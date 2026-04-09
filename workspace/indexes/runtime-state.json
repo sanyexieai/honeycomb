@@ -1,0 +1,269 @@
+{
+  "sessions": [
+    {
+      "id": "session.0001",
+      "name": "demo",
+      "instance_ids": [
+        "instance.0001",
+        "instance.0002",
+        "instance.0003",
+        "instance.0004",
+        "instance.0005",
+        "instance.0006",
+        "instance.0007"
+      ]
+    },
+    {
+      "id": "session.0002",
+      "name": "demo",
+      "instance_ids": []
+    }
+  ],
+  "instances": [
+    {
+      "id": "instance.0001",
+      "session_id": "session.0001",
+      "name": "alice",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0002",
+      "session_id": "session.0001",
+      "name": "alice",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0003",
+      "session_id": "session.0001",
+      "name": "alice",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0004",
+      "session_id": "session.0001",
+      "name": "alice",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0005",
+      "session_id": "session.0001",
+      "name": "alice",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0006",
+      "session_id": "session.0001",
+      "name": "alice",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0007",
+      "session_id": "session.0001",
+      "name": "bob",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    }
+  ],
+  "workers": [],
+  "jobs": [],
+  "messages": [
+    {
+      "id": "message.0001",
+      "session_id": "session.0001",
+      "from": "instance.0001",
+      "to": "instance.0007",
+      "channel": null,
+      "kind": "chat",
+      "body": "你好",
+      "reply_to": null
+    },
+    {
+      "id": "message.0002",
+      "session_id": "session.0001",
+      "from": "instance.0001",
+      "to": "instance.0007",
+      "channel": null,
+      "kind": "chat",
+      "body": "你好",
+      "reply_to": null
+    },
+    {
+      "id": "message.0003",
+      "session_id": "session.0001",
+      "from": "instance.0001",
+      "to": "instance.0007",
+      "channel": null,
+      "kind": "chat",
+      "body": "你好",
+      "reply_to": null
+    },
+    {
+      "id": "message.0004",
+      "session_id": "session.0001",
+      "from": "instance.0001",
+      "to": "instance.0007",
+      "channel": null,
+      "kind": "chat",
+      "body": "你好",
+      "reply_to": null
+    },
+    {
+      "id": "message.0005",
+      "session_id": "session.0001",
+      "from": "instance.0001",
+      "to": "instance.0007",
+      "channel": null,
+      "kind": "chat",
+      "body": "你好",
+      "reply_to": null
+    }
+  ],
+  "events": [
+    {
+      "id": "event.0001",
+      "session_id": "session.0001",
+      "source": "runtime",
+      "target": null,
+      "job_id": null,
+      "kind": "session_created",
+      "payload": "demo"
+    },
+    {
+      "id": "event.0002",
+      "session_id": "session.0001",
+      "source": "instance.0001",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "alice"
+    },
+    {
+      "id": "event.0003",
+      "session_id": "session.0002",
+      "source": "runtime",
+      "target": null,
+      "job_id": null,
+      "kind": "session_created",
+      "payload": "demo"
+    },
+    {
+      "id": "event.0004",
+      "session_id": "session.0001",
+      "source": "instance.0002",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "alice"
+    },
+    {
+      "id": "event.0005",
+      "session_id": "session.0001",
+      "source": "instance.0003",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "alice"
+    },
+    {
+      "id": "event.0006",
+      "session_id": "session.0001",
+      "source": "instance.0004",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "alice"
+    },
+    {
+      "id": "event.0007",
+      "session_id": "session.0001",
+      "source": "instance.0005",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "alice"
+    },
+    {
+      "id": "event.0008",
+      "session_id": "session.0001",
+      "source": "instance.0006",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "alice"
+    },
+    {
+      "id": "event.0009",
+      "session_id": "session.0001",
+      "source": "instance.0007",
+      "target": null,
+      "job_id": null,
+      "kind": "instance_created",
+      "payload": "bob"
+    },
+    {
+      "id": "event.0010",
+      "session_id": "session.0001",
+      "source": "instance.0001",
+      "target": "instance.0007",
+      "job_id": null,
+      "kind": "message_posted",
+      "payload": "你好"
+    },
+    {
+      "id": "event.0011",
+      "session_id": "session.0001",
+      "source": "instance.0001",
+      "target": "instance.0007",
+      "job_id": null,
+      "kind": "message_posted",
+      "payload": "你好"
+    },
+    {
+      "id": "event.0012",
+      "session_id": "session.0001",
+      "source": "instance.0001",
+      "target": "instance.0007",
+      "job_id": null,
+      "kind": "message_posted",
+      "payload": "你好"
+    },
+    {
+      "id": "event.0013",
+      "session_id": "session.0001",
+      "source": "instance.0001",
+      "target": "instance.0007",
+      "job_id": null,
+      "kind": "message_posted",
+      "payload": "你好"
+    },
+    {
+      "id": "event.0014",
+      "session_id": "session.0001",
+      "source": "instance.0001",
+      "target": "instance.0007",
+      "job_id": null,
+      "kind": "message_posted",
+      "payload": "你好"
+    }
+  ]
+}
