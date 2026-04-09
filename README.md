@@ -24,6 +24,7 @@ apps/
 crates/
   hc-protocol/        Shared schemas and traits
   hc-core/            Runtime model and orchestration
+  hc-llm/             Minimal pluggable LLM core
   hc-store/           Markdown-first storage layer
   hc-ui/              Slint-based desktop shell
 docs/
@@ -44,6 +45,7 @@ This repository currently contains:
 - architecture documents aligned to the core-first design
 - a Rust workspace skeleton for the runtime and UI split
 - initial runtime data models
+- a minimal `hc-llm` crate with provider abstraction and mock backend
 - Markdown-first storage guidance
 - a first `hc-ui` multi-window Slint shell prototype
 
@@ -53,6 +55,23 @@ Core terminal:
 
 ```powershell
 cargo run -p hc
+```
+
+Standalone LLM CLI:
+
+```powershell
+cargo run -p hc-llm-cli -- config llm --provider openai --api-key <your-key>
+cargo run -p hc-llm-cli -- config show
+cargo run -p hc-llm-cli -- providers
+cargo run -p hc-llm-cli -- generate "hello"
+```
+
+With a real OpenAI-compatible endpoint:
+
+```powershell
+$env:OPENAI_API_KEY="..."
+cargo run -p hc-llm-cli -- providers
+cargo run -p hc-llm-cli -- generate "hello" --provider openai --model gpt-4.1-mini
 ```
 
 Desktop multi-window shell:

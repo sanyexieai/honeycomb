@@ -72,6 +72,21 @@ Non-goals:
 - terminal rendering
 - provider-specific AI behavior
 
+### `hc-llm`
+
+Purpose:
+
+- minimal provider-neutral LLM interface
+- normalized chat request and response objects
+- pluggable provider registry
+- mock provider for local development and tests
+
+Non-goals:
+
+- agent orchestration
+- memory policy
+- UI ownership
+
 ### `hc-store`
 
 Purpose:
@@ -190,6 +205,8 @@ Recommended dependency direction:
 hc-ui ---------> hc-core -------> hc-protocol
                     |
                     +-----------> hc-store
+
+hc-llm --------> hc-protocol
 ```
 
 More concretely:

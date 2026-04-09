@@ -1,8 +1,10 @@
 [workspace]
 members = [
   "apps/hc",
+  "apps/hc-llm-cli",
   "crates/hc-protocol",
   "crates/hc-core",
+  "crates/hc-llm",
   "crates/hc-store",
   "crates/hc-ui",
 ]
@@ -20,4 +22,3 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"
-
