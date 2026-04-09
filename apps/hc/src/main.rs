@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_core::{
-    JobState, MessageKind, ProcessWorker, RunMode, RunRequest, RuntimeCommand,
+    JobState, MessageKind, MessageRoute, ProcessWorker, RunMode, RunRequest, RuntimeCommand,
     RuntimeCommandResult, RuntimeState, RuntimeSupervisor, WorkerReport,
 };
 
@@ -30,6 +30,7 @@ fn main() -> Result<()> {
         "reset" => reset_state(),
         "session" => handle_session(&args[1..]),
         "instance" => handle_instance(&args[1..]),
+        "channel" => handle_channel(&args[1..]),
         "send" => handle_send(&args[1..]),
         "term" => handle_term(&args[1..]),
         "chat" => handle_chat(&args[1..]),
@@ -83,6 +84,7 @@ fn run_control_repl() -> Result<()> {
         match tokens[0].as_str() {
             "/session" => handle_session_tokens(&tokens[1..])?,
             "/instance" => handle_instance_tokens(&tokens[1..])?,
+            "/channel" => handle_channel_tokens(&tokens[1..])?,
             "/term" => handle_term_tokens(&tokens[1..])?,
             "/reset" => reset_state()?,
             "/help" => print_control_help(),
@@ -188,9 +190,167 @@ fn handle_instance_tokens(tokens: &[String]) -> Result<()> {
     }
 }
 
+fn handle_channel(args: &[String]) -> Result<()> {
+    match args {
+        [action, session_selector, name] if action == "create" => {
+            let channel = with_locked_runtime_mut(|runtime| {
+                let session_id = resolve_session_selector(runtime, session_selector)?;
+                let result = runtime.dispatch(RuntimeCommand::CreateChannel {
+                    session_id,
+                    name: name.clone(),
+                })?;
+                let RuntimeCommandResult::Channel(channel) = result else {
+                    bail!("unexpected runtime result");
+                };
+                Ok(channel)
+            })?;
+            println!("created channel {} {}", channel.id, channel.name);
+            Ok(())
+        }
+        [action, session_selector] if action == "list" => {
+            let runtime = load_runtime()?;
+            let session_id = resolve_session_selector(&runtime, session_selector)?;
+            for channel in runtime
+                .state()
+                .channels
+                .iter()
+                .filter(|channel| channel.session_id == session_id)
+            {
+                println!("{} {}", channel.id, channel.name);
+            }
+            Ok(())
+        }
+        [action, session_selector, instance_selector, channel_selector] if action == "join" => {
+            let instance = with_locked_runtime_mut(|runtime| {
+                let session_id = resolve_session_selector(runtime, session_selector)?;
+                let instance_id =
+                    resolve_instance_selector(runtime, &session_id, instance_selector)?;
+                let channel_id =
+                    resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                let result = runtime.dispatch(RuntimeCommand::JoinChannel {
+                    instance_id,
+                    channel_id,
+                })?;
+                let RuntimeCommandResult::Instance(instance) = result else {
+                    bail!("unexpected runtime result");
+                };
+                Ok(instance)
+            })?;
+            println!("joined {} to channel(s): {}", instance.name, instance.channel_ids.join(", "));
+            Ok(())
+        }
+        [action, session_selector, instance_selector, channel_selector] if action == "leave" => {
+            let instance = with_locked_runtime_mut(|runtime| {
+                let session_id = resolve_session_selector(runtime, session_selector)?;
+                let instance_id =
+                    resolve_instance_selector(runtime, &session_id, instance_selector)?;
+                let channel_id =
+                    resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                let result = runtime.dispatch(RuntimeCommand::LeaveChannel {
+                    instance_id,
+                    channel_id,
+                })?;
+                let RuntimeCommandResult::Instance(instance) = result else {
+                    bail!("unexpected runtime result");
+                };
+                Ok(instance)
+            })?;
+            println!("left channel(s): {}", instance.channel_ids.join(", "));
+            Ok(())
+        }
+        [action, session_selector, from_selector, channel_selector, message @ ..]
+            if action == "send" && !message.is_empty() =>
+        {
+            let body = message.join(" ");
+            let (from_label, route_label, body) = with_locked_runtime_mut(|runtime| {
+                let session_id = resolve_session_selector(runtime, session_selector)?;
+                let from = resolve_instance_selector(runtime, &session_id, from_selector)?;
+                let channel_id =
+                    resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                let result = runtime.dispatch(RuntimeCommand::PostMessage {
+                    session_id,
+                    from: from.clone(),
+                    route: MessageRoute::Channel { channel_id },
+                    kind: MessageKind::Chat,
+                    body: body.clone(),
+                    reply_to: None,
+                })?;
+                let RuntimeCommandResult::Message(message) = result else {
+                    bail!("unexpected runtime result");
+                };
+                let from_label = display_instance(runtime, &message.session_id, &message.from);
+                let route_label = display_message_route(runtime, &message.session_id, &message.route);
+                Ok((from_label, route_label, message.body))
+            })?;
+            println!("[{from_label} -> {route_label}] {body}");
+            Ok(())
+        }
+        _ => bail!(
+            "usage: hc channel create <session> <name> | hc channel list <session> | hc channel join <session> <instance> <channel> | hc channel leave <session> <instance> <channel> | hc channel send <session> <from_instance> <channel> <message...>"
+        ),
+    }
+}
+
+fn handle_channel_tokens(tokens: &[String]) -> Result<()> {
+    match tokens {
+        [action, session, name] if action == "create" => handle_channel(&[
+            "create".to_owned(),
+            session.clone(),
+            name.clone(),
+        ]),
+        [action, session] if action == "list" => {
+            handle_channel(&["list".to_owned(), session.clone()])
+        }
+        [action, session, instance, channel] if action == "join" => handle_channel(&[
+            "join".to_owned(),
+            session.clone(),
+            instance.clone(),
+            channel.clone(),
+        ]),
+        [action, session, instance, channel] if action == "leave" => handle_channel(&[
+            "leave".to_owned(),
+            session.clone(),
+            instance.clone(),
+            channel.clone(),
+        ]),
+        _ => {
+            println!(
+                "usage: /channel create <session> <name> | /channel list <session> | /channel join <session> <instance> <channel> | /channel leave <session> <instance> <channel>"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn handle_send(args: &[String]) -> Result<()> {
+    if args.len() >= 4 && args[0] == "--all" {
+        let session_selector = &args[1];
+        let from_selector = &args[2];
+        let body = args[3..].join(" ");
+        let (from_label, route_label, body) = with_locked_runtime_mut(|runtime| {
+            let session_id = resolve_session_selector(runtime, session_selector)?;
+            let from = resolve_instance_selector(runtime, &session_id, from_selector)?;
+            let result = runtime.dispatch(RuntimeCommand::PostMessage {
+                session_id,
+                from: from.clone(),
+                route: MessageRoute::Broadcast,
+                kind: MessageKind::Chat,
+                body: body.clone(),
+                reply_to: None,
+            })?;
+            let RuntimeCommandResult::Message(message) = result else {
+                bail!("unexpected runtime result");
+            };
+            let from_label = display_instance(runtime, &message.session_id, &message.from);
+            let route_label = display_message_route(runtime, &message.session_id, &message.route);
+            Ok((from_label, route_label, message.body))
+        })?;
+        println!("[{from_label} -> {route_label}] {body}");
+        return Ok(());
+    }
+
     if args.len() < 4 {
-        bail!("usage: hc send <session> <from_instance> <to_instance> <message...>");
+        bail!("usage: hc send <session> <from_instance> <to_instance> <message...> | hc send --all <session> <from_instance> <message...>");
     }
 
     let session_selector = &args[0];
@@ -205,8 +365,7 @@ fn handle_send(args: &[String]) -> Result<()> {
         let result = runtime.dispatch(RuntimeCommand::PostMessage {
             session_id,
             from,
-            to: Some(to),
-            channel: None,
+            route: MessageRoute::Direct { to },
             kind: MessageKind::Chat,
             body: body.clone(),
             reply_to: None,
@@ -215,11 +374,7 @@ fn handle_send(args: &[String]) -> Result<()> {
             bail!("unexpected runtime result");
         };
         let from_label = display_instance(runtime, &message.session_id, &message.from);
-        let to_label = message
-            .to
-            .as_deref()
-            .map(|id| display_instance(runtime, &message.session_id, id))
-            .unwrap_or_else(|| "*".to_owned());
+        let to_label = display_message_route(runtime, &message.session_id, &message.route);
         Ok((from_label, to_label, message.body))
     })?;
     println!("[{from_label} -> {to_label}] {body}");
@@ -279,8 +434,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
                     let result = runtime.dispatch(RuntimeCommand::PostMessage {
                         session_id: session_id.clone(),
                         from: from.clone(),
-                        to: Some(to.clone()),
-                        channel: None,
+                        route: MessageRoute::Direct { to: to.clone() },
                         kind: MessageKind::Chat,
                         body: body.to_owned(),
                         reply_to: None,
@@ -288,11 +442,8 @@ fn handle_chat(args: &[String]) -> Result<()> {
                     let RuntimeCommandResult::Message(message) = result else {
                         bail!("unexpected runtime result");
                     };
-                    let to_label = message
-                        .to
-                        .as_deref()
-                        .map(|id| display_instance(runtime, &message.session_id, id))
-                        .unwrap_or_else(|| "*".to_owned());
+                    let to_label =
+                        display_message_route(runtime, &message.session_id, &message.route);
                     Ok((to_label, message.body))
                 })?;
                 println!("[you -> {to_label}] {body}");
@@ -327,29 +478,38 @@ fn handle_term_tokens(tokens: &[String]) -> Result<()> {
 fn handle_inbox(args: &[String]) -> Result<()> {
     match args {
         [session_selector, instance_selector] => {
-            let runtime = load_runtime()?;
-            let session_id = resolve_session_selector(&runtime, session_selector)?;
-            let instance_id = resolve_instance_selector(&runtime, &session_id, instance_selector)?;
-            let messages = runtime.mailbox_for_instance(&session_id, &instance_id)?;
-            for message in messages {
-                let from_label = display_instance(&runtime, &session_id, &message.from);
-                let to_label = message
-                    .to
-                    .as_deref()
-                    .map(|id| display_instance(&runtime, &session_id, id))
-                    .unwrap_or_else(|| "*".to_owned());
-                println!(
-                    "[{}] {} -> {}: {}",
-                    message.id,
-                    from_label,
-                    to_label,
-                    message.body
-                );
-            }
-            Ok(())
+            print_inbox(session_selector, instance_selector, None)
         }
-        _ => bail!("usage: hc inbox <session> <instance>"),
+        [session_selector, instance_selector, route_filter] => {
+            print_inbox(session_selector, instance_selector, Some(route_filter.as_str()))
+        }
+        _ => bail!("usage: hc inbox <session> <instance> [route]"),
     }
+}
+
+fn print_inbox(
+    session_selector: &str,
+    instance_selector: &str,
+    route_filter: Option<&str>,
+) -> Result<()> {
+    let runtime = load_runtime()?;
+    let session_id = resolve_session_selector(&runtime, session_selector)?;
+    let instance_id = resolve_instance_selector(&runtime, &session_id, instance_selector)?;
+    let messages = runtime.mailbox_for_instance(&session_id, &instance_id)?;
+    for message in messages {
+        if !message_matches_filter(&runtime, &session_id, message, route_filter)? {
+            continue;
+        }
+        let from_label = display_instance(&runtime, &session_id, &message.from);
+        println!(
+            "[{}] {} -> {}: {}",
+            message.id,
+            from_label,
+            display_message_route(&runtime, &session_id, &message.route),
+            message.body
+        );
+    }
+    Ok(())
 }
 
 fn handle_events(args: &[String]) -> Result<()> {
@@ -482,8 +642,7 @@ fn run_term(session_selector: &str, instance_selector: &str) -> Result<()> {
                     let result = runtime.dispatch(RuntimeCommand::PostMessage {
                         session_id,
                         from,
-                        to: Some(to),
-                        channel: None,
+                        route: MessageRoute::Direct { to },
                         kind: MessageKind::Chat,
                         body,
                         reply_to: None,
@@ -491,23 +650,145 @@ fn run_term(session_selector: &str, instance_selector: &str) -> Result<()> {
                     let RuntimeCommandResult::Message(message) = result else {
                         bail!("unexpected runtime result");
                     };
-                    let to_label = message
-                        .to
-                        .as_deref()
-                        .map(|id| display_instance(runtime, &message.session_id, id))
-                        .unwrap_or_else(|| "*".to_owned());
+                    let to_label =
+                        display_message_route(runtime, &message.session_id, &message.route);
                     Ok((to_label, message.body))
                 })?;
                 println!("[you -> {to_label}] {body}");
             }
+            "/all" => {
+                if tokens.len() < 2 {
+                    println!("usage: /all <message...>");
+                    continue;
+                }
+                let body = tokens[1..].join(" ");
+                let (route_label, body) = with_locked_runtime_mut(|runtime| {
+                    let session_id = resolve_session_selector(runtime, session_selector)?;
+                    let from = resolve_instance_selector(runtime, &session_id, instance_selector)?;
+                    let result = runtime.dispatch(RuntimeCommand::PostMessage {
+                        session_id,
+                        from,
+                        route: MessageRoute::Broadcast,
+                        kind: MessageKind::Chat,
+                        body,
+                        reply_to: None,
+                    })?;
+                    let RuntimeCommandResult::Message(message) = result else {
+                        bail!("unexpected runtime result");
+                    };
+                    let route_label =
+                        display_message_route(runtime, &message.session_id, &message.route);
+                    Ok((route_label, message.body))
+                })?;
+                println!("[you -> {route_label}] {body}");
+            }
+            "/channel" => {
+                if tokens.len() < 3 {
+                    println!("usage: /channel <channel> <message...>");
+                    continue;
+                }
+                let channel_selector = &tokens[1];
+                let body = tokens[2..].join(" ");
+                let (route_label, body) = with_locked_runtime_mut(|runtime| {
+                    let session_id = resolve_session_selector(runtime, session_selector)?;
+                    let from = resolve_instance_selector(runtime, &session_id, instance_selector)?;
+                    let channel_id =
+                        resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                    let result = runtime.dispatch(RuntimeCommand::PostMessage {
+                        session_id,
+                        from,
+                        route: MessageRoute::Channel { channel_id },
+                        kind: MessageKind::Chat,
+                        body,
+                        reply_to: None,
+                    })?;
+                    let RuntimeCommandResult::Message(message) = result else {
+                        bail!("unexpected runtime result");
+                    };
+                    let route_label =
+                        display_message_route(runtime, &message.session_id, &message.route);
+                    Ok((route_label, message.body))
+                })?;
+                println!("[you -> {route_label}] {body}");
+            }
             "/inbox" => {
-                handle_inbox(&[session_selector.to_owned(), instance_selector.to_owned()])?;
+                if tokens.len() == 1 {
+                    handle_inbox(&[session_selector.to_owned(), instance_selector.to_owned()])?;
+                } else {
+                    handle_inbox(&[
+                        session_selector.to_owned(),
+                        instance_selector.to_owned(),
+                        tokens[1].clone(),
+                    ])?;
+                }
             }
             "/events" => {
                 handle_events(&[session_selector.to_owned(), instance_selector.to_owned()])?;
             }
             "/who" => {
                 handle_instance(&["list".to_owned(), session_selector.to_owned()])?;
+            }
+            "/channels" => {
+                print_instance_channels(session_selector, instance_selector)?;
+            }
+            "/join" => {
+                if tokens.len() != 2 {
+                    println!("usage: /join <channel>");
+                    continue;
+                }
+                let channel_selector = &tokens[1];
+                let channel_name = with_locked_runtime_mut(|runtime| {
+                    let session_id = resolve_session_selector(runtime, session_selector)?;
+                    let instance_id =
+                        resolve_instance_selector(runtime, &session_id, instance_selector)?;
+                    let channel_id =
+                        resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                    let result = runtime.dispatch(RuntimeCommand::JoinChannel {
+                        instance_id,
+                        channel_id: channel_id.clone(),
+                    })?;
+                    let RuntimeCommandResult::Instance(_) = result else {
+                        bail!("unexpected runtime result");
+                    };
+                    let channel = runtime
+                        .state()
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == channel_id)
+                        .context("channel should exist after join")?;
+                    Ok(channel.name.clone())
+                })?;
+                println!("joined #{channel_name}");
+            }
+            "/leave" => {
+                if tokens.len() != 2 {
+                    println!("usage: /leave <channel>");
+                    continue;
+                }
+                let channel_selector = &tokens[1];
+                let channel_name = with_locked_runtime_mut(|runtime| {
+                    let session_id = resolve_session_selector(runtime, session_selector)?;
+                    let instance_id =
+                        resolve_instance_selector(runtime, &session_id, instance_selector)?;
+                    let channel_id =
+                        resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                    let channel_name = runtime
+                        .state()
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == channel_id)
+                        .map(|channel| channel.name.clone())
+                        .context("channel should exist before leave")?;
+                    let result = runtime.dispatch(RuntimeCommand::LeaveChannel {
+                        instance_id,
+                        channel_id,
+                    })?;
+                    let RuntimeCommandResult::Instance(_) = result else {
+                        bail!("unexpected runtime result");
+                    };
+                    Ok(channel_name)
+                })?;
+                println!("left #{channel_name}");
             }
             _ => run_local_command(line)?,
         }
@@ -567,8 +848,7 @@ fn run_demo() -> Result<()> {
     runtime.enqueue_command(RuntimeCommand::PostMessage {
         session_id: session.id.clone(),
         from: shell.id.clone(),
-        to: None,
-        channel: Some("main".to_owned()),
+        route: MessageRoute::Broadcast,
         kind: MessageKind::System,
         body: "runtime initialized".to_owned(),
         reply_to: None,
@@ -809,6 +1089,89 @@ fn resolve_instance_selector(
     bail!("instance not found in {session_id}: {selector}")
 }
 
+fn resolve_channel_selector(
+    runtime: &RuntimeSupervisor,
+    session_id: &str,
+    selector: &str,
+) -> Result<String> {
+    if let Some(channel) = runtime
+        .state()
+        .channels
+        .iter()
+        .find(|channel| {
+            channel.session_id == session_id && (channel.id == selector || channel.name == selector)
+        })
+    {
+        return Ok(channel.id.clone());
+    }
+
+    bail!("channel not found in {session_id}: {selector}")
+}
+
+fn print_instance_channels(session_selector: &str, instance_selector: &str) -> Result<()> {
+    let runtime = load_runtime()?;
+    let session_id = resolve_session_selector(&runtime, session_selector)?;
+    let instance_id = resolve_instance_selector(&runtime, &session_id, instance_selector)?;
+    let instance = runtime
+        .state()
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .context("instance should exist")?;
+
+    if instance.channel_ids.is_empty() {
+        println!("no joined channels");
+        return Ok(());
+    }
+
+    for channel_id in &instance.channel_ids {
+        let label = runtime
+            .state()
+            .channels
+            .iter()
+            .find(|channel| channel.id == *channel_id)
+            .map(|channel| format!("{} {}", channel.id, channel.name))
+            .unwrap_or_else(|| channel_id.clone());
+        println!("{label}");
+    }
+
+    Ok(())
+}
+
+fn message_matches_filter(
+    runtime: &RuntimeSupervisor,
+    session_id: &str,
+    message: &hc_core::MessageRecord,
+    route_filter: Option<&str>,
+) -> Result<bool> {
+    let Some(route_filter) = route_filter else {
+        return Ok(true);
+    };
+
+    if route_filter == "*" || route_filter.eq_ignore_ascii_case("all") {
+        return Ok(matches!(message.route, MessageRoute::Broadcast));
+    }
+
+    match &message.route {
+        MessageRoute::Direct { to } => Ok(route_filter == to
+            || route_filter == display_instance(runtime, session_id, to)),
+        MessageRoute::Channel { channel_id } => {
+            let channel = runtime
+                .state()
+                .channels
+                .iter()
+                .find(|channel| channel.id == *channel_id);
+            Ok(route_filter == channel_id
+                || channel
+                    .map(|channel| {
+                        route_filter == channel.name || route_filter == format!("#{}", channel.name)
+                    })
+                    .unwrap_or(false))
+        }
+        MessageRoute::Broadcast => Ok(false),
+    }
+}
+
 fn watch_inbox(session_selector: &str, instance_selector: &str) -> Result<()> {
     println!("watching inbox for {instance_selector} in {session_selector}. Press Ctrl+C to stop.");
     let mut seen = 0usize;
@@ -933,10 +1296,16 @@ fn print_help() {
     println!("hc session list");
     println!("hc instance create <session> <name>");
     println!("hc instance list <session>");
+    println!("hc channel create <session> <name>");
+    println!("hc channel list <session>");
+    println!("hc channel join <session> <instance> <channel>");
+    println!("hc channel leave <session> <instance> <channel>");
+    println!("hc channel send <session> <from_instance> <channel> <message...>");
     println!("hc send <session> <from_instance> <to_instance> <message...>");
+    println!("hc send --all <session> <from_instance> <message...>");
     println!("hc term <session> <instance>");
     println!("hc chat <session> <from_instance> <to_instance>");
-    println!("hc inbox <session> <instance>");
+    println!("hc inbox <session> <instance> [route]");
     println!("hc events <session> [instance]");
     println!("hc watch inbox <session> <instance>");
     println!("hc watch events <session> [instance]");
@@ -947,6 +1316,10 @@ fn print_control_help() {
     println!("/session list");
     println!("/instance create <session> <name>");
     println!("/instance list <session>");
+    println!("/channel create <session> <name>");
+    println!("/channel list <session>");
+    println!("/channel join <session> <instance> <channel>");
+    println!("/channel leave <session> <instance> <channel>");
     println!("/term <session> <instance>");
     println!("/reset");
     println!("/quit");
@@ -954,9 +1327,14 @@ fn print_control_help() {
 
 fn print_term_help() {
     println!("/msg <instance> <message...>");
-    println!("/inbox");
+    println!("/all <message...>");
+    println!("/channel <channel> <message...>");
+    println!("/inbox [route]");
     println!("/events");
     println!("/who");
+    println!("/channels");
+    println!("/join <channel>");
+    println!("/leave <channel>");
     println!("/quit");
 }
 
@@ -968,6 +1346,24 @@ fn display_instance(runtime: &RuntimeSupervisor, session_id: &str, instance_id: 
         .find(|instance| instance.session_id == session_id && instance.id == instance_id)
         .map(|instance| instance.name.clone())
         .unwrap_or_else(|| instance_id.to_owned())
+}
+
+fn display_message_route(
+    runtime: &RuntimeSupervisor,
+    session_id: &str,
+    route: &MessageRoute,
+) -> String {
+    match route {
+        MessageRoute::Direct { to } => display_instance(runtime, session_id, to),
+        MessageRoute::Broadcast => "*".to_owned(),
+        MessageRoute::Channel { channel_id } => runtime
+            .state()
+            .channels
+            .iter()
+            .find(|channel| channel.session_id == session_id && channel.id == *channel_id)
+            .map(|channel| format!("#{}", channel.name))
+            .unwrap_or_else(|| format!("#{}", channel_id)),
+    }
 }
 
 fn split_command(line: &str) -> Vec<String> {

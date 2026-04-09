@@ -50,6 +50,16 @@ Early implementation note:
 
 - mailbox can begin as a read model projected from stored messages before becoming a live queue
 
+### `Channel`
+
+Session-scoped discussion lane.
+
+Early implementation direction:
+
+- channels are first-class runtime records
+- instances explicitly join or leave channels
+- channel messages are only visible to subscribed instances
+
 ### `Worker`
 
 Execution unit for jobs. Internal implementation detail from the communication perspective.
@@ -93,6 +103,20 @@ The supervisor may also derive a worker plan from a run request:
 A promoted instance created when a task needs independent identity and direct communication rather than just execution.
 
 ## Decision Rules
+
+## Communication Modes
+
+The core runtime should support three routing modes:
+
+- direct message: one instance to one instance
+- broadcast: one instance to all instances in the session
+- channel message: one instance to all subscribed instances in a session channel
+
+Early implementation rule:
+
+- direct routing uses `to`
+- broadcast uses neither `to` nor `channel`
+- channel routing uses `channel` and requires membership
 
 ### When work stays a job
 

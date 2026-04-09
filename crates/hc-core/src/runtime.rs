@@ -7,6 +7,7 @@ use hc_protocol::protocol::RecordId;
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeState {
     pub sessions: Vec<SessionRecord>,
+    pub channels: Vec<ChannelRecord>,
     pub instances: Vec<InstanceRecord>,
     pub workers: Vec<WorkerRecord>,
     pub jobs: Vec<JobRecord>,
@@ -24,6 +25,18 @@ pub enum RuntimeCommand {
         name: String,
         parent_instance_id: Option<String>,
     },
+    CreateChannel {
+        session_id: String,
+        name: String,
+    },
+    JoinChannel {
+        instance_id: String,
+        channel_id: String,
+    },
+    LeaveChannel {
+        instance_id: String,
+        channel_id: String,
+    },
     RenameInstance {
         instance_id: String,
         name: String,
@@ -31,8 +44,7 @@ pub enum RuntimeCommand {
     PostMessage {
         session_id: String,
         from: String,
-        to: Option<String>,
-        channel: Option<String>,
+        route: MessageRoute,
         kind: MessageKind,
         body: String,
         reply_to: Option<String>,
@@ -60,6 +72,7 @@ pub enum RuntimeCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeCommandResult {
     Session(SessionRecord),
+    Channel(ChannelRecord),
     Instance(InstanceRecord),
     Message(MessageRecord),
     Job(JobRecord),
@@ -92,6 +105,7 @@ pub struct RuntimeSupervisor {
     state: RuntimeState,
     command_queue: VecDeque<RuntimeCommand>,
     next_session: u64,
+    next_channel: u64,
     next_instance: u64,
     next_worker: u64,
     next_job: u64,
@@ -107,6 +121,7 @@ impl RuntimeSupervisor {
     pub fn from_state(state: RuntimeState) -> Self {
         Self {
             next_session: state.sessions.len() as u64,
+            next_channel: state.channels.len() as u64,
             next_instance: state.instances.len() as u64,
             next_worker: state.workers.len() as u64,
             next_job: state.jobs.len() as u64,
@@ -137,6 +152,13 @@ impl RuntimeSupervisor {
             .instances
             .iter()
             .find(|instance| instance.id == instance_id)
+    }
+
+    pub fn channel(&self, channel_id: &str) -> Option<&ChannelRecord> {
+        self.state
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
     }
 
     pub fn job(&self, job_id: &str) -> Option<&JobRecord> {
@@ -196,19 +218,33 @@ impl RuntimeSupervisor {
             } => self
                 .create_instance(&session_id, name, parent_instance_id)
                 .map(RuntimeCommandResult::Instance),
+            RuntimeCommand::CreateChannel { session_id, name } => self
+                .create_channel(&session_id, name)
+                .map(RuntimeCommandResult::Channel),
+            RuntimeCommand::JoinChannel {
+                instance_id,
+                channel_id,
+            } => self
+                .join_channel(&instance_id, &channel_id)
+                .map(RuntimeCommandResult::Instance),
+            RuntimeCommand::LeaveChannel {
+                instance_id,
+                channel_id,
+            } => self
+                .leave_channel(&instance_id, &channel_id)
+                .map(RuntimeCommandResult::Instance),
             RuntimeCommand::RenameInstance { instance_id, name } => self
                 .rename_instance(&instance_id, name)
                 .map(RuntimeCommandResult::Instance),
             RuntimeCommand::PostMessage {
                 session_id,
                 from,
-                to,
-                channel,
+                route,
                 kind,
                 body,
                 reply_to,
             } => self
-                .post_message(&session_id, &from, to, channel, kind, body, reply_to)
+                .post_message(&session_id, &from, route, kind, body, reply_to)
                 .map(RuntimeCommandResult::Message),
             RuntimeCommand::SubmitRunRequest {
                 instance_id,
@@ -266,6 +302,7 @@ impl RuntimeSupervisor {
             id: self.next_id(IdKind::Session),
             name: name.into(),
             instance_ids: Vec::new(),
+            channel_ids: Vec::new(),
         };
         let event_id = self.next_id(IdKind::Event);
         self.push_event(EventRecord {
@@ -302,6 +339,7 @@ impl RuntimeSupervisor {
             name: name.into(),
             parent_instance_id: parent_instance_id.clone(),
             child_instance_ids: Vec::new(),
+            channel_ids: Vec::new(),
             job_ids: Vec::new(),
             worker_ids: Vec::new(),
         };
@@ -334,28 +372,153 @@ impl RuntimeSupervisor {
         Ok(instance)
     }
 
+    pub fn create_channel(
+        &mut self,
+        session_id: &str,
+        name: impl Into<String>,
+    ) -> Result<ChannelRecord, RuntimeError> {
+        let session_index = self
+            .find_session_index(session_id)
+            .ok_or_else(|| RuntimeError::session_not_found(session_id))?;
+
+        let channel = ChannelRecord {
+            id: self.next_id(IdKind::Channel),
+            session_id: session_id.to_owned(),
+            name: name.into(),
+            member_instance_ids: Vec::new(),
+        };
+
+        self.state.sessions[session_index]
+            .channel_ids
+            .push(channel.id.clone());
+
+        let event_id = self.next_id(IdKind::Event);
+        self.push_event(EventRecord {
+            id: event_id,
+            session_id: session_id.to_owned(),
+            source: "runtime".to_owned(),
+            target: Some(channel.id.clone()),
+            job_id: None,
+            kind: EventKind::ChannelCreated,
+            payload: channel.name.clone(),
+        });
+
+        self.state.channels.push(channel.clone());
+        Ok(channel)
+    }
+
+    pub fn join_channel(
+        &mut self,
+        instance_id: &str,
+        channel_id: &str,
+    ) -> Result<InstanceRecord, RuntimeError> {
+        let instance_index = self
+            .find_instance_index(instance_id)
+            .ok_or_else(|| RuntimeError::instance_not_found(instance_id))?;
+        let channel_index = self
+            .find_channel_index(channel_id)
+            .ok_or_else(|| RuntimeError::channel_not_found(channel_id))?;
+
+        let session_id = self.state.instances[instance_index].session_id.clone();
+        if self.state.channels[channel_index].session_id != session_id {
+            return Err(RuntimeError::channel_session_mismatch(
+                channel_id, &session_id,
+            ));
+        }
+
+        if !self.state.instances[instance_index]
+            .channel_ids
+            .iter()
+            .any(|id| id == channel_id)
+        {
+            self.state.instances[instance_index]
+                .channel_ids
+                .push(channel_id.to_owned());
+        }
+        if !self.state.channels[channel_index]
+            .member_instance_ids
+            .iter()
+            .any(|id| id == instance_id)
+        {
+            self.state.channels[channel_index]
+                .member_instance_ids
+                .push(instance_id.to_owned());
+        }
+
+        let instance = self.state.instances[instance_index].clone();
+        let event_id = self.next_id(IdKind::Event);
+        self.push_event(EventRecord {
+            id: event_id,
+            session_id,
+            source: instance.id.clone(),
+            target: Some(channel_id.to_owned()),
+            job_id: None,
+            kind: EventKind::ChannelJoined,
+            payload: channel_id.to_owned(),
+        });
+        Ok(instance)
+    }
+
+    pub fn leave_channel(
+        &mut self,
+        instance_id: &str,
+        channel_id: &str,
+    ) -> Result<InstanceRecord, RuntimeError> {
+        let instance_index = self
+            .find_instance_index(instance_id)
+            .ok_or_else(|| RuntimeError::instance_not_found(instance_id))?;
+        let channel_index = self
+            .find_channel_index(channel_id)
+            .ok_or_else(|| RuntimeError::channel_not_found(channel_id))?;
+
+        self.state.instances[instance_index]
+            .channel_ids
+            .retain(|id| id != channel_id);
+        self.state.channels[channel_index]
+            .member_instance_ids
+            .retain(|id| id != instance_id);
+
+        let instance = self.state.instances[instance_index].clone();
+        let session_id = instance.session_id.clone();
+        let event_id = self.next_id(IdKind::Event);
+        self.push_event(EventRecord {
+            id: event_id,
+            session_id,
+            source: instance.id.clone(),
+            target: Some(channel_id.to_owned()),
+            job_id: None,
+            kind: EventKind::ChannelLeft,
+            payload: channel_id.to_owned(),
+        });
+        Ok(instance)
+    }
+
     pub fn post_message(
         &mut self,
         session_id: &str,
         from: &str,
-        to: Option<String>,
-        channel: Option<String>,
+        route: MessageRoute,
         kind: MessageKind,
         body: impl Into<String>,
         reply_to: Option<String>,
     ) -> Result<MessageRecord, RuntimeError> {
         self.ensure_instance_in_session(session_id, from)?;
-
-        if let Some(target) = to.as_deref() {
-            self.ensure_instance_in_session(session_id, target)?;
+        match &route {
+            MessageRoute::Direct { to } => {
+                self.ensure_instance_in_session(session_id, to)?;
+            }
+            MessageRoute::Broadcast => {}
+            MessageRoute::Channel { channel_id } => {
+                self.ensure_channel_in_session(session_id, channel_id)?;
+                self.ensure_instance_in_channel(from, channel_id)?;
+            }
         }
 
         let message = MessageRecord {
             id: self.next_id(IdKind::Message),
             session_id: session_id.to_owned(),
             from: from.to_owned(),
-            to: to.clone(),
-            channel,
+            route: route.clone(),
             kind,
             body: body.into(),
             reply_to,
@@ -363,11 +526,16 @@ impl RuntimeSupervisor {
 
         self.state.messages.push(message.clone());
         let event_id = self.next_id(IdKind::Event);
+        let target = match &message.route {
+            MessageRoute::Direct { to } => Some(to.clone()),
+            MessageRoute::Broadcast => None,
+            MessageRoute::Channel { channel_id } => Some(channel_id.clone()),
+        };
         self.push_event(EventRecord {
             id: event_id,
             session_id: session_id.to_owned(),
             source: from.to_owned(),
-            target: to,
+            target,
             job_id: None,
             kind: EventKind::MessagePosted,
             payload: message.body.clone(),
@@ -415,11 +583,18 @@ impl RuntimeSupervisor {
             .messages
             .iter()
             .filter(|message| {
-                message.session_id == session_id
-                    && match message.to.as_deref() {
-                        Some(target) => target == instance_id,
-                        None => true,
-                    }
+                if message.session_id != session_id {
+                    return false;
+                }
+
+                match &message.route {
+                    MessageRoute::Direct { to } => to == instance_id,
+                    MessageRoute::Channel { channel_id } => self
+                        .instance(instance_id)
+                        .map(|instance| instance.channel_ids.iter().any(|id| id == channel_id))
+                        .unwrap_or(false),
+                    MessageRoute::Broadcast => true,
+                }
             })
             .collect())
     }
@@ -635,6 +810,49 @@ impl RuntimeSupervisor {
         Ok(())
     }
 
+    fn ensure_channel_in_session(
+        &self,
+        session_id: &str,
+        channel_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let channel = self
+            .state
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .ok_or_else(|| RuntimeError::channel_not_found(channel_id))?;
+
+        if channel.session_id != session_id {
+            return Err(RuntimeError::channel_session_mismatch(
+                channel_id, session_id,
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_instance_in_channel(
+        &self,
+        instance_id: &str,
+        channel_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let instance = self
+            .state
+            .instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| RuntimeError::instance_not_found(instance_id))?;
+
+        if !instance.channel_ids.iter().any(|id| id == channel_id) {
+            return Err(RuntimeError::instance_channel_mismatch(
+                instance_id,
+                channel_id,
+            ));
+        }
+
+        Ok(())
+    }
+
     fn find_session_index(&self, session_id: &str) -> Option<usize> {
         self.state
             .sessions
@@ -647,6 +865,13 @@ impl RuntimeSupervisor {
             .instances
             .iter()
             .position(|instance| instance.id == instance_id)
+    }
+
+    fn find_channel_index(&self, channel_id: &str) -> Option<usize> {
+        self.state
+            .channels
+            .iter()
+            .position(|channel| channel.id == channel_id)
     }
 
     fn find_job_index(&self, job_id: &str) -> Option<usize> {
@@ -662,6 +887,10 @@ impl RuntimeSupervisor {
             IdKind::Session => {
                 self.next_session += 1;
                 format!("session.{:04}", self.next_session)
+            }
+            IdKind::Channel => {
+                self.next_channel += 1;
+                format!("channel.{:04}", self.next_channel)
             }
             IdKind::Instance => {
                 self.next_instance += 1;
@@ -690,6 +919,7 @@ impl RuntimeSupervisor {
 #[derive(Debug, Clone, Copy)]
 enum IdKind {
     Session,
+    Channel,
     Instance,
     Worker,
     Job,
@@ -707,6 +937,18 @@ pub enum RuntimeError {
     InstanceSessionMismatch {
         instance_id: String,
         session_id: String,
+    },
+    #[error("channel not found: {0}")]
+    ChannelNotFound(String),
+    #[error("channel {channel_id} is not in session {session_id}")]
+    ChannelSessionMismatch {
+        channel_id: String,
+        session_id: String,
+    },
+    #[error("instance {instance_id} is not in channel {channel_id}")]
+    InstanceChannelMismatch {
+        instance_id: String,
+        channel_id: String,
     },
     #[error("job not found: {0}")]
     JobNotFound(String),
@@ -728,6 +970,24 @@ impl RuntimeError {
         }
     }
 
+    fn channel_not_found(channel_id: &str) -> Self {
+        Self::ChannelNotFound(channel_id.to_owned())
+    }
+
+    fn channel_session_mismatch(channel_id: &str, session_id: &str) -> Self {
+        Self::ChannelSessionMismatch {
+            channel_id: channel_id.to_owned(),
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    fn instance_channel_mismatch(instance_id: &str, channel_id: &str) -> Self {
+        Self::InstanceChannelMismatch {
+            instance_id: instance_id.to_owned(),
+            channel_id: channel_id.to_owned(),
+        }
+    }
+
     fn job_not_found(job_id: &str) -> Self {
         Self::JobNotFound(job_id.to_owned())
     }
@@ -738,9 +998,24 @@ pub struct SessionRecord {
     pub id: String,
     pub name: String,
     pub instance_ids: Vec<String>,
+    pub channel_ids: Vec<String>,
 }
 
 impl RecordId for SessionRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelRecord {
+    pub id: String,
+    pub session_id: String,
+    pub name: String,
+    pub member_instance_ids: Vec<String>,
+}
+
+impl RecordId for ChannelRecord {
     fn id(&self) -> &str {
         &self.id
     }
@@ -753,6 +1028,7 @@ pub struct InstanceRecord {
     pub name: String,
     pub parent_instance_id: Option<String>,
     pub child_instance_ids: Vec<String>,
+    pub channel_ids: Vec<String>,
     pub job_ids: Vec<String>,
     pub worker_ids: Vec<String>,
 }
@@ -824,6 +1100,9 @@ pub enum JobState {
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     SessionCreated,
+    ChannelCreated,
+    ChannelJoined,
+    ChannelLeft,
     InstanceCreated,
     InstanceRenamed,
     MessagePosted,
@@ -894,8 +1173,7 @@ pub struct MessageRecord {
     pub id: String,
     pub session_id: String,
     pub from: String,
-    pub to: Option<String>,
-    pub channel: Option<String>,
+    pub route: MessageRoute,
     pub kind: MessageKind,
     pub body: String,
     pub reply_to: Option<String>,
@@ -917,6 +1195,14 @@ pub enum MessageKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "route", rename_all = "snake_case")]
+pub enum MessageRoute {
+    Direct { to: String },
+    Broadcast,
+    Channel { channel_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventRecord {
     pub id: String,
     pub session_id: String,
@@ -930,5 +1216,109 @@ pub struct EventRecord {
 impl RecordId for EventRecord {
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_reaches_all_instances_in_session() {
+        let mut runtime = RuntimeSupervisor::new();
+        let session = runtime.create_session("demo");
+        let alice = runtime
+            .create_instance(&session.id, "alice", None)
+            .expect("alice should be created");
+        let bob = runtime
+            .create_instance(&session.id, "bob", None)
+            .expect("bob should be created");
+
+        runtime
+            .post_message(
+                &session.id,
+                &alice.id,
+                MessageRoute::Broadcast,
+                MessageKind::Chat,
+                "hello all",
+                None,
+            )
+            .expect("broadcast should succeed");
+
+        let alice_mailbox = runtime
+            .mailbox_for_instance(&session.id, &alice.id)
+            .expect("alice mailbox should load");
+        let bob_mailbox = runtime
+            .mailbox_for_instance(&session.id, &bob.id)
+            .expect("bob mailbox should load");
+
+        assert_eq!(alice_mailbox.len(), 1);
+        assert_eq!(bob_mailbox.len(), 1);
+        assert_eq!(alice_mailbox[0].body, "hello all");
+        assert_eq!(bob_mailbox[0].body, "hello all");
+    }
+
+    #[test]
+    fn channel_message_only_reaches_subscribed_instances() {
+        let mut runtime = RuntimeSupervisor::new();
+        let session = runtime.create_session("demo");
+        let alice = runtime
+            .create_instance(&session.id, "alice", None)
+            .expect("alice should be created");
+        let bob = runtime
+            .create_instance(&session.id, "bob", None)
+            .expect("bob should be created");
+        let carol = runtime
+            .create_instance(&session.id, "carol", None)
+            .expect("carol should be created");
+        let channel = runtime
+            .create_channel(&session.id, "planning")
+            .expect("channel should be created");
+
+        runtime
+            .join_channel(&alice.id, &channel.id)
+            .expect("alice should join");
+        runtime
+            .join_channel(&bob.id, &channel.id)
+            .expect("bob should join");
+
+        runtime
+            .post_message(
+                &session.id,
+                &alice.id,
+                MessageRoute::Channel {
+                    channel_id: channel.id.clone(),
+                },
+                MessageKind::Chat,
+                "plan update",
+                None,
+            )
+            .expect("channel message should succeed");
+
+        let alice_mailbox = runtime
+            .mailbox_for_instance(&session.id, &alice.id)
+            .expect("alice mailbox should load");
+        let bob_mailbox = runtime
+            .mailbox_for_instance(&session.id, &bob.id)
+            .expect("bob mailbox should load");
+        let carol_mailbox = runtime
+            .mailbox_for_instance(&session.id, &carol.id)
+            .expect("carol mailbox should load");
+
+        assert_eq!(alice_mailbox.len(), 1);
+        assert_eq!(bob_mailbox.len(), 1);
+        assert!(carol_mailbox.is_empty());
+        assert_eq!(
+            alice_mailbox[0].route,
+            MessageRoute::Channel {
+                channel_id: channel.id.clone()
+            }
+        );
+        assert_eq!(
+            bob_mailbox[0].route,
+            MessageRoute::Channel {
+                channel_id: channel.id.clone()
+            }
+        );
     }
 }

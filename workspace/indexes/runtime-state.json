@@ -5,18 +5,22 @@
       "name": "demo",
       "instance_ids": [
         "instance.0001",
-        "instance.0002",
-        "instance.0003",
-        "instance.0004",
-        "instance.0005",
-        "instance.0006",
-        "instance.0007"
+        "instance.0002"
+      ],
+      "channel_ids": [
+        "channel.0001"
       ]
-    },
+    }
+  ],
+  "channels": [
     {
-      "id": "session.0002",
-      "name": "demo",
-      "instance_ids": []
+      "id": "channel.0001",
+      "session_id": "session.0001",
+      "name": "planning",
+      "member_instance_ids": [
+        "instance.0001",
+        "instance.0002"
+      ]
     }
   ],
   "instances": [
@@ -26,60 +30,21 @@
       "name": "alice",
       "parent_instance_id": null,
       "child_instance_ids": [],
+      "channel_ids": [
+        "channel.0001"
+      ],
       "job_ids": [],
       "worker_ids": []
     },
     {
       "id": "instance.0002",
       "session_id": "session.0001",
-      "name": "alice",
-      "parent_instance_id": null,
-      "child_instance_ids": [],
-      "job_ids": [],
-      "worker_ids": []
-    },
-    {
-      "id": "instance.0003",
-      "session_id": "session.0001",
-      "name": "alice",
-      "parent_instance_id": null,
-      "child_instance_ids": [],
-      "job_ids": [],
-      "worker_ids": []
-    },
-    {
-      "id": "instance.0004",
-      "session_id": "session.0001",
-      "name": "alice",
-      "parent_instance_id": null,
-      "child_instance_ids": [],
-      "job_ids": [],
-      "worker_ids": []
-    },
-    {
-      "id": "instance.0005",
-      "session_id": "session.0001",
-      "name": "alice",
-      "parent_instance_id": null,
-      "child_instance_ids": [],
-      "job_ids": [],
-      "worker_ids": []
-    },
-    {
-      "id": "instance.0006",
-      "session_id": "session.0001",
-      "name": "alice",
-      "parent_instance_id": null,
-      "child_instance_ids": [],
-      "job_ids": [],
-      "worker_ids": []
-    },
-    {
-      "id": "instance.0007",
-      "session_id": "session.0001",
       "name": "bob",
       "parent_instance_id": null,
       "child_instance_ids": [],
+      "channel_ids": [
+        "channel.0001"
+      ],
       "job_ids": [],
       "worker_ids": []
     }
@@ -91,50 +56,12 @@
       "id": "message.0001",
       "session_id": "session.0001",
       "from": "instance.0001",
-      "to": "instance.0007",
-      "channel": null,
+      "route": {
+        "route": "channel",
+        "channel_id": "channel.0001"
+      },
       "kind": "chat",
-      "body": "你好",
-      "reply_to": null
-    },
-    {
-      "id": "message.0002",
-      "session_id": "session.0001",
-      "from": "instance.0001",
-      "to": "instance.0007",
-      "channel": null,
-      "kind": "chat",
-      "body": "你好",
-      "reply_to": null
-    },
-    {
-      "id": "message.0003",
-      "session_id": "session.0001",
-      "from": "instance.0001",
-      "to": "instance.0007",
-      "channel": null,
-      "kind": "chat",
-      "body": "你好",
-      "reply_to": null
-    },
-    {
-      "id": "message.0004",
-      "session_id": "session.0001",
-      "from": "instance.0001",
-      "to": "instance.0007",
-      "channel": null,
-      "kind": "chat",
-      "body": "你好",
-      "reply_to": null
-    },
-    {
-      "id": "message.0005",
-      "session_id": "session.0001",
-      "from": "instance.0001",
-      "to": "instance.0007",
-      "channel": null,
-      "kind": "chat",
-      "body": "你好",
+      "body": "hello-channel",
       "reply_to": null
     }
   ],
@@ -159,111 +86,48 @@
     },
     {
       "id": "event.0003",
-      "session_id": "session.0002",
-      "source": "runtime",
-      "target": null,
-      "job_id": null,
-      "kind": "session_created",
-      "payload": "demo"
-    },
-    {
-      "id": "event.0004",
       "session_id": "session.0001",
       "source": "instance.0002",
-      "target": null,
-      "job_id": null,
-      "kind": "instance_created",
-      "payload": "alice"
-    },
-    {
-      "id": "event.0005",
-      "session_id": "session.0001",
-      "source": "instance.0003",
-      "target": null,
-      "job_id": null,
-      "kind": "instance_created",
-      "payload": "alice"
-    },
-    {
-      "id": "event.0006",
-      "session_id": "session.0001",
-      "source": "instance.0004",
-      "target": null,
-      "job_id": null,
-      "kind": "instance_created",
-      "payload": "alice"
-    },
-    {
-      "id": "event.0007",
-      "session_id": "session.0001",
-      "source": "instance.0005",
-      "target": null,
-      "job_id": null,
-      "kind": "instance_created",
-      "payload": "alice"
-    },
-    {
-      "id": "event.0008",
-      "session_id": "session.0001",
-      "source": "instance.0006",
-      "target": null,
-      "job_id": null,
-      "kind": "instance_created",
-      "payload": "alice"
-    },
-    {
-      "id": "event.0009",
-      "session_id": "session.0001",
-      "source": "instance.0007",
       "target": null,
       "job_id": null,
       "kind": "instance_created",
       "payload": "bob"
     },
     {
-      "id": "event.0010",
+      "id": "event.0004",
       "session_id": "session.0001",
-      "source": "instance.0001",
-      "target": "instance.0007",
+      "source": "runtime",
+      "target": "channel.0001",
       "job_id": null,
-      "kind": "message_posted",
-      "payload": "你好"
+      "kind": "channel_created",
+      "payload": "planning"
     },
     {
-      "id": "event.0011",
+      "id": "event.0005",
       "session_id": "session.0001",
       "source": "instance.0001",
-      "target": "instance.0007",
+      "target": "channel.0001",
       "job_id": null,
-      "kind": "message_posted",
-      "payload": "你好"
+      "kind": "channel_joined",
+      "payload": "channel.0001"
     },
     {
-      "id": "event.0012",
+      "id": "event.0006",
       "session_id": "session.0001",
-      "source": "instance.0001",
-      "target": "instance.0007",
+      "source": "instance.0002",
+      "target": "channel.0001",
       "job_id": null,
-      "kind": "message_posted",
-      "payload": "你好"
+      "kind": "channel_joined",
+      "payload": "channel.0001"
     },
     {
-      "id": "event.0013",
+      "id": "event.0007",
       "session_id": "session.0001",
       "source": "instance.0001",
-      "target": "instance.0007",
+      "target": "channel.0001",
       "job_id": null,
       "kind": "message_posted",
-      "payload": "你好"
-    },
-    {
-      "id": "event.0014",
-      "session_id": "session.0001",
-      "source": "instance.0001",
-      "target": "instance.0007",
-      "job_id": null,
-      "kind": "message_posted",
-      "payload": "你好"
+      "payload": "hello-channel"
     }
   ]
 }

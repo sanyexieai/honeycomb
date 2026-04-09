@@ -8,8 +8,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
-use hc_core::{MessageKind, RuntimeCommand, RuntimeCommandResult, RuntimeSupervisor};
+use anyhow::{Context, Result, bail};
+use hc_core::{MessageKind, MessageRoute, RuntimeCommand, RuntimeCommandResult, RuntimeSupervisor};
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel, Weak};
 
 slint::slint! {
@@ -251,6 +251,8 @@ fn spawn_window(registry: Rc<RefCell<UiRegistry>>, role_name: String) -> Result<
         transcript_lines: vec![
                 "Honeycomb instance window ready.".to_owned(),
                 "Use /msg <name> <text> to talk to another window.".to_owned(),
+                "Use /all <text> for broadcast and /channel <name> <text> for channel chat.".to_owned(),
+                "Use /channel-create <name>, /join <name>, /leave <name>, /channels.".to_owned(),
                 "Use /name <new-name> to rename this window instance.".to_owned(),
                 "Use /who to list instances.".to_owned(),
             ],
@@ -298,6 +300,31 @@ fn handle_window_input(
         return Ok(());
     }
 
+    if let Some(body) = parse_all_command(line) {
+        broadcast_window_message(&registry, window_index, &body)?;
+        return Ok(());
+    }
+
+    if let Some((channel_name, body)) = parse_channel_message_command(line) {
+        send_channel_message(&registry, window_index, &channel_name, &body)?;
+        return Ok(());
+    }
+
+    if let Some(channel_name) = parse_channel_create_command(line) {
+        create_channel(&registry, window_index, &channel_name)?;
+        return Ok(());
+    }
+
+    if let Some(channel_name) = parse_join_command(line) {
+        join_channel(&registry, window_index, &channel_name)?;
+        return Ok(());
+    }
+
+    if let Some(channel_name) = parse_leave_command(line) {
+        leave_channel(&registry, window_index, &channel_name)?;
+        return Ok(());
+    }
+
     if let Some(name) = parse_name_command(line) {
         rename_window_instance(&registry, window_index, &name)?;
         return Ok(());
@@ -308,7 +335,7 @@ fn handle_window_input(
             append_local_line(
                 &registry,
                 window_index,
-                "Commands: /msg <name> <text>, /name <new-name>, /who, /help".to_owned(),
+                "Commands: /msg <name> <text>, /all <text>, /channel <name> <text>, /channel-create <name>, /join <name>, /leave <name>, /channels, /name <new-name>, /who, /help".to_owned(),
             );
         }
         "/who" => {
@@ -322,6 +349,12 @@ fn handle_window_input(
                     .join(", ")
             };
             append_local_line(&registry, window_index, format!("Open instances: {names}"));
+        }
+        "/channels" => {
+            let lines = list_window_channels(&registry, window_index)?;
+            for line in lines {
+                append_local_line(&registry, window_index, line);
+            }
         }
         _ => {
             append_local_line(&registry, window_index, format!("$ {line}"));
@@ -408,8 +441,7 @@ fn send_window_message(
         let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
             session_id: session_id.clone(),
             from: from_id.clone(),
-            to: Some(to_id.clone()),
-            channel: None,
+            route: MessageRoute::Direct { to: to_id.clone() },
             kind: MessageKind::Chat,
             body: body.to_owned(),
             reply_to: None,
@@ -431,6 +463,292 @@ fn send_window_message(
     let _ = (session_id, from_id, from_name, to_id, to_name, message_body);
     sync_windows(registry);
     Ok(())
+}
+
+fn broadcast_window_message(
+    registry: &Rc<RefCell<UiRegistry>>,
+    from_window_index: i32,
+    body: &str,
+) -> Result<()> {
+    {
+        let mut registry_ref = registry.borrow_mut();
+        let from_index = registry_ref
+            .windows
+            .iter()
+            .position(|window| window.window_index == from_window_index)
+            .ok_or_else(|| anyhow::anyhow!("window not found: {from_window_index}"))?;
+
+        let session_id = registry_ref.session_id.clone();
+        let from_id = registry_ref.windows[from_index].instance_id.clone();
+        let from_name = registry_ref.windows[from_index].instance_name.clone();
+
+        let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
+            session_id,
+            from: from_id,
+            route: MessageRoute::Broadcast,
+            kind: MessageKind::Chat,
+            body: body.to_owned(),
+            reply_to: None,
+        })?;
+        let RuntimeCommandResult::Message(message) = result else {
+            bail!("unexpected runtime result while posting broadcast");
+        };
+
+        for window in &mut registry_ref.windows {
+            if window.window_index == from_window_index {
+                window
+                    .transcript_lines
+                    .push(format!("[you -> *] {}", message.body));
+            } else {
+                window
+                    .transcript_lines
+                    .push(format!("[broadcast {}] {from_name}: {}", message.id, message.body));
+            }
+        }
+    }
+
+    sync_windows(registry);
+    Ok(())
+}
+
+fn create_channel(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    channel_name: &str,
+) -> Result<()> {
+    let created_name = {
+        let mut registry_ref = registry.borrow_mut();
+        let session_id = registry_ref.session_id.clone();
+        let result = registry_ref.runtime.dispatch(RuntimeCommand::CreateChannel {
+            session_id,
+            name: channel_name.to_owned(),
+        })?;
+        let RuntimeCommandResult::Channel(channel) = result else {
+            bail!("unexpected runtime result while creating channel");
+        };
+        channel.name
+    };
+    append_local_line(
+        registry,
+        window_index,
+        format!("created channel #{created_name}"),
+    );
+    sync_windows(registry);
+    Ok(())
+}
+
+fn join_channel(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    channel_name: &str,
+) -> Result<()> {
+    let joined_name = {
+        let mut registry_ref = registry.borrow_mut();
+        let target_index = registry_ref
+            .windows
+            .iter()
+            .position(|window| window.window_index == window_index)
+            .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+        let instance_id = registry_ref.windows[target_index].instance_id.clone();
+        let channel_id = resolve_channel_name(
+            &registry_ref.runtime,
+            &registry_ref.session_id,
+            channel_name,
+        )?;
+        let result = registry_ref.runtime.dispatch(RuntimeCommand::JoinChannel {
+            instance_id,
+            channel_id: channel_id.clone(),
+        })?;
+        let RuntimeCommandResult::Instance(_) = result else {
+            bail!("unexpected runtime result while joining channel");
+        };
+        registry_ref
+            .runtime
+            .state()
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .map(|channel| channel.name.clone())
+            .context("channel should exist after join")?
+    };
+    append_local_line(registry, window_index, format!("joined #{joined_name}"));
+    sync_windows(registry);
+    Ok(())
+}
+
+fn leave_channel(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    channel_name: &str,
+) -> Result<()> {
+    let left_name = {
+        let mut registry_ref = registry.borrow_mut();
+        let target_index = registry_ref
+            .windows
+            .iter()
+            .position(|window| window.window_index == window_index)
+            .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+        let instance_id = registry_ref.windows[target_index].instance_id.clone();
+        let channel_id = resolve_channel_name(
+            &registry_ref.runtime,
+            &registry_ref.session_id,
+            channel_name,
+        )?;
+        let name = registry_ref
+            .runtime
+            .state()
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .map(|channel| channel.name.clone())
+            .context("channel should exist before leave")?;
+        let result = registry_ref.runtime.dispatch(RuntimeCommand::LeaveChannel {
+            instance_id,
+            channel_id,
+        })?;
+        let RuntimeCommandResult::Instance(_) = result else {
+            bail!("unexpected runtime result while leaving channel");
+        };
+        name
+    };
+    append_local_line(registry, window_index, format!("left #{left_name}"));
+    sync_windows(registry);
+    Ok(())
+}
+
+fn send_channel_message(
+    registry: &Rc<RefCell<UiRegistry>>,
+    from_window_index: i32,
+    channel_name: &str,
+    body: &str,
+) -> Result<()> {
+    {
+        let mut registry_ref = registry.borrow_mut();
+        let from_index = registry_ref
+            .windows
+            .iter()
+            .position(|window| window.window_index == from_window_index)
+            .ok_or_else(|| anyhow::anyhow!("window not found: {from_window_index}"))?;
+
+        let session_id = registry_ref.session_id.clone();
+        let from_id = registry_ref.windows[from_index].instance_id.clone();
+        let from_name = registry_ref.windows[from_index].instance_name.clone();
+        let channel_id = resolve_channel_name(&registry_ref.runtime, &session_id, channel_name)?;
+        let channel_label = registry_ref
+            .runtime
+            .state()
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .map(|channel| channel.name.clone())
+            .context("channel should exist while posting")?;
+
+        let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
+            session_id,
+            from: from_id,
+            route: MessageRoute::Channel {
+                channel_id: channel_id.clone(),
+            },
+            kind: MessageKind::Chat,
+            body: body.to_owned(),
+            reply_to: None,
+        })?;
+        let RuntimeCommandResult::Message(message) = result else {
+            bail!("unexpected runtime result while posting channel message");
+        };
+
+        let recipients = registry_ref
+            .windows
+            .iter()
+            .map(|window| {
+                let receives = registry_ref
+                    .runtime
+                    .instance(&window.instance_id)
+                    .map(|instance| instance.channel_ids.iter().any(|id| id == &channel_id))
+                    .unwrap_or(false);
+                (window.window_index, receives)
+            })
+            .collect::<Vec<_>>();
+
+        for window in &mut registry_ref.windows {
+            let receives = recipients
+                .iter()
+                .find(|(index, _)| *index == window.window_index)
+                .map(|(_, receives)| *receives)
+                .unwrap_or(false);
+            if !receives {
+                continue;
+            }
+
+            if window.window_index == from_window_index {
+                window
+                    .transcript_lines
+                    .push(format!("[you -> #{}] {}", channel_label, message.body));
+            } else {
+                window.transcript_lines.push(format!(
+                    "[channel {}] {} -> #{}: {}",
+                    message.id, from_name, channel_label, message.body
+                ));
+            }
+        }
+    }
+
+    sync_windows(registry);
+    Ok(())
+}
+
+fn list_window_channels(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+) -> Result<Vec<String>> {
+    let registry_ref = registry.borrow();
+    let window = registry_ref
+        .windows
+        .iter()
+        .find(|window| window.window_index == window_index)
+        .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+    let instance = registry_ref
+        .runtime
+        .instance(&window.instance_id)
+        .context("instance should exist")?;
+
+    if instance.channel_ids.is_empty() {
+        return Ok(vec!["no joined channels".to_owned()]);
+    }
+
+    Ok(instance
+        .channel_ids
+        .iter()
+        .map(|channel_id| {
+            registry_ref
+                .runtime
+                .state()
+                .channels
+                .iter()
+                .find(|channel| channel.id == *channel_id)
+                .map(|channel| format!("#{} ({})", channel.name, channel.id))
+                .unwrap_or_else(|| channel_id.clone())
+        })
+        .collect())
+}
+
+fn resolve_channel_name(
+    runtime: &RuntimeSupervisor,
+    session_id: &str,
+    selector: &str,
+) -> Result<String> {
+    runtime
+        .state()
+        .channels
+        .iter()
+        .find(|channel| {
+            channel.session_id == session_id
+                && (channel.id == selector
+                    || channel.name == selector
+                    || format!("#{}", channel.name) == selector)
+        })
+        .map(|channel| channel.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("channel not found: {selector}"))
 }
 
 fn run_local_command_async(registry: Rc<RefCell<UiRegistry>>, window_index: i32, line: String) {
@@ -626,6 +944,53 @@ fn parse_msg_command(line: &str) -> Option<(String, String)> {
 
 fn parse_name_command(line: &str) -> Option<String> {
     let rest = line.strip_prefix("/name ")?;
+    let name = rest.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+fn parse_all_command(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("/all ")?;
+    let body = rest.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.to_owned())
+}
+
+fn parse_channel_message_command(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("/channel ")?;
+    let mut parts = rest.splitn(2, ' ');
+    let channel = parts.next()?.trim();
+    let body = parts.next()?.trim();
+    if channel.is_empty() || body.is_empty() {
+        return None;
+    }
+    Some((channel.to_owned(), body.to_owned()))
+}
+
+fn parse_channel_create_command(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("/channel-create ")?;
+    let name = rest.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+fn parse_join_command(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("/join ")?;
+    let name = rest.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+fn parse_leave_command(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("/leave ")?;
     let name = rest.trim();
     if name.is_empty() {
         return None;
