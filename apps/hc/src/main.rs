@@ -9,13 +9,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use hc_core::{
-    JobState, MessageKind, MessageRoute, ProcessWorker, RunMode, RunRequest, RuntimeCommand,
-    RuntimeCommandResult, RuntimeState, RuntimeSupervisor, WorkerReport,
+    JobState, MessageKind, MessageRoute, ParticipationClaim, ProcessWorker, RunMode, RunRequest,
+    RuntimeCommand, RuntimeCommandResult, RuntimeNamespace, RuntimeState, RuntimeSupervisor,
+    WorkerReport,
 };
 
 fn main() -> Result<()> {
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
         "instance" => handle_instance(&args[1..]),
         "channel" => handle_channel(&args[1..]),
         "send" => handle_send(&args[1..]),
+        "claim" => handle_claim(&args[1..]),
         "term" => handle_term(&args[1..]),
         "chat" => handle_chat(&args[1..]),
         "inbox" => handle_inbox(&args[1..]),
@@ -85,6 +87,7 @@ fn run_control_repl() -> Result<()> {
             "/session" => handle_session_tokens(&tokens[1..])?,
             "/instance" => handle_instance_tokens(&tokens[1..])?,
             "/channel" => handle_channel_tokens(&tokens[1..])?,
+            "/claim" => handle_claim_tokens(&tokens[1..])?,
             "/term" => handle_term_tokens(&tokens[1..])?,
             "/reset" => reset_state()?,
             "/help" => print_control_help(),
@@ -105,9 +108,11 @@ fn handle_session(args: &[String]) -> Result<()> {
             Ok(())
         }
         [action, name] if action == "create" => {
+            let namespace = runtime_namespace();
             let session = with_locked_runtime_mut(|runtime| {
                 let result = runtime.dispatch(RuntimeCommand::CreateSession {
                     name: name.clone(),
+                    namespace: Some(namespace.clone()),
                 })?;
                 let RuntimeCommandResult::Session(session) = result else {
                     bail!("unexpected runtime result");
@@ -379,6 +384,193 @@ fn handle_send(args: &[String]) -> Result<()> {
     })?;
     println!("[{from_label} -> {to_label}] {body}");
     Ok(())
+}
+
+fn handle_claim(args: &[String]) -> Result<()> {
+    match args {
+        [action, session_selector, instance_selector, message_id, score]
+            if action == "submit" =>
+        {
+            handle_claim_submit(
+                session_selector,
+                instance_selector,
+                message_id,
+                score,
+                None,
+            )
+        }
+        [action, session_selector, instance_selector, message_id, score, reason @ ..]
+            if action == "submit" =>
+        {
+            handle_claim_submit(
+                session_selector,
+                instance_selector,
+                message_id,
+                score,
+                Some(reason.join(" ")),
+            )
+        }
+        [action, message_id] if action == "list" => {
+            let runtime = load_runtime()?;
+            for claim in runtime.claims_for_message(message_id)? {
+                let session_id = runtime
+                    .state()
+                    .messages
+                    .iter()
+                    .find(|message| message.id == *message_id)
+                    .map(|message| message.session_id.clone())
+                    .context("message should exist")?;
+                let label = display_instance(&runtime, &session_id, &claim.instance_id);
+                println!(
+                    "{} score={:.2} round={} reason={}",
+                    label,
+                    claim.score,
+                    claim.round,
+                    claim.reason.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        [action, message_id, round] if action == "resolve" => {
+            let round = round
+                .parse::<u32>()
+                .with_context(|| format!("invalid round: {round}"))?;
+            let result = with_locked_runtime_mut(|runtime| {
+                let result = runtime.dispatch(RuntimeCommand::ResolveSpeakingGrant {
+                    message_id: message_id.clone(),
+                    round,
+                })?;
+                let RuntimeCommandResult::SpeakingGrant(grant) = result else {
+                    bail!("unexpected runtime result");
+                };
+                Ok((runtime.state().clone(), grant))
+            })?;
+            let (state, grant) = result;
+            match grant {
+                Some(grant) => {
+                    let runtime = RuntimeSupervisor::from_state(state);
+                    let session_id = runtime
+                        .state()
+                        .messages
+                        .iter()
+                        .find(|message| message.id == grant.message_id)
+                        .map(|message| message.session_id.clone())
+                        .context("message should exist")?;
+                    let label = display_instance(&runtime, &session_id, &grant.instance_id);
+                    println!(
+                        "granted {} for {} in round {} score={:.2}",
+                        label, grant.message_id, grant.round, grant.score
+                    );
+                }
+                None => {
+                    println!("no speaking grant for {message_id} in round {round}");
+                }
+            }
+            Ok(())
+        }
+        _ => bail!(
+            "usage: hc claim submit <session> <instance> <message_id> <score> [reason...] | hc claim list <message_id> | hc claim resolve <message_id> <round>"
+        ),
+    }
+}
+
+fn handle_claim_submit(
+    session_selector: &str,
+    instance_selector: &str,
+    message_id: &str,
+    score: &str,
+    reason: Option<String>,
+) -> Result<()> {
+    let score = score
+        .parse::<f32>()
+        .with_context(|| format!("invalid score: {score}"))?;
+    let claim = with_locked_runtime_mut(|runtime| {
+        let session_id = resolve_session_selector(runtime, session_selector)?;
+        let instance_id = resolve_instance_selector(runtime, &session_id, instance_selector)?;
+        let round = runtime
+            .nomination_policy()
+            .rounds
+            .first()
+            .map(|round| round.round)
+            .unwrap_or(1);
+        let timestamp_ms = current_timestamp_ms();
+        let claim = match reason.clone() {
+            Some(reason) => ParticipationClaim::new(
+                message_id.to_owned(),
+                instance_id,
+                score,
+                round,
+                timestamp_ms,
+            )
+            .with_reason(reason),
+            None => ParticipationClaim::new(
+                message_id.to_owned(),
+                instance_id,
+                score,
+                round,
+                timestamp_ms,
+            ),
+        };
+        let result = runtime.dispatch(RuntimeCommand::SubmitParticipationClaim {
+            claim: claim.clone(),
+        })?;
+        let RuntimeCommandResult::Claim(claim) = result else {
+            bail!("unexpected runtime result");
+        };
+        Ok((runtime.state().clone(), claim))
+    })?;
+    let (state, claim) = claim;
+    let runtime = RuntimeSupervisor::from_state(state);
+    let session_id = runtime
+        .state()
+        .messages
+        .iter()
+        .find(|message| message.id == claim.message_id)
+        .map(|message| message.session_id.clone())
+        .context("message should exist")?;
+    let label = display_instance(&runtime, &session_id, &claim.instance_id);
+    println!(
+        "claim submitted {} message={} score={:.2} round={}",
+        label, claim.message_id, claim.score, claim.round
+    );
+    Ok(())
+}
+
+fn handle_claim_tokens(tokens: &[String]) -> Result<()> {
+    match tokens {
+        [action, session, instance, message_id, score] if action == "submit" => handle_claim(&[
+            "submit".to_owned(),
+            session.clone(),
+            instance.clone(),
+            message_id.clone(),
+            score.clone(),
+        ]),
+        [action, session, instance, message_id, score, reason @ ..] if action == "submit" => {
+            let mut args = vec![
+                "submit".to_owned(),
+                session.clone(),
+                instance.clone(),
+                message_id.clone(),
+                score.clone(),
+            ];
+            args.extend(reason.iter().cloned());
+            handle_claim(&args)
+        }
+        [action, message_id] if action == "list" => {
+            handle_claim(&["list".to_owned(), message_id.clone()])
+        }
+        [action, message_id, round] if action == "resolve" => handle_claim(&[
+            "resolve".to_owned(),
+            message_id.clone(),
+            round.clone(),
+        ]),
+        _ => {
+            println!(
+                "usage: /claim submit <session> <instance> <message_id> <score> [reason...] | /claim list <message_id> | /claim resolve <message_id> <round>"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn handle_chat(args: &[String]) -> Result<()> {
@@ -803,6 +995,7 @@ fn run_demo() -> Result<()> {
     let mut runtime = RuntimeSupervisor::new();
     runtime.enqueue_command(RuntimeCommand::CreateSession {
         name: "bootstrap".to_owned(),
+        namespace: Some(runtime_namespace()),
     });
     let session = match runtime
         .step()
@@ -1004,12 +1197,28 @@ where
 }
 
 fn state_path() -> PathBuf {
+    if let Ok(path) = env::var("HC_RUNTIME_STATE_PATH") {
+        return PathBuf::from(path);
+    }
+
+    let namespace = runtime_namespace();
+
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("workspace")
+        .join("tenants")
+        .join(namespace.tenant_id)
+        .join("users")
+        .join(namespace.user_id)
         .join("indexes")
         .join("runtime-state.json")
+}
+
+fn runtime_namespace() -> RuntimeNamespace {
+    let tenant_id = env::var("HC_TENANT_ID").unwrap_or_else(|_| "local".to_owned());
+    let user_id = env::var("HC_USER_ID").unwrap_or_else(|_| "default".to_owned());
+    RuntimeNamespace::new(tenant_id, user_id)
 }
 
 fn state_temp_path() -> PathBuf {
@@ -1303,6 +1512,9 @@ fn print_help() {
     println!("hc channel send <session> <from_instance> <channel> <message...>");
     println!("hc send <session> <from_instance> <to_instance> <message...>");
     println!("hc send --all <session> <from_instance> <message...>");
+    println!("hc claim submit <session> <instance> <message_id> <score> [reason...]");
+    println!("hc claim list <message_id>");
+    println!("hc claim resolve <message_id> <round>");
     println!("hc term <session> <instance>");
     println!("hc chat <session> <from_instance> <to_instance>");
     println!("hc inbox <session> <instance> [route]");
@@ -1320,6 +1532,9 @@ fn print_control_help() {
     println!("/channel list <session>");
     println!("/channel join <session> <instance> <channel>");
     println!("/channel leave <session> <instance> <channel>");
+    println!("/claim submit <session> <instance> <message_id> <score> [reason...]");
+    println!("/claim list <message_id>");
+    println!("/claim resolve <message_id> <round>");
     println!("/term <session> <instance>");
     println!("/reset");
     println!("/quit");
@@ -1368,6 +1583,13 @@ fn display_message_route(
 
 fn split_command(line: &str) -> Vec<String> {
     line.split_whitespace().map(ToOwned::to_owned).collect()
+}
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn run_local_command(line: &str) -> Result<()> {

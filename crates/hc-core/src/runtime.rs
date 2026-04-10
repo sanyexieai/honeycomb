@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
+use hc_claim::{ClaimError, NominationPolicy, ParticipationClaim, SpeakingGrant, select_winner};
 use hc_protocol::protocol::RecordId;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeState {
     pub sessions: Vec<SessionRecord>,
     pub channels: Vec<ChannelRecord>,
@@ -12,13 +13,62 @@ pub struct RuntimeState {
     pub workers: Vec<WorkerRecord>,
     pub jobs: Vec<JobRecord>,
     pub messages: Vec<MessageRecord>,
+    #[serde(default)]
+    pub nominations: Vec<NominationRecord>,
+    #[serde(default)]
+    pub claims: Vec<ParticipationClaim>,
+    #[serde(default)]
+    pub speaking_grants: Vec<SpeakingGrant>,
     pub events: Vec<EventRecord>,
 }
 
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            channels: Vec::new(),
+            instances: Vec::new(),
+            workers: Vec::new(),
+            jobs: Vec::new(),
+            messages: Vec::new(),
+            nominations: Vec::new(),
+            claims: Vec::new(),
+            speaking_grants: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeNamespace {
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+impl RuntimeNamespace {
+    pub fn new(tenant_id: impl Into<String>, user_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            user_id: user_id.into(),
+        }
+    }
+
+    pub fn local_default() -> Self {
+        Self::new("local", "default")
+    }
+}
+
+impl Default for RuntimeNamespace {
+    fn default() -> Self {
+        Self::local_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RuntimeCommand {
     CreateSession {
         name: String,
+        namespace: Option<RuntimeNamespace>,
     },
     CreateInstance {
         session_id: String,
@@ -49,6 +99,13 @@ pub enum RuntimeCommand {
         body: String,
         reply_to: Option<String>,
     },
+    SubmitParticipationClaim {
+        claim: ParticipationClaim,
+    },
+    ResolveSpeakingGrant {
+        message_id: String,
+        round: u32,
+    },
     SubmitRunRequest {
         instance_id: String,
         title: String,
@@ -69,12 +126,14 @@ pub enum RuntimeCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RuntimeCommandResult {
     Session(SessionRecord),
     Channel(ChannelRecord),
     Instance(InstanceRecord),
     Message(MessageRecord),
+    Claim(ParticipationClaim),
+    SpeakingGrant(Option<SpeakingGrant>),
     Job(JobRecord),
     Event(EventRecord),
     Ack,
@@ -104,6 +163,7 @@ pub enum WorkerReport {
 pub struct RuntimeSupervisor {
     state: RuntimeState,
     command_queue: VecDeque<RuntimeCommand>,
+    nomination_policy: NominationPolicy,
     next_session: u64,
     next_channel: u64,
     next_instance: u64,
@@ -120,6 +180,7 @@ impl RuntimeSupervisor {
 
     pub fn from_state(state: RuntimeState) -> Self {
         Self {
+            nomination_policy: NominationPolicy::default(),
             next_session: state.sessions.len() as u64,
             next_channel: state.channels.len() as u64,
             next_instance: state.instances.len() as u64,
@@ -134,6 +195,10 @@ impl RuntimeSupervisor {
 
     pub fn state(&self) -> &RuntimeState {
         &self.state
+    }
+
+    pub fn nomination_policy(&self) -> &NominationPolicy {
+        &self.nomination_policy
     }
 
     pub fn queued_command_count(&self) -> usize {
@@ -208,9 +273,12 @@ impl RuntimeSupervisor {
         command: RuntimeCommand,
     ) -> Result<RuntimeCommandResult, RuntimeError> {
         match command {
-            RuntimeCommand::CreateSession { name } => {
-                Ok(RuntimeCommandResult::Session(self.create_session(name)))
-            }
+            RuntimeCommand::CreateSession { name, namespace } => Ok(
+                RuntimeCommandResult::Session(match namespace {
+                    Some(namespace) => self.create_session_in_namespace(name, namespace),
+                    None => self.create_session(name),
+                }),
+            ),
             RuntimeCommand::CreateInstance {
                 session_id,
                 name,
@@ -246,6 +314,12 @@ impl RuntimeSupervisor {
             } => self
                 .post_message(&session_id, &from, route, kind, body, reply_to)
                 .map(RuntimeCommandResult::Message),
+            RuntimeCommand::SubmitParticipationClaim { claim } => self
+                .submit_participation_claim(claim)
+                .map(RuntimeCommandResult::Claim),
+            RuntimeCommand::ResolveSpeakingGrant { message_id, round } => self
+                .resolve_speaking_grant(&message_id, round)
+                .map(RuntimeCommandResult::SpeakingGrant),
             RuntimeCommand::SubmitRunRequest {
                 instance_id,
                 title,
@@ -298,9 +372,18 @@ impl RuntimeSupervisor {
     }
 
     pub fn create_session(&mut self, name: impl Into<String>) -> SessionRecord {
+        self.create_session_in_namespace(name, RuntimeNamespace::local_default())
+    }
+
+    pub fn create_session_in_namespace(
+        &mut self,
+        name: impl Into<String>,
+        namespace: RuntimeNamespace,
+    ) -> SessionRecord {
         let session = SessionRecord {
             id: self.next_id(IdKind::Session),
             name: name.into(),
+            namespace,
             instance_ids: Vec::new(),
             channel_ids: Vec::new(),
         };
@@ -336,6 +419,7 @@ impl RuntimeSupervisor {
         let instance = InstanceRecord {
             id: self.next_id(IdKind::Instance),
             session_id: session_id.to_owned(),
+            namespace: self.state.sessions[session_index].namespace.clone(),
             name: name.into(),
             parent_instance_id: parent_instance_id.clone(),
             child_instance_ids: Vec::new(),
@@ -384,6 +468,7 @@ impl RuntimeSupervisor {
         let channel = ChannelRecord {
             id: self.next_id(IdKind::Channel),
             session_id: session_id.to_owned(),
+            namespace: self.state.sessions[session_index].namespace.clone(),
             name: name.into(),
             member_instance_ids: Vec::new(),
         };
@@ -541,6 +626,38 @@ impl RuntimeSupervisor {
             payload: message.body.clone(),
         });
 
+        if message.kind == MessageKind::Chat
+            && matches!(
+                message.route,
+                MessageRoute::Broadcast | MessageRoute::Channel { .. }
+            )
+        {
+            let opening_round = self
+                .nomination_policy
+                .rounds
+                .first()
+                .map(|round| round.round)
+                .unwrap_or(1);
+            self.state.nominations.push(NominationRecord {
+                message_id: message.id.clone(),
+                session_id: session_id.to_owned(),
+                route: message.route.clone(),
+                current_round: opening_round,
+                status: NominationStatus::Open,
+            });
+
+            let nomination_event_id = self.next_id(IdKind::Event);
+            self.push_event(EventRecord {
+                id: nomination_event_id,
+                session_id: session_id.to_owned(),
+                source: "runtime".to_owned(),
+                target: Some(message.id.clone()),
+                job_id: None,
+                kind: EventKind::NominationOpened,
+                payload: format!("round={opening_round}"),
+            });
+        }
+
         Ok(message)
     }
 
@@ -571,6 +688,122 @@ impl RuntimeSupervisor {
         Ok(instance)
     }
 
+    pub fn submit_participation_claim(
+        &mut self,
+        claim: ParticipationClaim,
+    ) -> Result<ParticipationClaim, RuntimeError> {
+        if !(0.0..=1.0).contains(&claim.score) {
+            return Err(RuntimeError::invalid_claim(claim.score));
+        }
+
+        let message = self
+            .state
+            .messages
+            .iter()
+            .find(|message| message.id == claim.message_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::message_not_found(&claim.message_id))?;
+        self.ensure_instance_in_session(&message.session_id, &claim.instance_id)?;
+
+        self.state.claims.push(claim.clone());
+        let event_id = self.next_id(IdKind::Event);
+        self.push_event(EventRecord {
+            id: event_id,
+            session_id: message.session_id,
+            source: claim.instance_id.clone(),
+            target: Some(message.id.clone()),
+            job_id: None,
+            kind: EventKind::ParticipationClaimSubmitted,
+            payload: format!("round={} score={:.2}", claim.round, claim.score),
+        });
+
+        Ok(claim)
+    }
+
+    pub fn resolve_speaking_grant(
+        &mut self,
+        message_id: &str,
+        round: u32,
+    ) -> Result<Option<SpeakingGrant>, RuntimeError> {
+        let message = self
+            .state
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::message_not_found(message_id))?;
+        let claims = self
+            .state
+            .claims
+            .iter()
+            .filter(|claim| claim.message_id == message_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let grant = select_winner(&claims, &self.nomination_policy, round)
+            .map_err(RuntimeError::claim_protocol)?;
+        let nomination_index = self
+            .state
+            .nominations
+            .iter()
+            .position(|nomination| nomination.message_id == message_id);
+
+        if let Some(grant) = &grant {
+            self.state.speaking_grants.push(grant.clone());
+            if let Some(index) = nomination_index {
+                self.state.nominations[index].status = NominationStatus::Granted;
+                self.state.nominations[index].current_round = round;
+            }
+            let event_id = self.next_id(IdKind::Event);
+            self.push_event(EventRecord {
+                id: event_id,
+                session_id: message.session_id,
+                source: "runtime".to_owned(),
+                target: Some(grant.instance_id.clone()),
+                job_id: None,
+                kind: EventKind::SpeakingGranted,
+                payload: format!(
+                    "message={} round={} score={:.2}",
+                    grant.message_id, grant.round, grant.score
+                ),
+            });
+        } else if let Some(index) = nomination_index {
+            if let Some(next_round) = self
+                .nomination_policy
+                .rounds
+                .iter()
+                .find(|candidate| candidate.round > round)
+                .map(|candidate| candidate.round)
+            {
+                self.state.nominations[index].current_round = next_round;
+                let event_id = self.next_id(IdKind::Event);
+                self.push_event(EventRecord {
+                    id: event_id,
+                    session_id: message.session_id,
+                    source: "runtime".to_owned(),
+                    target: Some(message.id.clone()),
+                    job_id: None,
+                    kind: EventKind::NominationAdvanced,
+                    payload: format!("round={next_round}"),
+                });
+            } else {
+                self.state.nominations[index].status = NominationStatus::Exhausted;
+                self.state.nominations[index].current_round = round;
+                let event_id = self.next_id(IdKind::Event);
+                self.push_event(EventRecord {
+                    id: event_id,
+                    session_id: message.session_id,
+                    source: "runtime".to_owned(),
+                    target: Some(message.id.clone()),
+                    job_id: None,
+                    kind: EventKind::NominationExhausted,
+                    payload: format!("round={round}"),
+                });
+            }
+        }
+
+        Ok(grant)
+    }
+
     pub fn mailbox_for_instance(
         &self,
         session_id: &str,
@@ -597,6 +830,33 @@ impl RuntimeSupervisor {
                 }
             })
             .collect())
+    }
+
+    pub fn claims_for_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<&ParticipationClaim>, RuntimeError> {
+        if !self.state.messages.iter().any(|message| message.id == message_id) {
+            return Err(RuntimeError::message_not_found(message_id));
+        }
+
+        Ok(self
+            .state
+            .claims
+            .iter()
+            .filter(|claim| claim.message_id == message_id)
+            .collect())
+    }
+
+    pub fn nomination_for_message(
+        &self,
+        message_id: &str,
+    ) -> Result<&NominationRecord, RuntimeError> {
+        self.state
+            .nominations
+            .iter()
+            .find(|nomination| nomination.message_id == message_id)
+            .ok_or_else(|| RuntimeError::message_not_found(message_id))
     }
 
     pub fn events_for_instance(
@@ -952,6 +1212,12 @@ pub enum RuntimeError {
     },
     #[error("job not found: {0}")]
     JobNotFound(String),
+    #[error("message not found: {0}")]
+    MessageNotFound(String),
+    #[error("invalid claim score: {0}")]
+    InvalidClaimScore(String),
+    #[error("claim protocol error: {0}")]
+    ClaimProtocol(String),
 }
 
 impl RuntimeError {
@@ -991,12 +1257,26 @@ impl RuntimeError {
     fn job_not_found(job_id: &str) -> Self {
         Self::JobNotFound(job_id.to_owned())
     }
+
+    fn message_not_found(message_id: &str) -> Self {
+        Self::MessageNotFound(message_id.to_owned())
+    }
+
+    fn invalid_claim(score: f32) -> Self {
+        Self::InvalidClaimScore(format!("{score:.4}"))
+    }
+
+    fn claim_protocol(error: ClaimError) -> Self {
+        Self::ClaimProtocol(error.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub namespace: RuntimeNamespace,
     pub instance_ids: Vec<String>,
     pub channel_ids: Vec<String>,
 }
@@ -1011,6 +1291,8 @@ impl RecordId for SessionRecord {
 pub struct ChannelRecord {
     pub id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub namespace: RuntimeNamespace,
     pub name: String,
     pub member_instance_ids: Vec<String>,
 }
@@ -1025,6 +1307,8 @@ impl RecordId for ChannelRecord {
 pub struct InstanceRecord {
     pub id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub namespace: RuntimeNamespace,
     pub name: String,
     pub parent_instance_id: Option<String>,
     pub child_instance_ids: Vec<String>,
@@ -1106,6 +1390,11 @@ pub enum EventKind {
     InstanceCreated,
     InstanceRenamed,
     MessagePosted,
+    NominationOpened,
+    NominationAdvanced,
+    NominationExhausted,
+    ParticipationClaimSubmitted,
+    SpeakingGranted,
     JobQueued,
     JobStateChanged,
     JobStdout,
@@ -1183,6 +1472,23 @@ impl RecordId for MessageRecord {
     fn id(&self) -> &str {
         &self.id
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NominationRecord {
+    pub message_id: String,
+    pub session_id: String,
+    pub route: MessageRoute,
+    pub current_round: u32,
+    pub status: NominationStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NominationStatus {
+    Open,
+    Granted,
+    Exhausted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1321,4 +1627,25 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn runtime_namespace_propagates_from_session_to_instances_and_channels() {
+        let mut runtime = RuntimeSupervisor::new();
+        let session = runtime.create_session_in_namespace(
+            "demo",
+            RuntimeNamespace::new("tenant-a", "user-a"),
+        );
+        let instance = runtime
+            .create_instance(&session.id, "alice", None)
+            .expect("instance should be created");
+        let channel = runtime
+            .create_channel(&session.id, "planning")
+            .expect("channel should be created");
+
+        assert_eq!(session.namespace.tenant_id, "tenant-a");
+        assert_eq!(session.namespace.user_id, "user-a");
+        assert_eq!(instance.namespace, session.namespace);
+        assert_eq!(channel.namespace, session.namespace);
+    }
+
 }

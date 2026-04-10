@@ -156,52 +156,6 @@ pub enum LlmError {
     ProviderFailure(String),
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct MockProvider;
-
-impl MockProvider {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl LlmProvider for MockProvider {
-    fn info(&self) -> ProviderInfo {
-        ProviderInfo {
-            id: "mock".to_owned(),
-            display_name: "Mock Provider".to_owned(),
-            supports_chat: true,
-            supports_streaming: false,
-        }
-    }
-
-    fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse, LlmError> {
-        let last_user_message = request
-            .messages
-            .iter()
-            .rev()
-            .find(|message| matches!(message.role, MessageRole::User))
-            .ok_or_else(|| LlmError::InvalidRequest("missing user message".to_owned()))?;
-
-        let content = format!(
-            "mock:{}:{}",
-            request.model.model,
-            last_user_message.content.trim()
-        );
-
-        Ok(GenerateResponse {
-            model: request.model.clone(),
-            message: ChatMessage::new(MessageRole::Assistant, content),
-            finish_reason: FinishReason::Stop,
-            usage: Some(TokenUsage {
-                input_tokens: request.messages.len() as u32,
-                output_tokens: 1,
-            }),
-            raw: None,
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleProvider {
     info: ProviderInfo,
@@ -380,36 +334,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mock_provider_echoes_last_user_message() {
-        let provider = MockProvider::new();
+    fn registry_returns_error_for_missing_provider() {
+        let registry = ProviderRegistry::new();
         let request = GenerateRequest::new(
-            ModelRef::new("mock", "demo"),
-            vec![
-                ChatMessage::new(MessageRole::System, "You are concise."),
-                ChatMessage::new(MessageRole::User, "hello world"),
-            ],
-        );
-
-        let response = provider.generate(&request).expect("mock should respond");
-
-        assert_eq!(response.model.provider, "mock");
-        assert_eq!(response.model.model, "demo");
-        assert_eq!(response.message.role, MessageRole::Assistant);
-        assert_eq!(response.message.content, "mock:demo:hello world");
-        assert_eq!(response.finish_reason, FinishReason::Stop);
-    }
-
-    #[test]
-    fn registry_routes_request_to_matching_provider() {
-        let mut registry = ProviderRegistry::new();
-        registry.register(MockProvider::new());
-
-        let request = GenerateRequest::new(
-            ModelRef::new("mock", "demo"),
+            ModelRef::new("openai", "gpt-4.1-mini"),
             vec![ChatMessage::new(MessageRole::User, "route this")],
         );
 
-        let response = registry.generate(&request).expect("registry should route");
-        assert_eq!(response.message.content, "mock:demo:route this");
+        let error = registry
+            .generate(&request)
+            .expect_err("missing provider should fail");
+        assert!(matches!(error, LlmError::ProviderNotFound(provider) if provider == "openai"));
     }
 }

@@ -11,11 +11,24 @@
 
 ```text
 workspace/
-  sessions/     Session logs and summaries
-  instances/    Instance definitions and snapshots
-  decisions/    Architecture and product decisions
-  indexes/      Rebuildable derived indexes
-  attachments/  Binary assets referenced by documents
+  tenants/
+    <tenant-id>/
+      users/
+        <user-id>/
+          personas/     Durable persona profiles
+          capabilities/ Shareable capability profiles
+          memory/       Durable memory records and summaries
+          sessions/     Session logs and summaries
+          instances/    Instance definitions and snapshots
+          decisions/    Architecture and product decisions
+          indexes/      Rebuildable derived indexes
+          attachments/  Binary assets referenced by documents
+```
+
+Default local development may use:
+
+```text
+workspace/tenants/local/users/default/
 ```
 
 ## Document Model
@@ -29,6 +42,8 @@ Example:
 id: session.bootstrap.0001
 type: session
 title: Bootstrap session notes
+tenant_id: local
+user_id: default
 tags: [core, runtime]
 status: active
 created_at: 2026-04-09T10:00:00+08:00
@@ -57,6 +72,9 @@ Recommended fields:
 - `tags`
 - `status`
 - `source`
+- `tenant_id`
+- `user_id`
+- `visibility`
 - `relations`
 - `owners`
 - `capabilities`
@@ -91,6 +109,9 @@ Examples:
 - `session.bootstrap.0001.md`
 - `instance.shell.main.0001.md`
 - `decision.storage.markdown-first.0001.md`
+- `memory.task.review.0001.md`
+- `persona.seed.task.demo.planner.md`
+- `capability.seed.planner.md`
 
 ## Linking Rules
 
@@ -110,8 +131,18 @@ High-volume runtime data should not bloat primary Markdown files.
 
 Recommended pattern:
 
-- append runtime events to `workspace/indexes/events.jsonl`
+- append runtime events to `workspace/tenants/<tenant-id>/users/<user-id>/indexes/events.jsonl`
 - periodically summarize those events into session Markdown documents
+
+## Multi-Tenant Rules
+
+- tenant and user boundaries should be visible in directory layout, not hidden only in metadata
+- source Markdown should still include `tenant_id` and `user_id` in frontmatter for portability
+- cross-user or cross-tenant sharing should happen through explicit export/import or shared capability documents, not by silently mixing roots
+- object-level visibility should be explicit:
+  - `private`
+  - `tenant_shared`
+  - `cross_tenant_shared`
 
 ## Storage Boundaries
 

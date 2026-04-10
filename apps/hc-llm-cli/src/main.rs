@@ -7,8 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_llm::{
-    ChatMessage, GenerateRequest, MessageRole, MockProvider, ModelRef, OpenAiCompatibleProvider,
-    ProviderRegistry,
+    ChatMessage, GenerateRequest, MessageRole, ModelRef, OpenAiCompatibleProvider, ProviderRegistry,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -44,15 +43,7 @@ fn main() -> Result<()> {
 
     match args[0].as_str() {
         "config" => handle_config(&args[1..]),
-        "providers" => {
-            for info in registry.provider_infos() {
-                println!(
-                    "{} {} chat={} streaming={}",
-                    info.id, info.display_name, info.supports_chat, info.supports_streaming
-                );
-            }
-            Ok(())
-        }
+        "providers" => print_supported_providers(),
         "chat" => handle_chat(&registry, &args[1..]),
         "generate" => handle_generate(&registry, &args[1..]),
         "help" | "--help" | "-h" => {
@@ -65,9 +56,7 @@ fn main() -> Result<()> {
 
 fn default_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
-    registry.register(MockProvider::new());
-
-    let provider_id = env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned());
+    let provider_id = default_provider();
     let api_key = env::var("HC_LLM_API_KEY")
         .or_else(|_| env::var("OPENAI_API_KEY"))
         .ok();
@@ -75,16 +64,14 @@ fn default_registry() -> ProviderRegistry {
         .or_else(|_| env::var("OPENAI_BASE_URL"))
         .unwrap_or_else(|_| default_base_url_for_provider(&provider_id));
 
-    if provider_id != "mock" {
-        if let Some(api_key) = api_key {
-            if let Ok(provider) = OpenAiCompatibleProvider::new(
-                provider_id.clone(),
-                format!("{provider_id} compatible"),
-                base_url,
-                api_key,
-            ) {
-                registry.register(provider);
-            }
+    if let Some(api_key) = api_key {
+        if let Ok(provider) = OpenAiCompatibleProvider::new(
+            provider_id.clone(),
+            format!("{provider_id} compatible"),
+            base_url,
+            api_key,
+        ) {
+            registry.register(provider);
         }
     }
 
@@ -542,6 +529,9 @@ fn matches_openai_not_configured(error: &hc_llm::LlmError) -> bool {
 
 fn default_provider() -> String {
     if let Ok(provider) = env::var("HC_LLM_PROVIDER") {
+        if provider.trim().eq_ignore_ascii_case("mock") {
+            return "openai".to_owned();
+        }
         return provider;
     }
 
@@ -549,20 +539,20 @@ fn default_provider() -> String {
         return "openai".to_owned();
     }
 
-    "mock".to_owned()
+    "openai".to_owned()
 }
 
 fn default_model() -> String {
     let provider = default_provider();
-    env::var("HC_LLM_MODEL").unwrap_or_else(|_| {
-        if provider == "mock" {
-            "demo".to_owned()
-        } else {
-            let model_type =
-                env::var("HC_LLM_MODEL_TYPE").unwrap_or_else(|_| "balanced".to_owned());
-            default_model_for(&provider, &model_type)
+    if let Ok(model) = env::var("HC_LLM_MODEL") {
+        if !using_legacy_mock_config() {
+            return model;
         }
-    })
+    }
+    {
+        let model_type = env::var("HC_LLM_MODEL_TYPE").unwrap_or_else(|_| "balanced".to_owned());
+        default_model_for(&provider, &model_type)
+    }
 }
 
 fn generate_with_guidance(
@@ -578,6 +568,12 @@ fn generate_with_guidance(
             anyhow::anyhow!(error)
         }
     })
+}
+
+fn using_legacy_mock_config() -> bool {
+    env::var("HC_LLM_PROVIDER")
+        .map(|provider| provider.trim().eq_ignore_ascii_case("mock"))
+        .unwrap_or(false)
 }
 
 fn env_file_path() -> Result<PathBuf> {
@@ -780,4 +776,19 @@ fn prompt_model_type(current_model_type: &str) -> Result<String> {
         }
     }
     normalize_model_type(trimmed)
+}
+
+fn print_supported_providers() -> Result<()> {
+    for preset in provider_presets() {
+        println!(
+            "{} {} base_url={} balanced={} fast={} coding={}",
+            preset.id,
+            preset.display_name,
+            preset.default_base_url,
+            preset.balanced_model,
+            preset.fast_model,
+            preset.coding_model
+        );
+    }
+    Ok(())
 }

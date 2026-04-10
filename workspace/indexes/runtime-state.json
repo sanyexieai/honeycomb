@@ -5,24 +5,13 @@
       "name": "demo",
       "instance_ids": [
         "instance.0001",
-        "instance.0002"
+        "instance.0002",
+        "instance.0003"
       ],
-      "channel_ids": [
-        "channel.0001"
-      ]
+      "channel_ids": []
     }
   ],
-  "channels": [
-    {
-      "id": "channel.0001",
-      "session_id": "session.0001",
-      "name": "planning",
-      "member_instance_ids": [
-        "instance.0001",
-        "instance.0002"
-      ]
-    }
-  ],
+  "channels": [],
   "instances": [
     {
       "id": "instance.0001",
@@ -30,21 +19,27 @@
       "name": "alice",
       "parent_instance_id": null,
       "child_instance_ids": [],
-      "channel_ids": [
-        "channel.0001"
-      ],
+      "channel_ids": [],
       "job_ids": [],
       "worker_ids": []
     },
     {
       "id": "instance.0002",
       "session_id": "session.0001",
-      "name": "bob",
+      "name": "doctor",
       "parent_instance_id": null,
       "child_instance_ids": [],
-      "channel_ids": [
-        "channel.0001"
-      ],
+      "channel_ids": [],
+      "job_ids": [],
+      "worker_ids": []
+    },
+    {
+      "id": "instance.0003",
+      "session_id": "session.0001",
+      "name": "coder",
+      "parent_instance_id": null,
+      "child_instance_ids": [],
+      "channel_ids": [],
       "job_ids": [],
       "worker_ids": []
     }
@@ -57,12 +52,38 @@
       "session_id": "session.0001",
       "from": "instance.0001",
       "route": {
-        "route": "channel",
-        "channel_id": "channel.0001"
+        "route": "broadcast"
       },
       "kind": "chat",
-      "body": "hello-channel",
+      "body": "medical question",
       "reply_to": null
+    }
+  ],
+  "claims": [
+    {
+      "message_id": "message.0001",
+      "instance_id": "instance.0003",
+      "score": 0.86,
+      "reason": "general fallback",
+      "round": 1,
+      "timestamp_ms": 1775792291020
+    },
+    {
+      "message_id": "message.0001",
+      "instance_id": "instance.0002",
+      "score": 0.93,
+      "reason": "medical specialty match",
+      "round": 1,
+      "timestamp_ms": 1775792291388
+    }
+  ],
+  "speaking_grants": [
+    {
+      "message_id": "message.0001",
+      "instance_id": "instance.0002",
+      "round": 1,
+      "score": 0.93,
+      "threshold_band": "high"
     }
   ],
   "events": [
@@ -91,43 +112,52 @@
       "target": null,
       "job_id": null,
       "kind": "instance_created",
-      "payload": "bob"
+      "payload": "doctor"
     },
     {
       "id": "event.0004",
       "session_id": "session.0001",
-      "source": "runtime",
-      "target": "channel.0001",
+      "source": "instance.0003",
+      "target": null,
       "job_id": null,
-      "kind": "channel_created",
-      "payload": "planning"
+      "kind": "instance_created",
+      "payload": "coder"
     },
     {
       "id": "event.0005",
       "session_id": "session.0001",
       "source": "instance.0001",
-      "target": "channel.0001",
+      "target": null,
       "job_id": null,
-      "kind": "channel_joined",
-      "payload": "channel.0001"
+      "kind": "message_posted",
+      "payload": "medical question"
     },
     {
       "id": "event.0006",
       "session_id": "session.0001",
-      "source": "instance.0002",
-      "target": "channel.0001",
+      "source": "instance.0003",
+      "target": "message.0001",
       "job_id": null,
-      "kind": "channel_joined",
-      "payload": "channel.0001"
+      "kind": "participation_claim_submitted",
+      "payload": "round=1 score=0.86"
     },
     {
       "id": "event.0007",
       "session_id": "session.0001",
-      "source": "instance.0001",
-      "target": "channel.0001",
+      "source": "instance.0002",
+      "target": "message.0001",
       "job_id": null,
-      "kind": "message_posted",
-      "payload": "hello-channel"
+      "kind": "participation_claim_submitted",
+      "payload": "round=1 score=0.93"
+    },
+    {
+      "id": "event.0008",
+      "session_id": "session.0001",
+      "source": "runtime",
+      "target": "instance.0002",
+      "job_id": null,
+      "kind": "speaking_granted",
+      "payload": "message=message.0001 round=1 score=0.93"
     }
   ]
 }

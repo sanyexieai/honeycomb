@@ -9,5 +9,5 @@ rust-version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+hc-claim = { path = "../hc-claim" }
 hc-protocol = { path = "../hc-protocol" }
-

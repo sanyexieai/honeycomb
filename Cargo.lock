@@ -1645,10 +1645,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "hc-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-capability",
+ "hc-claim",
+ "hc-core",
+ "hc-memory",
+ "hc-persona",
+ "hc-responder",
+ "hc-store",
+ "hc-trace",
+ "serde",
+]
+
+[[package]]
+name = "hc-capability"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-store",
+ "serde",
+]
+
+[[package]]
+name = "hc-claim"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hc-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-claim",
  "hc-protocol",
  "serde",
  "thiserror 2.0.18",
@@ -1676,11 +1710,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "hc-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-persona",
+ "hc-store",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
+name = "hc-persona"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-store",
+ "serde",
+]
+
+[[package]]
 name = "hc-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hc-responder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-store",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "hc-responder-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-responder",
+ "hc-store",
 ]
 
 [[package]]
@@ -1694,12 +1767,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hc-trace"
+version = "0.1.0"
+dependencies = [
+ "hc-responder",
+ "serde",
+]
+
+[[package]]
 name = "hc-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-agent",
  "hc-core",
+ "hc-llm",
  "hc-protocol",
+ "hc-responder",
+ "hc-store",
  "slint",
 ]
 

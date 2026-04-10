@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+hc-agent = { path = "../hc-agent" }
 hc-core = { path = "../hc-core" }
+hc-llm = { path = "../hc-llm" }
 hc-protocol = { path = "../hc-protocol" }
+hc-responder = { path = "../hc-responder" }
+hc-store = { path = "../hc-store" }
 slint = "1.8"

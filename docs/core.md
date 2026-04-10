@@ -118,6 +118,97 @@ Early implementation rule:
 - broadcast uses neither `to` nor `channel`
 - channel routing uses `channel` and requires membership
 
+## LLM Participation Model
+
+LLM-backed instances should not treat every visible message as a prompt that must be answered.
+
+The runtime should separate three stages:
+
+- visibility: can this instance see the message
+- self-nomination: does this instance believe it is a good fit to answer
+- speaking: is this instance allowed to produce the public reply
+
+This matters most for broadcast and channel discussions where multiple experts may observe the same message.
+
+### Self-Nomination
+
+The preferred early mechanism is distributed self-nomination rather than heavy central routing.
+
+Flow:
+
+1. a message is published into a session or channel
+2. each eligible instance evaluates its own fit
+3. interested instances emit a small nomination signal
+4. the runtime collects nominations
+5. one winner gets the right to answer first
+
+Important constraint:
+
+- nominations should be lightweight
+- nomination is not yet a full answer
+- non-winning instances should stay quiet unless later invited
+
+### Nomination Signal
+
+Early nomination records should include:
+
+- `message_id`
+- `instance_id`
+- `score`
+- `reason`
+- `round`
+- `timestamp`
+
+The score is local and self-assessed by each instance.
+It is not a centralized expert ranking.
+
+### Threshold Rounds
+
+Self-nomination should use staged thresholds rather than a single pass.
+
+Recommended early rounds:
+
+- round 1: high-confidence threshold
+- round 2: medium-confidence threshold
+- round 3: low-confidence threshold
+
+Behavior:
+
+1. when a message arrives, instances may nominate only if they meet the current round threshold
+2. if a high-threshold nominee appears, that nominee gets the first speaking right
+3. if no one qualifies before the round timeout, the threshold drops to the next band
+4. a new nomination round opens
+5. the process repeats until someone wins or all rounds are exhausted
+
+This keeps experts with strong relevance fast, while still allowing broader fallback participation when no clear specialist steps forward.
+
+### Early Winner Rule
+
+The runtime should stay lightweight.
+It does not need deep centralized topic scoring.
+
+A practical first rule is:
+
+- pick the highest nomination score in the current round
+- break ties by earliest timestamp
+- allow only one primary speaker
+
+Optional later extensions:
+
+- allow one secondary speaker for supplement
+- use role priority as a tie-breaker
+- let a coordinator instance request clarification before granting reply rights
+
+### Silence by Default
+
+Recommended early defaults:
+
+- direct messages may go straight to the target instance
+- broadcast messages should trigger nomination rather than immediate speaking
+- channel messages should also use nomination unless the channel is explicitly single-owner
+
+This prevents expert groups from flooding the conversation.
+
 ### When work stays a job
 
 - it only needs execution

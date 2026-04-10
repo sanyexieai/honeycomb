@@ -1,0 +1,18 @@
+[package]
+name = "hc-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+hc-core = { path = "../hc-core" }
+hc-capability = { path = "../hc-capability" }
+hc-claim = { path = "../hc-claim" }
+hc-memory = { path = "../hc-memory" }
+hc-persona = { path = "../hc-persona" }
+hc-responder = { path = "../hc-responder" }
+hc-store = { path = "../hc-store" }
+hc-trace = { path = "../hc-trace" }

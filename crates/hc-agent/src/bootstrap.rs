@@ -1,0 +1,248 @@
+use anyhow::Result;
+use hc_capability::{CapabilityNamespace, CapabilityProfile, seed_capability_for_role};
+use hc_core::{RuntimeCommand, RuntimeCommandResult, RuntimeSupervisor};
+use hc_persona::{PersonaNamespace, PersonaProfile, seed_persona_for_role};
+use hc_responder::{LlmResponderConfig, ResponderBinding};
+use serde::{Deserialize, Serialize};
+
+use crate::{AgentRuntimeBinding, BindingNamespace, TaskNamespace, TaskRequest};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSeed {
+    pub id: String,
+    pub proposed_name: String,
+    pub role: String,
+    pub goal: String,
+    pub capability_hints: Vec<String>,
+}
+
+impl AgentSeed {
+    pub fn new(
+        id: impl Into<String>,
+        proposed_name: impl Into<String>,
+        role: impl Into<String>,
+        goal: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            proposed_name: proposed_name.into(),
+            role: role.into(),
+            goal: goal.into(),
+            capability_hints: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentPlan {
+    pub task_id: String,
+    pub namespace: TaskNamespace,
+    pub seeds: Vec<AgentSeed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializedAgent {
+    pub seed: AgentSeed,
+    pub persona: PersonaProfile,
+    pub capabilities: Vec<CapabilityProfile>,
+    pub binding: AgentRuntimeBinding,
+}
+
+pub fn bootstrap_task(task: &TaskRequest) -> AgentPlan {
+    let base = task.id.replace(' ', "-");
+    AgentPlan {
+        task_id: task.id.clone(),
+        namespace: task.namespace.clone(),
+        seeds: vec![
+            AgentSeed::new(
+                format!("{base}.planner"),
+                "planner",
+                "planner",
+                format!("Plan the work for task: {}", task.title),
+            ),
+            AgentSeed::new(
+                format!("{base}.worker"),
+                "worker",
+                "worker",
+                format!("Execute the main work for task: {}", task.goal),
+            ),
+            AgentSeed::new(
+                format!("{base}.reviewer"),
+                "reviewer",
+                "reviewer",
+                format!("Review outputs and identify gaps for task: {}", task.title),
+            ),
+        ],
+    }
+}
+
+pub fn bootstrap_planning_task(task: &TaskRequest) -> AgentPlan {
+    let base = task.id.replace(' ', "-");
+    AgentPlan {
+        task_id: task.id.clone(),
+        namespace: task.namespace.clone(),
+        seeds: vec![AgentSeed::new(
+            format!("{base}.planner"),
+            "planner",
+            "planner",
+            format!("Plan the work for task: {}", task.goal),
+        )],
+    }
+}
+
+pub fn materialize_plan(
+    runtime: &mut RuntimeSupervisor,
+    session_id: &str,
+    plan: &AgentPlan,
+) -> Result<Vec<MaterializedAgent>> {
+    let mut agents = Vec::new();
+
+    for seed in &plan.seeds {
+        agents.push(materialize_seed(
+            runtime,
+            session_id,
+            &plan.task_id,
+            &plan.namespace,
+            seed,
+        )?);
+    }
+
+    if agents.is_empty() {
+        anyhow::bail!("no agent seeds were materialized");
+    }
+
+    Ok(agents)
+}
+
+pub fn materialize_seed(
+    runtime: &mut RuntimeSupervisor,
+    session_id: &str,
+    task_id: &str,
+    namespace: &TaskNamespace,
+    seed: &AgentSeed,
+) -> Result<MaterializedAgent> {
+    let result = runtime.dispatch(RuntimeCommand::CreateInstance {
+        session_id: session_id.to_owned(),
+        name: seed.proposed_name.clone(),
+        parent_instance_id: None,
+    })?;
+    let RuntimeCommandResult::Instance(instance) = result else {
+        anyhow::bail!("unexpected runtime result while creating instance");
+    };
+
+    let persona = seed_persona_for_role(
+        PersonaNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()),
+        task_id,
+        &seed.proposed_name,
+        &seed.role,
+        &seed.goal,
+    );
+    let capability = seed_capability_for_role(
+        CapabilityNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()),
+        &seed.role,
+    );
+    let mut binding =
+        AgentRuntimeBinding::new(instance.id).with_namespace(BindingNamespace::new(
+            persona.namespace.tenant_id.clone(),
+            persona.namespace.user_id.clone(),
+        ));
+    let mut capability_refs = vec![capability.id.clone()];
+    capability_refs.extend(seed.capability_hints.clone());
+    capability_refs.sort();
+    capability_refs.dedup();
+    binding.capability_refs = capability_refs.clone();
+    binding.persona_ref = Some(persona.id.clone());
+    binding.memory_scope_refs = vec![format!("memory_scope.task.{task_id}")];
+    binding.responder_binding_ref = Some("responder.default".to_owned());
+    binding.responder = Some(ResponderBinding::Llm(LlmResponderConfig {
+        provider: "openai".to_owned(),
+        model: "gpt-4.1-mini".to_owned(),
+        system_prompt: Some(format!(
+            "You are {}. Role: {}. Style: {}.",
+            persona.name, persona.role, persona.style
+        )),
+    }));
+
+    Ok(MaterializedAgent {
+        seed: seed.clone(),
+        persona: PersonaProfile {
+            capability_refs,
+            ..persona
+        },
+        capabilities: vec![capability],
+        binding,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use crate::TaskRequest;
+
+    #[test]
+    fn bootstrap_creates_default_seed_roles() {
+        let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo")
+            .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+        let plan = bootstrap_task(&task);
+
+        assert_eq!(plan.task_id, "task.demo");
+        assert_eq!(plan.namespace.tenant_id, "tenant-a");
+        assert_eq!(plan.namespace.user_id, "user-a");
+        assert_eq!(plan.seeds.len(), 3);
+        assert_eq!(plan.seeds[0].role, "planner");
+        assert_eq!(plan.seeds[1].role, "worker");
+        assert_eq!(plan.seeds[2].role, "reviewer");
+    }
+
+    #[test]
+    fn materialize_plan_creates_runtime_instances() {
+        let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo")
+            .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+        let plan = bootstrap_task(&task);
+        let mut runtime = RuntimeSupervisor::new();
+        let session = runtime.create_session_in_namespace(
+            "demo",
+            hc_core::RuntimeNamespace::new("tenant-a", "user-a"),
+        );
+
+        let agents = materialize_plan(&mut runtime, &session.id, &plan)
+            .context("plan should materialize")
+            .expect("materialization should succeed");
+
+        assert_eq!(agents.len(), 3);
+        assert_eq!(runtime.state().instances.len(), 3);
+        assert_eq!(
+            agents[0].binding.persona_ref.as_deref(),
+            Some("persona.seed.task.demo.planner")
+        );
+        assert_eq!(agents[0].capabilities.len(), 1);
+        assert_eq!(agents[0].capabilities[0].id, "capability.seed.planner");
+        assert_eq!(
+            agents[0].persona.capability_refs,
+            vec!["capability.seed.planner".to_owned()]
+        );
+        assert_eq!(
+            agents[0].binding.capability_refs,
+            vec!["capability.seed.planner".to_owned()]
+        );
+        assert_eq!(agents[0].binding.namespace.tenant_id, "tenant-a");
+        assert_eq!(agents[0].binding.namespace.user_id, "user-a");
+        assert_eq!(agents[0].persona.namespace.tenant_id, "tenant-a");
+        assert_eq!(agents[0].persona.namespace.user_id, "user-a");
+        assert_eq!(agents[0].capabilities[0].namespace.tenant_id, "tenant-a");
+        assert_eq!(agents[0].capabilities[0].namespace.user_id, "user-a");
+        assert_eq!(agents[0].persona.role, "planner");
+    }
+
+    #[test]
+    fn bootstrap_planning_task_creates_only_planner_seed() {
+        let task = TaskRequest::new("task.plan", "Planning Task", "Plan this task")
+            .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+        let plan = bootstrap_planning_task(&task);
+
+        assert_eq!(plan.seeds.len(), 1);
+        assert_eq!(plan.seeds[0].role, "planner");
+        assert_eq!(plan.seeds[0].proposed_name, "planner");
+    }
+}
