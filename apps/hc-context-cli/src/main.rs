@@ -19,9 +19,10 @@ use hc_llm::{
     ProviderRegistry, StreamChunk,
 };
 use hc_memory::{
-    MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind, MemoryOwnerRef, MemoryScope,
-    MemoryVisibility,
+    MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind, MemoryOwnerRef, MemoryRoom,
+    MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope, MemoryVisibility,
 };
+use hc_store::store::WorkspaceNamespace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestMode {
@@ -417,7 +418,7 @@ fn default_registry() -> ProviderRegistry {
 fn print_help() -> Result<()> {
     println!("hc-context-cli");
     println!("hc-context-cli                    # start chat");
-    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory]");
+    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--chat-room-id <id>]");
     println!("hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--write-room-id <id> --write-room-layer <layer>]");
     Ok(())
 }
@@ -432,6 +433,8 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         typewriter_delay_ms: default_typewriter_delay_ms(),
     };
     let mut show_memory = false;
+    let mut persist_chat_memory = default_chat_memory_enabled();
+    let mut chat_room_id: Option<String> = None;
     let mut memory_query = ContextMemoryQuery::default().for_namespace(runtime_memory_namespace());
 
     let mut owner_kind: Option<MemoryOwnerKind> = None;
@@ -540,6 +543,22 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 show_memory = true;
                 index += 1;
             }
+            "--chat-memory" => {
+                persist_chat_memory = true;
+                index += 1;
+            }
+            "--no-chat-memory" => {
+                persist_chat_memory = false;
+                index += 1;
+            }
+            "--chat-room-id" => {
+                chat_room_id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --chat-room-id")?,
+                );
+                index += 2;
+            }
             other => bail!("unknown chat option: {other}"),
         }
     }
@@ -559,12 +578,33 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     println!("Type /help for commands, /quit to exit.");
 
     let memory_namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
     let retriever = WorkspaceMemoryRetriever::new(
         default_workspace_root(),
-        workspace_namespace_from_memory_namespace(&memory_namespace),
+        workspace_namespace.clone(),
     );
     let composer = DefaultContextComposer;
     let mut history = Vec::new();
+    let chat_room = if persist_chat_memory {
+        let room_id = chat_room_id.unwrap_or_else(|| default_chat_room_id(&memory_namespace));
+        let room = MemoryRoom::new(
+            room_id,
+            MemoryLayer::Chat,
+            format!("Chat Room | {} / {}", memory_namespace.tenant_id, memory_namespace.user_id),
+            "Interactive chat transcript and compressed reply memory.",
+        )
+        .with_namespace(memory_namespace.clone())
+        .with_visibility(MemoryVisibility::Private)
+        .with_tag("chat")
+        .with_tag("interactive");
+        ensure_chat_room(default_workspace_root(), &workspace_namespace, &room)?;
+        println!("chat_memory=on room={}", room.id);
+        Some(room)
+    } else {
+        println!("chat_memory=off");
+        None
+    };
+    let mut turn_index = 0usize;
 
     loop {
         print!("you> ");
@@ -606,6 +646,17 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             _ => {}
         }
 
+        turn_index += 1;
+        if let Some(room) = &chat_room {
+            persist_chat_turn_user_message(
+                default_workspace_root(),
+                &workspace_namespace,
+                room,
+                turn_index,
+                trimmed,
+            )?;
+        }
+
         history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
         let generation = GenerateRequest::new(ModelRef::new(provider.clone(), model.clone()), history.clone());
         let request = ContextRequest::new(generation)
@@ -637,6 +688,16 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         };
         println!();
         history.push(response.response.message.clone());
+
+        if let Some(room) = &chat_room {
+            persist_chat_turn_assistant_reply(
+                default_workspace_root(),
+                &workspace_namespace,
+                room,
+                turn_index,
+                &response.response.message.content,
+            )?;
+        }
 
         if show_memory {
             if response.recalled_memories.is_empty() {
@@ -681,6 +742,18 @@ fn default_typewriter_delay_ms() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(12)
+}
+
+fn default_chat_memory_enabled() -> bool {
+    env::var("HC_CONTEXT_CHAT_MEMORY")
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn parse_request_mode(value: &str) -> Result<RequestMode> {
@@ -771,6 +844,98 @@ fn summarize_title_from_prompt(prompt_parts: &[String]) -> String {
         return "Context Memory".to_owned();
     }
     joined.chars().take(64).collect()
+}
+
+fn default_chat_room_id(namespace: &MemoryNamespace) -> String {
+    format!(
+        "room.chat.{}.{}.{}",
+        slugify_chat_segment(&namespace.tenant_id),
+        slugify_chat_segment(&namespace.user_id),
+        current_timestamp_ms()
+    )
+}
+
+fn ensure_chat_room(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+) -> Result<()> {
+    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    repository.write_room(room)?;
+    Ok(())
+}
+
+fn persist_chat_turn_user_message(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+    turn_index: usize,
+    content: &str,
+) -> Result<()> {
+    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let asset = MemoryRoomAsset::new(
+        format!("asset.{}.turn.{}.user", room.id, turn_index),
+        room.id.clone(),
+        format!("turn.{:04}.user.md", turn_index),
+        MemoryLayer::Chat,
+        MemoryRoomAssetKind::Raw,
+        format!("User Turn {}", turn_index),
+        content.trim(),
+    )
+    .with_namespace(MemoryNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()))
+    .with_visibility(MemoryVisibility::Private)
+    .with_memory_kind(MemoryKind::Knowledge)
+    .with_owner(MemoryOwnerRef::session(room.id.clone()))
+    .with_tag("chat")
+    .with_tag("user");
+    repository.write_asset(room, &asset)?;
+    Ok(())
+}
+
+fn persist_chat_turn_assistant_reply(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+    turn_index: usize,
+    content: &str,
+) -> Result<()> {
+    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let asset = MemoryRoomAsset::new(
+        format!("asset.{}.turn.{}.assistant", room.id, turn_index),
+        room.id.clone(),
+        format!("turn.{:04}.assistant.md", turn_index),
+        MemoryLayer::Chat,
+        MemoryRoomAssetKind::Compressed,
+        format!("Assistant Turn {}", turn_index),
+        content.trim(),
+    )
+    .with_namespace(MemoryNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()))
+    .with_visibility(MemoryVisibility::Private)
+    .with_memory_kind(MemoryKind::Summary)
+    .with_owner(MemoryOwnerRef::session(room.id.clone()))
+    .with_tag("chat")
+    .with_tag("assistant");
+    repository.write_asset(room, &asset)?;
+    Ok(())
+}
+
+fn current_timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis()
+}
+
+fn slugify_chat_segment(value: &str) -> String {
+    let mut slug = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('.') {
+            slug.push('.');
+        }
+    }
+    slug.trim_matches('.').to_owned()
 }
 
 fn render_output(text: &str, output_style: OutputStyle) -> Result<()> {

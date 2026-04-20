@@ -11,3 +11,4 @@ serde_json.workspace = true
 hc-context = { path = "../../crates/hc-context" }
 hc-llm = { path = "../../crates/hc-llm" }
 hc-memory = { path = "../../crates/hc-memory" }
+hc-store = { path = "../../crates/hc-store" }

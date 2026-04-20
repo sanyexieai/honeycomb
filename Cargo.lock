@@ -1699,6 +1699,7 @@ dependencies = [
  "hc-context",
  "hc-llm",
  "hc-memory",
+ "hc-store",
  "serde_json",
 ]
 
