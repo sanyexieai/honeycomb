@@ -9,10 +9,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_context::{
-    ContextMemoryQuery, ContextRequest, DefaultContextComposer, PromptPolicy,
-    WorkspaceMemoryRetriever, default_workspace_root, generate_with_context,
-    generate_with_context_stream, persist_room_memory, room_memory_write_request_from_response,
-    workspace_namespace_from_memory_namespace,
+    CompositeMemoryOrganizer, ContextMemoryQuery, ContextRequest, DefaultContextComposer,
+    DefaultPromptAssetSynthesizer, KeywordMemoryTagSuggester, LlmMemoryOrganizer,
+    LlmPromptAssetSynthesizer, MemoryOrganizationInput, MemoryOrganizer, PromptAssetSynthesizer,
+    PromptPolicy, RuleBasedMemoryKindResolver, RuleBasedMemoryPromotionAdvisor,
+    RuleBasedMemoryRoomRouter, WorkspaceMemoryRetriever, default_workspace_root,
+    generate_with_context_using_synthesizer, generate_with_context_stream_using_synthesizer,
+    persist_room_memory, room_memory_write_request_from_response, summarize_global_preference,
+    summarize_global_preference_with_llm, workspace_namespace_from_memory_namespace,
 };
 use hc_llm::{
     ChatMessage, GenerateRequest, MessageRole, ModelRef, OpenAiCompatibleProvider,
@@ -28,6 +32,13 @@ use hc_store::store::WorkspaceNamespace;
 enum RequestMode {
     Direct,
     Stream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyMode {
+    Auto,
+    Llm,
+    Rule,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +67,7 @@ fn main() -> Result<()> {
 
 fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--show-memory] [--json] [--write-room-id <id> --write-room-layer <layer>]");
+        bail!("usage: hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]");
     }
 
     let mut provider = default_provider();
@@ -70,6 +81,7 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     };
     let mut show_memory = false;
     let mut json = false;
+    let mut prompt_asset_mode = default_prompt_asset_mode();
     let mut memory_query = ContextMemoryQuery::default().for_namespace(runtime_memory_namespace());
     let mut write_room_id: Option<String> = None;
     let mut write_room_layer: Option<MemoryLayer> = None;
@@ -249,6 +261,13 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 json = true;
                 index += 1;
             }
+            "--prompt-asset-mode" => {
+                prompt_asset_mode = parse_strategy_mode(
+                    args.get(index + 1)
+                        .context("missing value for --prompt-asset-mode")?,
+                )?;
+                index += 2;
+            }
             value => {
                 prompt_parts.push(value.to_owned());
                 index += 1;
@@ -293,10 +312,25 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         workspace_namespace_from_memory_namespace(&memory_namespace),
     );
     let composer = DefaultContextComposer;
+    let prompt_asset_model = ModelRef::new(
+        request.generation.model.provider.clone(),
+        request.generation.model.model.clone(),
+    );
+    let prompt_asset_synthesizer = build_prompt_asset_synthesizer(
+        registry,
+        &prompt_asset_model,
+        prompt_asset_mode,
+    );
 
     let response = match request_mode {
         RequestMode::Direct => {
-            let response = generate_with_context(registry, &retriever, &composer, &request)?;
+            let response = generate_with_context_using_synthesizer(
+                registry,
+                &retriever,
+                &composer,
+                prompt_asset_synthesizer.as_ref(),
+                &request,
+            )?;
             if !json {
                 render_output(&response.response.message.content, output_style)?;
                 println!();
@@ -311,10 +345,11 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 }
                 Ok(())
             };
-            let response = generate_with_context_stream(
+            let response = generate_with_context_stream_using_synthesizer(
                 registry,
                 &retriever,
                 &composer,
+                prompt_asset_synthesizer.as_ref(),
                 &request,
                 &mut callback,
             )?;
@@ -418,8 +453,8 @@ fn default_registry() -> ProviderRegistry {
 fn print_help() -> Result<()> {
     println!("hc-context-cli");
     println!("hc-context-cli                    # start chat");
-    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--chat-room-id <id>]");
-    println!("hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--write-room-id <id> --write-room-layer <layer>]");
+    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--literary-memory] [--no-literary-memory] [--chat-room-id <id>] [--organizer-mode <auto|llm|rule>] [--prompt-asset-mode <auto|llm|rule>] [--preference-summary-mode <auto|llm|rule>]");
+    println!("hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]");
     Ok(())
 }
 
@@ -434,7 +469,11 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     };
     let mut show_memory = false;
     let mut persist_chat_memory = default_chat_memory_enabled();
+    let mut persist_literary_memory = default_literary_memory_enabled();
     let mut chat_room_id: Option<String> = None;
+    let mut organizer_mode = default_organizer_mode();
+    let mut prompt_asset_mode = default_prompt_asset_mode();
+    let mut preference_summary_mode = default_preference_summary_mode();
     let mut memory_query = ContextMemoryQuery::default().for_namespace(runtime_memory_namespace());
 
     let mut owner_kind: Option<MemoryOwnerKind> = None;
@@ -551,12 +590,41 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 persist_chat_memory = false;
                 index += 1;
             }
+            "--literary-memory" => {
+                persist_literary_memory = true;
+                index += 1;
+            }
+            "--no-literary-memory" => {
+                persist_literary_memory = false;
+                index += 1;
+            }
             "--chat-room-id" => {
                 chat_room_id = Some(
                     args.get(index + 1)
                         .cloned()
                         .context("missing value for --chat-room-id")?,
                 );
+                index += 2;
+            }
+            "--organizer-mode" => {
+                organizer_mode = parse_strategy_mode(
+                    args.get(index + 1)
+                        .context("missing value for --organizer-mode")?,
+                )?;
+                index += 2;
+            }
+            "--prompt-asset-mode" => {
+                prompt_asset_mode = parse_strategy_mode(
+                    args.get(index + 1)
+                        .context("missing value for --prompt-asset-mode")?,
+                )?;
+                index += 2;
+            }
+            "--preference-summary-mode" => {
+                preference_summary_mode = parse_strategy_mode(
+                    args.get(index + 1)
+                        .context("missing value for --preference-summary-mode")?,
+                )?;
                 index += 2;
             }
             other => bail!("unknown chat option: {other}"),
@@ -571,9 +639,13 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 
     println!("hc-context chat");
     println!(
-        "provider={provider} model={model} request_mode={} memory_scope={}",
+        "provider={provider} model={model} request_mode={} memory_scope={} organizer={} prompt_assets={} preference_summary={} literary_memory={}",
         request_mode_label(request_mode),
-        memory_scope_label(memory_query.memory_query.scope.as_ref())
+        memory_scope_label(memory_query.memory_query.scope.as_ref()),
+        strategy_mode_label(organizer_mode),
+        strategy_mode_label(prompt_asset_mode),
+        strategy_mode_label(preference_summary_mode),
+        if persist_literary_memory { "on" } else { "off" },
     );
     println!("Type /help for commands, /quit to exit.");
 
@@ -584,6 +656,21 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         workspace_namespace.clone(),
     );
     let composer = DefaultContextComposer;
+    let rule_organizer = CompositeMemoryOrganizer::new(
+        RuleBasedMemoryRoomRouter,
+        RuleBasedMemoryKindResolver,
+        KeywordMemoryTagSuggester,
+        RuleBasedMemoryPromotionAdvisor,
+    );
+    let organizer_model = ModelRef::new(provider.clone(), model.clone());
+    let organizer = build_memory_organizer(
+        registry,
+        &organizer_model,
+        organizer_mode,
+        rule_organizer,
+    );
+    let prompt_asset_synthesizer =
+        build_prompt_asset_synthesizer(registry, &organizer_model, prompt_asset_mode);
     let mut history = Vec::new();
     let chat_room = if persist_chat_memory {
         let room_id = chat_room_id.unwrap_or_else(|| default_chat_room_id(&memory_namespace));
@@ -657,6 +744,20 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             )?;
         }
 
+        if let Some(room) = &chat_room {
+            persist_global_promotions_for_chat_input(
+                organizer.as_ref(),
+                default_workspace_root(),
+                &workspace_namespace,
+                &memory_namespace,
+                room,
+                trimmed,
+                registry,
+                &organizer_model,
+                preference_summary_mode,
+            )?;
+        }
+
         history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
         let generation = GenerateRequest::new(ModelRef::new(provider.clone(), model.clone()), history.clone());
         let request = ContextRequest::new(generation)
@@ -673,7 +774,13 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         io::stdout().flush().context("failed to flush stdout")?;
         let response = match request_mode {
             RequestMode::Direct => {
-                let response = generate_with_context(registry, &retriever, &composer, &request)?;
+                let response = generate_with_context_using_synthesizer(
+                    registry,
+                    &retriever,
+                    &composer,
+                    prompt_asset_synthesizer.as_ref(),
+                    &request,
+                )?;
                 render_output(&response.response.message.content, output_style)?;
                 response
             }
@@ -683,7 +790,14 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                         .map_err(|error| hc_llm::LlmError::ProviderFailure(error.to_string()))?;
                     Ok(())
                 };
-                generate_with_context_stream(registry, &retriever, &composer, &request, &mut callback)?
+                generate_with_context_stream_using_synthesizer(
+                    registry,
+                    &retriever,
+                    &composer,
+                    prompt_asset_synthesizer.as_ref(),
+                    &request,
+                    &mut callback,
+                )?
             }
         };
         println!();
@@ -697,6 +811,21 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 turn_index,
                 &response.response.message.content,
             )?;
+            if persist_literary_memory {
+                match persist_chat_turn_assistant_wenyan(
+                    registry,
+                    &organizer_model,
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    room,
+                    turn_index,
+                    &response.response.message.content,
+                ) {
+                    Ok(Some(path)) => println!("literary> persisted wenyan memory: {}", path.display()),
+                    Ok(None) => {}
+                    Err(error) => eprintln!("literary> skipped wenyan memory: {error}"),
+                }
+            }
         }
 
         if show_memory {
@@ -737,6 +866,27 @@ fn default_request_mode() -> RequestMode {
         .unwrap_or(RequestMode::Direct)
 }
 
+fn default_organizer_mode() -> StrategyMode {
+    env::var("HC_CONTEXT_ORGANIZER_MODE")
+        .ok()
+        .and_then(|value| parse_strategy_mode(&value).ok())
+        .unwrap_or(StrategyMode::Llm)
+}
+
+fn default_prompt_asset_mode() -> StrategyMode {
+    env::var("HC_CONTEXT_PROMPT_ASSET_MODE")
+        .ok()
+        .and_then(|value| parse_strategy_mode(&value).ok())
+        .unwrap_or(StrategyMode::Llm)
+}
+
+fn default_preference_summary_mode() -> StrategyMode {
+    env::var("HC_CONTEXT_PREFERENCE_SUMMARY_MODE")
+        .ok()
+        .and_then(|value| parse_strategy_mode(&value).ok())
+        .unwrap_or(StrategyMode::Llm)
+}
+
 fn default_typewriter_delay_ms() -> u64 {
     env::var("HC_LLM_TYPEWRITER_DELAY_MS")
         .ok()
@@ -756,6 +906,18 @@ fn default_chat_memory_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn default_literary_memory_enabled() -> bool {
+    env::var("HC_CONTEXT_LITERARY_MEMORY")
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn parse_request_mode(value: &str) -> Result<RequestMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "direct" | "sync" => Ok(RequestMode::Direct),
@@ -764,10 +926,27 @@ fn parse_request_mode(value: &str) -> Result<RequestMode> {
     }
 }
 
+fn parse_strategy_mode(value: &str) -> Result<StrategyMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(StrategyMode::Auto),
+        "llm" => Ok(StrategyMode::Llm),
+        "rule" => Ok(StrategyMode::Rule),
+        other => bail!("unsupported strategy mode: {other}. supported modes: auto, llm, rule"),
+    }
+}
+
 fn request_mode_label(mode: RequestMode) -> &'static str {
     match mode {
         RequestMode::Direct => "direct",
         RequestMode::Stream => "stream",
+    }
+}
+
+fn strategy_mode_label(mode: StrategyMode) -> &'static str {
+    match mode {
+        StrategyMode::Auto => "auto",
+        StrategyMode::Llm => "llm",
+        StrategyMode::Rule => "rule",
     }
 }
 
@@ -917,6 +1096,200 @@ fn persist_chat_turn_assistant_reply(
     .with_tag("assistant");
     repository.write_asset(room, &asset)?;
     Ok(())
+}
+
+fn persist_chat_turn_assistant_wenyan(
+    registry: &ProviderRegistry,
+    model: &ModelRef,
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+    turn_index: usize,
+    content: &str,
+) -> Result<Option<PathBuf>> {
+    let source = strip_think_blocks(content).trim().to_owned();
+    if source.is_empty() {
+        return Ok(None);
+    }
+
+    let generation = GenerateRequest::new(
+        model.clone(),
+        vec![
+            ChatMessage::new(
+                MessageRole::System,
+                "Translate the assistant answer into concise classical Chinese. Return only the classical Chinese text, with no explanation.",
+            ),
+            ChatMessage::new(MessageRole::User, source),
+        ],
+    );
+    let response = registry.generate(&generation).map_err(anyhow::Error::from)?;
+    let wenyan = response.message.content.trim();
+    if wenyan.is_empty() {
+        return Ok(None);
+    }
+
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let asset = MemoryRoomAsset::new(
+        format!("asset.{}.turn.{}.assistant.wenyan", room.id, turn_index),
+        room.id.clone(),
+        format!("turn.{:04}.assistant.wenyan.md", turn_index),
+        MemoryLayer::Chat,
+        MemoryRoomAssetKind::Literary,
+        format!("Assistant Turn {} Wenyan", turn_index),
+        wenyan,
+    )
+    .with_namespace(MemoryNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    ))
+    .with_visibility(MemoryVisibility::Private)
+    .with_memory_kind(MemoryKind::Summary)
+    .with_owner(MemoryOwnerRef::session(room.id.clone()))
+    .with_derived_from(format!("asset.{}.turn.{}.assistant", room.id, turn_index))
+    .with_tag("chat")
+    .with_tag("assistant")
+    .with_tag("wenyan");
+
+    Ok(Some(repository.write_asset(room, &asset)?))
+}
+
+fn strip_think_blocks(content: &str) -> String {
+    let mut output = String::new();
+    let mut rest = content;
+    loop {
+        let Some(start) = rest.find("<think>") else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + "<think>".len()..];
+        let Some(end) = after_start.find("</think>") else {
+            break;
+        };
+        rest = &after_start[end + "</think>".len()..];
+    }
+    output
+}
+
+fn persist_global_promotions_for_chat_input(
+    organizer: &(impl MemoryOrganizer + ?Sized),
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    memory_namespace: &MemoryNamespace,
+    chat_room: &MemoryRoom,
+    content: &str,
+    registry: &ProviderRegistry,
+    model: &ModelRef,
+    summary_mode: StrategyMode,
+) -> Result<()> {
+    let input = MemoryOrganizationInput::new(memory_namespace.clone(), content)
+        .with_room_hint(chat_room.id.clone(), MemoryLayer::Chat)
+        .with_owner(MemoryOwnerRef::session(chat_room.id.clone()))
+        .with_tag("chat");
+    let decision = organizer.organize(&input)?;
+
+    if decision.promotions.is_empty() {
+        return Ok(());
+    }
+
+    let Some((summary, memory_kind)) =
+        summarize_preference_for_promotion(registry, model, &input, summary_mode)?
+    else {
+        return Ok(());
+    };
+
+    for promotion in &decision.promotions {
+        if promotion.target_layer != MemoryLayer::Global {
+            continue;
+        }
+        let room_id = promotion.target_room_id.clone().unwrap_or_else(|| {
+            format!(
+                "room.global.{}.{}",
+                slugify_chat_segment(&memory_namespace.tenant_id),
+                slugify_chat_segment(&memory_namespace.user_id)
+            )
+        });
+        let file_slug = slugify_chat_segment(&summary);
+        let write_request = hc_context::RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            MemoryLayer::Global,
+            "Global Preference",
+            summary.clone(),
+            memory_kind.clone(),
+        )
+        .with_visibility(MemoryVisibility::Private)
+        .with_owner(MemoryOwnerRef::global())
+        .with_tag("global")
+        .with_tag("preference")
+        .with_derived_from(chat_room.id.clone())
+        .with_file_name(format!("pref.{}.md", file_slug))
+        .with_asset_id(format!("asset.{}.{}", room_id, file_slug));
+        let path = persist_room_memory(root.as_ref(), workspace_namespace.clone(), &write_request)?;
+        println!("promotion> persisted global memory: {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn build_memory_organizer<'a>(
+    registry: &'a ProviderRegistry,
+    model: &'a ModelRef,
+    mode: StrategyMode,
+    rule_organizer: CompositeMemoryOrganizer<
+        RuleBasedMemoryRoomRouter,
+        RuleBasedMemoryKindResolver,
+        KeywordMemoryTagSuggester,
+        RuleBasedMemoryPromotionAdvisor,
+    >,
+) -> Box<dyn MemoryOrganizer + 'a> {
+    match mode {
+        StrategyMode::Rule => Box::new(rule_organizer),
+        StrategyMode::Auto => {
+            Box::new(LlmMemoryOrganizer::new(registry, model.clone(), rule_organizer))
+        }
+        StrategyMode::Llm => Box::new(LlmMemoryOrganizer::strict(
+            registry,
+            model.clone(),
+            rule_organizer,
+        )),
+    }
+}
+
+fn build_prompt_asset_synthesizer<'a>(
+    registry: &'a ProviderRegistry,
+    model: &'a ModelRef,
+    mode: StrategyMode,
+) -> Box<dyn PromptAssetSynthesizer + 'a> {
+    match mode {
+        StrategyMode::Rule => Box::new(DefaultPromptAssetSynthesizer),
+        StrategyMode::Auto => Box::new(LlmPromptAssetSynthesizer::new(
+            registry,
+            model.clone(),
+            DefaultPromptAssetSynthesizer,
+        )),
+        StrategyMode::Llm => Box::new(LlmPromptAssetSynthesizer::strict(
+            registry,
+            model.clone(),
+            DefaultPromptAssetSynthesizer,
+        )),
+    }
+}
+
+fn summarize_preference_for_promotion(
+    registry: &ProviderRegistry,
+    model: &ModelRef,
+    input: &MemoryOrganizationInput,
+    mode: StrategyMode,
+) -> Result<Option<(String, MemoryKind)>> {
+    match mode {
+        StrategyMode::Rule => Ok(summarize_global_preference(input)),
+        StrategyMode::Llm => summarize_global_preference_with_llm(registry, model, input),
+        StrategyMode::Auto => match summarize_global_preference_with_llm(registry, model, input) {
+            Ok(summary) => Ok(summary.or_else(|| summarize_global_preference(input))),
+            Err(_) => Ok(summarize_global_preference(input)),
+        },
+    }
 }
 
 fn current_timestamp_ms() -> u128 {

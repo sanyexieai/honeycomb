@@ -13,7 +13,7 @@ use hc_memory::{
 };
 use hc_persona::PersonaProfile;
 use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,6 +55,7 @@ impl PromptPolicy {
         }
     }
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptAsset {
@@ -509,6 +510,10 @@ pub trait MemoryPromotionAdvisor {
     ) -> Result<Vec<MemoryPromotionSuggestion>>;
 }
 
+pub trait PromptAssetSynthesizer {
+    fn synthesize(&self, memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>>;
+}
+
 pub trait ContextComposer {
     fn compose_messages(
         &self,
@@ -533,6 +538,28 @@ pub struct KeywordMemoryTagSuggester;
 #[derive(Debug, Clone, Default)]
 pub struct NoopMemoryPromotionAdvisor;
 
+#[derive(Debug, Clone, Default)]
+pub struct RuleBasedMemoryPromotionAdvisor;
+
+#[derive(Debug, Clone, Default)]
+pub struct DefaultPromptAssetSynthesizer;
+
+#[derive(Clone)]
+pub struct LlmPromptAssetSynthesizer<'a, F> {
+    registry: &'a ProviderRegistry,
+    model: hc_llm::ModelRef,
+    fallback: F,
+    fallback_on_error: bool,
+}
+
+#[derive(Clone)]
+pub struct LlmMemoryOrganizer<'a, F> {
+    registry: &'a ProviderRegistry,
+    model: hc_llm::ModelRef,
+    fallback: F,
+    fallback_on_error: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompositeMemoryOrganizer<R, K, T, P> {
     router: R,
@@ -548,6 +575,46 @@ impl<R, K, T, P> CompositeMemoryOrganizer<R, K, T, P> {
             kind_resolver,
             tag_suggester,
             promotion_advisor,
+        }
+    }
+}
+
+impl<'a, F> LlmPromptAssetSynthesizer<'a, F> {
+    pub fn new(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+        Self {
+            registry,
+            model,
+            fallback,
+            fallback_on_error: true,
+        }
+    }
+
+    pub fn strict(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+        Self {
+            registry,
+            model,
+            fallback,
+            fallback_on_error: false,
+        }
+    }
+}
+
+impl<'a, F> LlmMemoryOrganizer<'a, F> {
+    pub fn new(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+        Self {
+            registry,
+            model,
+            fallback,
+            fallback_on_error: true,
+        }
+    }
+
+    pub fn strict(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+        Self {
+            registry,
+            model,
+            fallback,
+            fallback_on_error: false,
         }
     }
 }
@@ -752,6 +819,244 @@ impl MemoryPromotionAdvisor for NoopMemoryPromotionAdvisor {
     }
 }
 
+impl MemoryPromotionAdvisor for RuleBasedMemoryPromotionAdvisor {
+    fn suggest_promotions(
+        &self,
+        input: &MemoryOrganizationInput,
+        _route: &MemoryRoomRoute,
+        _memory_kind: MemoryKind,
+    ) -> Result<Vec<MemoryPromotionSuggestion>> {
+        let content = input.content.trim();
+        let lowered = content.to_ascii_lowercase();
+        let global_room_id = format!(
+            "room.global.{}.{}",
+            slugify_for_memory(&input.namespace.tenant_id),
+            slugify_for_memory(&input.namespace.user_id)
+        );
+
+        let mut promotions = Vec::new();
+        if detect_assistant_name_preference(content).is_some() {
+            promotions.push(MemoryPromotionSuggestion {
+                target_layer: MemoryLayer::Global,
+                target_room_id: Some(global_room_id.clone()),
+                reason: "assistant naming preference should persist across chats".to_owned(),
+            });
+        }
+        if contains_any(
+            &lowered,
+            &[
+                "??????",
+                "?????",
+                "???",
+                "respond in chinese",
+                "answer in chinese",
+            ],
+        ) {
+            promotions.push(MemoryPromotionSuggestion {
+                target_layer: MemoryLayer::Global,
+                target_room_id: Some(global_room_id.clone()),
+                reason: "language preference should persist across chats".to_owned(),
+            });
+        }
+        if contains_any(
+            &lowered,
+            &[
+                "????",
+                "????",
+                "????",
+                "be concise",
+                "shorter answers",
+            ],
+        ) {
+            promotions.push(MemoryPromotionSuggestion {
+                target_layer: MemoryLayer::Global,
+                target_room_id: Some(global_room_id),
+                reason: "response style preference should persist across chats".to_owned(),
+            });
+        }
+
+        Ok(promotions)
+    }
+}
+
+impl PromptAssetSynthesizer for DefaultPromptAssetSynthesizer {
+    fn synthesize(&self, memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>> {
+        let mut assets = Vec::new();
+        for memory in memories {
+            let is_global_preference = memory.kind == MemoryKind::Preference
+                && matches!(memory.layer, Some(MemoryLayer::Global))
+                    || (memory.kind == MemoryKind::Preference && memory.scope == MemoryScope::Global);
+            if !is_global_preference {
+                continue;
+            }
+
+            let kind = infer_prompt_asset_kind_from_preference(memory);
+            let title = match kind {
+                PromptAssetKind::StyleGuide => format!("Style Preference | {}", memory.title),
+                PromptAssetKind::BehaviorTemplate => {
+                    format!("Behavior Preference | {}", memory.title)
+                }
+                _ => format!("Global Preference | {}", memory.title),
+            };
+            assets.push(prompt_asset_from_memory(memory, kind, title));
+        }
+        Ok(assets)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LlmPromptAssetOutput {
+    #[serde(default)]
+    assets: Vec<LlmPromptAssetItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LlmPromptAssetItem {
+    #[serde(default)]
+    source_memory_id: Option<String>,
+    #[serde(default = "default_prompt_asset_kind")]
+    kind: PromptAssetKind,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LlmMemoryOrganizationOutput {
+    #[serde(default)]
+    room_layer: Option<MemoryLayer>,
+    #[serde(default)]
+    room_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    memory_kind: Option<MemoryKind>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    promotions: Vec<MemoryPromotionSuggestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LlmGlobalPreferenceSummaryOutput {
+    #[serde(default)]
+    summary: String,
+    #[serde(default = "default_preference_memory_kind")]
+    memory_kind: MemoryKind,
+}
+
+impl<'a, F> PromptAssetSynthesizer for LlmPromptAssetSynthesizer<'a, F>
+where
+    F: PromptAssetSynthesizer,
+{
+    fn synthesize(&self, memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>> {
+        if memories.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        match self.try_synthesize(memories) {
+            Ok(assets) if !assets.is_empty() => Ok(assets),
+            Ok(_) if self.fallback_on_error => self.fallback.synthesize(memories),
+            Ok(assets) => Ok(assets),
+            Err(error) if self.fallback_on_error => self.fallback.synthesize(memories).or(Err(error)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<'a, F> LlmPromptAssetSynthesizer<'a, F>
+where
+    F: PromptAssetSynthesizer,
+{
+    fn try_synthesize(&self, memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>> {
+        let response = self
+            .registry
+            .generate(&GenerateRequest {
+                model: self.model.clone(),
+                messages: vec![
+                    ChatMessage::new(
+                        MessageRole::System,
+                        "You convert durable recalled memories into prompt assets. Return JSON only.",
+                    ),
+                    ChatMessage::new(
+                        MessageRole::User,
+                        format!(
+                            "{}\n\nMemories JSON:\n{}",
+                            llm_prompt_asset_synthesizer_instructions(),
+                            serde_json::to_string_pretty(memories)?
+                        ),
+                    ),
+                ],
+                temperature: Some(0.1),
+                max_output_tokens: Some(800),
+                metadata: Default::default(),
+            })
+            .map_err(anyhow::Error::from)?;
+        let parsed: LlmPromptAssetOutput = parse_json_payload(&response.message.content)?;
+        Ok(parsed
+            .assets
+            .into_iter()
+            .enumerate()
+            .filter(|(_, asset)| !asset.content.trim().is_empty())
+            .map(|(index, asset)| prompt_asset_from_llm_item(memories, index, asset))
+            .collect())
+    }
+}
+
+impl<'a, F> MemoryOrganizer for LlmMemoryOrganizer<'a, F>
+where
+    F: MemoryOrganizer,
+{
+    fn organize(&self, input: &MemoryOrganizationInput) -> Result<MemoryOrganizationDecision> {
+        match self.try_organize(input) {
+            Ok(decision) => Ok(decision),
+            Err(error) if self.fallback_on_error => self.fallback.organize(input).or(Err(error)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<'a, F> LlmMemoryOrganizer<'a, F>
+where
+    F: MemoryOrganizer,
+{
+    fn try_organize(&self, input: &MemoryOrganizationInput) -> Result<MemoryOrganizationDecision> {
+        let response = self
+            .registry
+            .generate(&GenerateRequest {
+                model: self.model.clone(),
+                messages: vec![
+                    ChatMessage::new(
+                        MessageRole::System,
+                        "You organize memory writes into rooms and promotions. Return JSON only.",
+                    ),
+                    ChatMessage::new(
+                        MessageRole::User,
+                        format!(
+                            "{}\n\nInput JSON:\n{}",
+                            llm_memory_organizer_instructions(),
+                            serde_json::to_string_pretty(input)?
+                        ),
+                    ),
+                ],
+                temperature: Some(0.1),
+                max_output_tokens: Some(900),
+                metadata: Default::default(),
+            })
+            .map_err(anyhow::Error::from)?;
+        let parsed: LlmMemoryOrganizationOutput = parse_json_payload(&response.message.content)?;
+        let fallback = if self.fallback_on_error {
+            self.fallback.organize(input)?
+        } else {
+            base_memory_decision_from_input(input)
+        };
+        Ok(memory_decision_from_llm_output(input, fallback, parsed))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DefaultContextComposer;
 
@@ -847,12 +1152,29 @@ pub fn generate_with_context(
     composer: &impl ContextComposer,
     request: &ContextRequest,
 ) -> Result<ContextResponse> {
+    let synthesizer = LlmPromptAssetSynthesizer::new(
+        registry,
+        request.generation.model.clone(),
+        DefaultPromptAssetSynthesizer,
+    );
+    generate_with_context_using_synthesizer(registry, retriever, composer, &synthesizer, request)
+}
+
+pub fn generate_with_context_using_synthesizer(
+    registry: &ProviderRegistry,
+    retriever: &impl MemoryRetriever,
+    composer: &impl ContextComposer,
+    synthesizer: &(impl PromptAssetSynthesizer + ?Sized),
+    request: &ContextRequest,
+) -> Result<ContextResponse> {
     let memories = retriever.retrieve(&request.memory_query)?;
+    let synthesized_prompt_assets = synthesizer.synthesize(&memories)?;
+    let prompt_assets = merged_prompt_assets(&request.prompt_assets, &synthesized_prompt_assets);
     let messages = composer.compose_messages(
         request.system_prompt.as_deref(),
         request.self_model.as_ref(),
         &request.prompt_policies,
-        &request.prompt_assets,
+        &prompt_assets,
         &memories,
         &request.generation.messages,
     );
@@ -876,12 +1198,37 @@ pub fn generate_with_context_stream(
     request: &ContextRequest,
     on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
 ) -> Result<ContextResponse> {
+    let synthesizer = LlmPromptAssetSynthesizer::new(
+        registry,
+        request.generation.model.clone(),
+        DefaultPromptAssetSynthesizer,
+    );
+    generate_with_context_stream_using_synthesizer(
+        registry,
+        retriever,
+        composer,
+        &synthesizer,
+        request,
+        on_chunk,
+    )
+}
+
+pub fn generate_with_context_stream_using_synthesizer(
+    registry: &ProviderRegistry,
+    retriever: &impl MemoryRetriever,
+    composer: &impl ContextComposer,
+    synthesizer: &(impl PromptAssetSynthesizer + ?Sized),
+    request: &ContextRequest,
+    on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
+) -> Result<ContextResponse> {
     let memories = retriever.retrieve(&request.memory_query)?;
+    let synthesized_prompt_assets = synthesizer.synthesize(&memories)?;
+    let prompt_assets = merged_prompt_assets(&request.prompt_assets, &synthesized_prompt_assets);
     let messages = composer.compose_messages(
         request.system_prompt.as_deref(),
         request.self_model.as_ref(),
         &request.prompt_policies,
-        &request.prompt_assets,
+        &prompt_assets,
         &memories,
         &request.generation.messages,
     );
@@ -1010,6 +1357,85 @@ pub fn prompt_asset_from_memory(
         asset = asset.with_tag(tag.clone());
     }
     asset
+}
+
+pub fn summarize_global_preference(input: &MemoryOrganizationInput) -> Option<(String, MemoryKind)> {
+    if let Some(name) = detect_assistant_name_preference(&input.content) {
+        return Some((
+            format!("User prefers the assistant to be called {}.", name),
+            MemoryKind::Preference,
+        ));
+    }
+
+    let lowered = input.content.to_ascii_lowercase();
+    if contains_any(
+        &lowered,
+        &[
+            "??????",
+            "?????",
+            "???",
+            "respond in chinese",
+            "answer in chinese",
+        ],
+    ) {
+        return Some((
+            "User prefers responses in Chinese.".to_owned(),
+            MemoryKind::Preference,
+        ));
+    }
+
+    if contains_any(
+        &lowered,
+        &[
+            "????",
+            "????",
+            "????",
+            "be concise",
+            "shorter answers",
+        ],
+    ) {
+        return Some((
+            "User prefers concise responses.".to_owned(),
+            MemoryKind::Preference,
+        ));
+    }
+
+    None
+}
+
+pub fn summarize_global_preference_with_llm(
+    registry: &ProviderRegistry,
+    model: &hc_llm::ModelRef,
+    input: &MemoryOrganizationInput,
+) -> Result<Option<(String, MemoryKind)>> {
+    let response = registry
+        .generate(&GenerateRequest {
+            model: model.clone(),
+            messages: vec![
+                ChatMessage::new(
+                    MessageRole::System,
+                    "You summarize durable user preferences into compact memory entries. Return JSON only.",
+                ),
+                ChatMessage::new(
+                    MessageRole::User,
+                    format!(
+                        "{}\n\nInput JSON:\n{}",
+                        llm_global_preference_summary_instructions(),
+                        serde_json::to_string_pretty(input)?
+                    ),
+                ),
+            ],
+            temperature: Some(0.1),
+            max_output_tokens: Some(300),
+            metadata: Default::default(),
+        })
+        .map_err(anyhow::Error::from)?;
+    let parsed: LlmGlobalPreferenceSummaryOutput = parse_json_payload(&response.message.content)?;
+    let summary = parsed.summary.trim();
+    if summary.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((summary.to_owned(), parsed.memory_kind)))
 }
 
 fn memory_scope_for_layer(layer: &MemoryLayer) -> MemoryScope {
@@ -1200,11 +1626,221 @@ fn contains_any(content: &str, candidates: &[&str]) -> bool {
     candidates.iter().any(|candidate| content.contains(candidate))
 }
 
+fn detect_assistant_name_preference(content: &str) -> Option<String> {
+    for marker in ["\u{4f60}\u{4ee5}\u{540e}\u{53eb}", "\u{4ee5}\u{540e}\u{53eb}\u{4f60}", "\u{4ee5}\u{540e}\u{4f60}\u{53eb}", "call you "] {
+        if let Some(rest) = content.split_once(marker).map(|(_, rest)| rest.trim()) {
+            let candidate = rest
+                .trim_matches(|character: char| character.is_ascii_punctuation() || character.is_whitespace())
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| character.is_ascii_punctuation() || character.is_whitespace());
+            if !candidate.is_empty() {
+                return Some(candidate.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn infer_prompt_asset_kind_from_preference(memory: &RetrievedMemory) -> PromptAssetKind {
+    let lowered = memory.summary.to_ascii_lowercase();
+    if contains_any(
+        &lowered,
+        &["concise", "style", "language", "中文", "markdown", "shorter"],
+    ) {
+        PromptAssetKind::StyleGuide
+    } else if contains_any(
+        &lowered,
+        &["called", "name", "叫", "称呼", "call the assistant"],
+    ) {
+        PromptAssetKind::BehaviorTemplate
+    } else {
+        PromptAssetKind::PromptMemory
+    }
+}
+
+fn llm_prompt_asset_synthesizer_instructions() -> &'static str {
+    "Turn the recalled memories into prompt assets that should shape future model behavior.\n\
+Only produce assets for durable instruction-like memories such as user preferences, naming, language, style, output constraints, or other long-lived behavior guidance.\n\
+Prefer zero assets over low-confidence assets.\n\
+Return strict JSON with this schema:\n\
+{\"assets\":[{\"source_memory_id\":\"optional memory id\",\"kind\":\"system_policy|behavior_template|style_guide|output_contract|prompt_memory\",\"title\":\"short title\",\"content\":\"instruction text for the model\",\"tags\":[\"tag\"]}]}"
+}
+
+fn llm_memory_organizer_instructions() -> &'static str {
+    "Decide how to organize this memory write.\n\
+Honor any explicit room_id_hint, room_layer_hint, owner, visibility, and tags when they are present.\n\
+Only suggest promotions when the content should persist beyond the current room, especially global user preferences.\n\
+Return strict JSON with this schema:\n\
+{\"room_layer\":\"chat|topic|task|project|global|null\",\"room_id\":\"optional room id\",\"title\":\"optional title\",\"memory_kind\":\"summary|decision|preference|workflow_memory|knowledge|null\",\"tags\":[\"tag\"],\"promotions\":[{\"target_layer\":\"chat|topic|task|project|global\",\"target_room_id\":\"optional room id\",\"reason\":\"why\"}]}"
+}
+
+fn llm_global_preference_summary_instructions() -> &'static str {
+    "Read the input and decide whether it contains a durable user preference that should be stored as global memory.\n\
+If it does, return a short factual summary in third person, suitable for future recall.\n\
+The memory_kind should usually be \"preference\".\n\
+Return strict JSON with this schema:\n\
+{\"summary\":\"short durable preference summary\",\"memory_kind\":\"preference|summary|knowledge|workflow_memory|decision\"}"
+}
+
+fn parse_json_payload<T>(content: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(parsed) = serde_json::from_str::<T>(content.trim()) {
+        return Ok(parsed);
+    }
+
+    if let Some(block) = extract_json_block(content) {
+        return Ok(serde_json::from_str(block)?);
+    }
+
+    Err(anyhow::anyhow!("llm did not return valid json"))
+}
+
+fn extract_json_block(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    for (open, close) in [('{', '}'), ('[', ']')] {
+        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close))
+            && start < end
+        {
+            return Some(&trimmed[start..=end]);
+        }
+    }
+    None
+}
+
+fn prompt_asset_from_llm_item(
+    memories: &[RetrievedMemory],
+    index: usize,
+    item: LlmPromptAssetItem,
+) -> PromptAsset {
+    let memory = item
+        .source_memory_id
+        .as_ref()
+        .and_then(|id| memories.iter().find(|memory| &memory.id == id));
+    let id = item
+        .source_memory_id
+        .clone()
+        .or_else(|| memory.map(|memory| format!("prompt.asset.{}", memory.id)))
+        .unwrap_or_else(|| format!("prompt.asset.synthetic.{index}"));
+    let mut asset = PromptAsset::new(id, item.kind, item.title, item.content);
+    for tag in item.tags {
+        if !tag.trim().is_empty() {
+            asset = asset.with_tag(tag);
+        }
+    }
+    if let Some(memory) = memory {
+        for tag in &memory.tags {
+            if !asset.tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+                asset.tags.push(tag.clone());
+            }
+        }
+    }
+    asset
+}
+
+fn default_prompt_asset_kind() -> PromptAssetKind {
+    PromptAssetKind::PromptMemory
+}
+
+fn default_preference_memory_kind() -> MemoryKind {
+    MemoryKind::Preference
+}
+
+fn memory_decision_from_llm_output(
+    input: &MemoryOrganizationInput,
+    fallback: MemoryOrganizationDecision,
+    output: LlmMemoryOrganizationOutput,
+) -> MemoryOrganizationDecision {
+    let mut route = fallback.route;
+    if let Some(room_layer) = output.room_layer {
+        route.room_layer = room_layer;
+    }
+    if let Some(room_id) = output.room_id
+        && !room_id.trim().is_empty()
+    {
+        route.room_id = room_id;
+    }
+    if let Some(title) = output.title
+        && !title.trim().is_empty()
+    {
+        route.title = title;
+    }
+    if let Some(owner) = &input.owner
+        && !route.owners.iter().any(|existing| existing == owner)
+    {
+        route.owners.push(owner.clone());
+    }
+    route.visibility = input.visibility.clone();
+
+    let memory_kind = output.memory_kind.unwrap_or(fallback.memory_kind);
+    let mut tags = fallback.tags;
+    for tag in output.tags {
+        if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(&tag)) {
+            tags.push(tag);
+        }
+    }
+
+    MemoryOrganizationDecision {
+        route,
+        memory_kind,
+        tags,
+        promotions: output.promotions,
+    }
+}
+
+fn base_memory_decision_from_input(input: &MemoryOrganizationInput) -> MemoryOrganizationDecision {
+    let room_layer = input.room_layer_hint.clone().unwrap_or(MemoryLayer::Chat);
+    let room_id = input
+        .room_id_hint
+        .clone()
+        .unwrap_or_else(|| format!("room.{}", slugify_for_memory(&input.namespace.user_id)));
+    let mut owners = Vec::new();
+    if let Some(owner) = &input.owner {
+        owners.push(owner.clone());
+    }
+
+    MemoryOrganizationDecision {
+        route: MemoryRoomRoute {
+            room_id,
+            room_layer,
+            title: input
+                .title_hint
+                .clone()
+                .unwrap_or_else(|| summarize_title_from_content(&input.content)),
+            owners,
+            visibility: input.visibility.clone(),
+        },
+        memory_kind: MemoryKind::Summary,
+        tags: input.tags.clone(),
+        promotions: Vec::new(),
+    }
+}
+
+fn merged_prompt_assets(
+    explicit_assets: &[PromptAsset],
+    synthesized_assets: &[PromptAsset],
+) -> Vec<PromptAsset> {
+    let mut merged = explicit_assets.to_vec();
+    for asset in synthesized_assets {
+        if merged.iter().any(|existing| existing.id == asset.id) {
+            continue;
+        }
+        merged.push(asset.clone());
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hc_capability::CapabilityProfile;
-    use hc_llm::{MessageRole, ModelRef};
+    use hc_llm::{
+        FinishReason, GenerateResponse, LlmProvider, MessageRole, ModelRef, ProviderInfo,
+        ProviderRegistry,
+    };
     use hc_memory::{
         MemoryKind, MemoryLayer, MemoryOwnerRef, MemoryRoom, MemoryRoomAsset,
         MemoryRoomAssetKind, MemoryRoomRepository, MemoryVisibility,
@@ -1219,6 +1855,41 @@ mod tests {
             .expect("system time before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("honeycomb-{}-{}-{}", name, std::process::id(), nanos))
+    }
+
+    struct StaticProvider {
+        id: String,
+        response_text: String,
+    }
+
+    impl StaticProvider {
+        fn new(id: &str, response_text: &str) -> Self {
+            Self {
+                id: id.to_owned(),
+                response_text: response_text.to_owned(),
+            }
+        }
+    }
+
+    impl LlmProvider for StaticProvider {
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                id: self.id.clone(),
+                display_name: "Static Test Provider".to_owned(),
+                supports_chat: true,
+                supports_streaming: false,
+            }
+        }
+
+        fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse, hc_llm::LlmError> {
+            Ok(GenerateResponse {
+                model: request.model.clone(),
+                message: ChatMessage::new(MessageRole::Assistant, self.response_text.clone()),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            })
+        }
     }
 
     #[test]
@@ -1537,6 +2208,121 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_asset_synthesizer_turns_global_preference_into_prompt_asset() {
+        let memory = RetrievedMemory {
+            id: "asset.room.global.local.default.pref-name".to_owned(),
+            title: "Global Preference".to_owned(),
+            summary: "User prefers the assistant to be called 小八.".to_owned(),
+            scope: MemoryScope::Global,
+            kind: MemoryKind::Preference,
+            layer: Some(MemoryLayer::Global),
+            room_id: Some("room.global.local.default".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 980,
+            tags: vec!["global".to_owned(), "preference".to_owned()],
+        };
+
+        let assets = DefaultPromptAssetSynthesizer
+            .synthesize(&[memory])
+            .expect("synthesis should succeed");
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, PromptAssetKind::BehaviorTemplate);
+        assert!(assets[0].content.contains("小八"));
+    }
+
+    #[test]
+    fn llm_prompt_asset_synthesizer_prefers_llm_output() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(StaticProvider::new(
+            "test",
+            r#"```json
+{"assets":[{"source_memory_id":"memory.global.preference.0001","kind":"behavior_template","title":"Assistant Name","content":"Call yourself 小八 when addressing the user.","tags":["global","identity"]}]}
+```"#,
+        ));
+        let synthesizer = LlmPromptAssetSynthesizer::new(
+            &registry,
+            ModelRef::new("test", "mock"),
+            DefaultPromptAssetSynthesizer,
+        );
+        let memory = RetrievedMemory::from(&MemoryRecord::new(
+            "memory.global.preference.0001",
+            MemoryScope::Global,
+            MemoryOwnerRef::global(),
+            MemoryKind::Preference,
+            "Assistant Naming",
+            "User prefers the assistant to be called 小八.",
+        ));
+
+        let assets = synthesizer
+            .synthesize(&[memory])
+            .expect("llm synthesizer should succeed");
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, PromptAssetKind::BehaviorTemplate);
+        assert!(assets[0].content.contains("小八"));
+        assert!(assets[0].tags.iter().any(|tag| tag == "identity"));
+    }
+
+    #[test]
+    fn llm_prompt_asset_synthesizer_tolerates_missing_assets_field() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(StaticProvider::new("test", r#"{"note":"no prompt assets"}"#));
+        let synthesizer = LlmPromptAssetSynthesizer::strict(
+            &registry,
+            ModelRef::new("test", "mock"),
+            DefaultPromptAssetSynthesizer,
+        );
+        let memory = RetrievedMemory::from(&MemoryRecord::new(
+            "memory.global.preference.0001",
+            MemoryScope::Global,
+            MemoryOwnerRef::global(),
+            MemoryKind::Preference,
+            "Assistant Naming",
+            "User prefers the assistant to be called 小八.",
+        ));
+
+        let assets = synthesizer
+            .synthesize(&[memory])
+            .expect("missing assets should be treated as no assets");
+
+        assert!(assets.is_empty());
+    }
+
+    #[test]
+    fn composer_renders_synthesized_prompt_assets() {
+        let composer = DefaultContextComposer;
+        let memory = RetrievedMemory {
+            id: "asset.room.global.local.default.pref-language".to_owned(),
+            title: "Global Preference".to_owned(),
+            summary: "User prefers responses in Chinese.".to_owned(),
+            scope: MemoryScope::Global,
+            kind: MemoryKind::Preference,
+            layer: Some(MemoryLayer::Global),
+            room_id: Some("room.global.local.default".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 980,
+            tags: vec!["global".to_owned(), "preference".to_owned()],
+        };
+        let synthesized = DefaultPromptAssetSynthesizer
+            .synthesize(&[memory.clone()])
+            .expect("synthesis should succeed");
+
+        let messages = composer.compose_messages(
+            Some("You are helpful."),
+            None,
+            &[],
+            &synthesized,
+            &[memory],
+            &[ChatMessage::new(MessageRole::User, "继续")],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].content.contains("Prompt assets"));
+        assert!(messages[0].content.contains("User prefers responses in Chinese."));
+    }
+
+    #[test]
     fn self_model_can_be_built_from_persona_and_capabilities() {
         let persona = PersonaProfile::new(
             "persona.agent.reviewer",
@@ -1577,4 +2363,97 @@ mod tests {
             .iter()
             .any(|constraint| constraint.description.contains("Avoid inventing behavior")));
     }
+
+    #[test]
+    fn rule_based_promotion_advisor_detects_global_name_preference() {
+        let advisor = RuleBasedMemoryPromotionAdvisor;
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("local", "default"),
+            "\u{4f60}\u{4ee5}\u{540e}\u{53eb}\u{5c0f}\u{516b}",
+        );
+        let route = MemoryRoomRoute {
+            room_id: "room.chat.local.default.1".to_owned(),
+            room_layer: MemoryLayer::Chat,
+            title: "Chat Room".to_owned(),
+            owners: vec![MemoryOwnerRef::session("room.chat.local.default.1")],
+            visibility: MemoryVisibility::Private,
+        };
+
+        let promotions = advisor
+            .suggest_promotions(&input, &route, MemoryKind::Preference)
+            .expect("promotion suggestions should succeed");
+
+        assert_eq!(promotions.len(), 1);
+        assert_eq!(promotions[0].target_layer, MemoryLayer::Global);
+        assert_eq!(
+            promotions[0].target_room_id.as_deref(),
+            Some("room.global.local.default")
+        );
+
+        let summary = summarize_global_preference(&input)
+            .expect("name preference summary should be generated");
+        assert!(summary.0.contains("小八"));
+        assert_eq!(summary.1, MemoryKind::Preference);
+    }
+
+
+    #[test]
+    fn llm_memory_organizer_prefers_llm_output() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(StaticProvider::new(
+            "test",
+            r#"{"room_layer":"chat","room_id":"room.chat.local.default.1","title":"Chat Room","memory_kind":"preference","tags":["chat","identity"],"promotions":[{"target_layer":"global","target_room_id":"room.global.local.default","reason":"assistant naming should persist"}]}"#,
+        ));
+        let fallback = CompositeMemoryOrganizer::new(
+            RuleBasedMemoryRoomRouter,
+            RuleBasedMemoryKindResolver,
+            KeywordMemoryTagSuggester,
+            RuleBasedMemoryPromotionAdvisor,
+        );
+        let organizer = LlmMemoryOrganizer::new(&registry, ModelRef::new("test", "mock"), fallback);
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("local", "default"),
+            "??????",
+        )
+        .with_room_hint("room.chat.local.default.1", MemoryLayer::Chat)
+        .with_owner(MemoryOwnerRef::session("room.chat.local.default.1"));
+
+        let decision = organizer
+            .organize(&input)
+            .expect("llm organizer should succeed");
+
+        assert_eq!(decision.memory_kind, MemoryKind::Preference);
+        assert!(decision.tags.iter().any(|tag| tag == "identity"));
+        assert_eq!(decision.promotions.len(), 1);
+        assert_eq!(decision.promotions[0].target_layer, MemoryLayer::Global);
+        assert_eq!(
+            decision.promotions[0].target_room_id.as_deref(),
+            Some("room.global.local.default")
+        );
+    }
+
+    #[test]
+    fn llm_global_preference_summary_uses_llm_output() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(StaticProvider::new(
+            "test",
+            r#"{"summary":"User prefers the assistant to be called 小八.","memory_kind":"preference"}"#,
+        ));
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("local", "default"),
+            "你以后叫小八",
+        );
+
+        let summary = summarize_global_preference_with_llm(
+            &registry,
+            &ModelRef::new("test", "mock"),
+            &input,
+        )
+        .expect("llm summary should succeed")
+        .expect("summary should be present");
+
+        assert_eq!(summary.1, MemoryKind::Preference);
+        assert!(summary.0.contains("小八"));
+    }
+
 }

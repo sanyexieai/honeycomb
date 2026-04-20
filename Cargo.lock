@@ -1689,6 +1689,7 @@ dependencies = [
  "hc-persona",
  "hc-store",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
