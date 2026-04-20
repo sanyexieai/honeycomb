@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -464,41 +464,8 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         );
     } else if show_memory {
         let room_candidates = retriever.discover_room_candidates(&effective_memory_query)?;
-        println!("candidate rooms:");
-        if room_candidates.is_empty() {
-            println!("- none");
-        } else {
-            for candidate in room_candidates.iter().take(5) {
-                println!(
-                    "- {} | layer={:?} | score={} | reasons={}",
-                    candidate.room_id,
-                    candidate.layer,
-                    candidate.score_milli,
-                    candidate.reasons.join(",")
-                );
-            }
-        }
-        println!("recalled memories:");
-        if response.recalled_memories.is_empty() {
-            println!("- none");
-        } else {
-            for memory in &response.recalled_memories {
-                let room_suffix = memory
-                    .room_id
-                    .as_ref()
-                    .map(|room_id| format!(" | room={room_id}"))
-                    .unwrap_or_default();
-                println!(
-                    "- {} | kind={:?} | source={}{} | confidence={} | {}",
-                    memory.title,
-                    memory.kind,
-                    memory.source_kind,
-                    room_suffix,
-                    memory.confidence_milli,
-                    memory.summary
-                );
-            }
-        }
+        print_room_candidates_for_generate(&room_candidates);
+        print_recalled_memories_for_generate(&response.recalled_memories);
     }
 
     if !json && let Some(path) = persisted_path {
@@ -1233,33 +1200,221 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 
         if show_memory {
             let room_candidates = retriever.discover_room_candidates(&effective_memory_query)?;
-            if room_candidates.is_empty() {
-                println!("room> none");
-            } else {
-                for candidate in room_candidates.iter().take(5) {
-                    println!(
-                        "room> {} | layer={:?} | score={} | reasons={}",
-                        candidate.room_id,
-                        candidate.layer,
-                        candidate.score_milli,
-                        candidate.reasons.join(",")
-                    );
-                }
-            }
-            if response.recalled_memories.is_empty() {
-                println!("memory> none");
-            } else {
-                for memory in &response.recalled_memories {
-                    println!(
-                        "memory> {} | kind={:?} | source={} | {}",
-                        memory.title, memory.kind, memory.source_kind, memory.summary
-                    );
-                }
-            }
+            print_room_candidates_for_chat(&room_candidates);
+            print_recalled_memories_for_chat(&response.recalled_memories);
         }
     }
 
     Ok(())
+}
+
+fn print_room_candidates_for_generate(candidates: &[hc_context::RoomCandidate]) {
+    println!("candidate rooms:");
+    if candidates.is_empty() {
+        println!("- none");
+        return;
+    }
+
+    for candidate in candidates.iter().take(6) {
+        println!(
+            "- {} | kind={} | layer={:?} | score={} | {}",
+            candidate.room_id,
+            summarize_room_kind(candidate),
+            candidate.layer,
+            candidate.score_milli,
+            summarize_room_signals(&candidate.reasons),
+        );
+        let summary = truncate_debug_text(&candidate.summary, 96);
+        if !summary.is_empty() {
+            println!("  summary: {}", summary);
+        }
+    }
+}
+
+fn print_recalled_memories_for_generate(memories: &[hc_context::RetrievedMemory]) {
+    println!("recalled memories:");
+    if memories.is_empty() {
+        println!("- none");
+        return;
+    }
+
+    for memory in memories {
+        let room_suffix = memory
+            .room_id
+            .as_ref()
+            .map(|room_id| format!(" | room={room_id}"))
+            .unwrap_or_default();
+        println!(
+            "- {} | room_kind={} | kind={:?} | source={}{} | confidence={}",
+            memory.title,
+            summarize_retrieved_room_kind(memory),
+            memory.kind,
+            memory.source_kind,
+            room_suffix,
+            memory.confidence_milli,
+        );
+        let summary = truncate_debug_text(&memory.summary, 108);
+        if !summary.is_empty() {
+            println!("  summary: {}", summary);
+        }
+    }
+}
+
+fn print_room_candidates_for_chat(candidates: &[hc_context::RoomCandidate]) {
+    if candidates.is_empty() {
+        println!("room> none");
+        return;
+    }
+
+    for candidate in candidates.iter().take(6) {
+        println!(
+            "room> {} | kind={} | layer={:?} | score={} | {}",
+            candidate.room_id,
+            summarize_room_kind(candidate),
+            candidate.layer,
+            candidate.score_milli,
+            summarize_room_signals(&candidate.reasons),
+        );
+        let summary = truncate_debug_text(&candidate.summary, 96);
+        if !summary.is_empty() {
+            println!("room> summary={summary}");
+        }
+    }
+}
+
+fn print_recalled_memories_for_chat(memories: &[hc_context::RetrievedMemory]) {
+    if memories.is_empty() {
+        println!("memory> none");
+        return;
+    }
+
+    for memory in memories {
+        let room_suffix = memory
+            .room_id
+            .as_ref()
+            .map(|room_id| format!(" | room={room_id}"))
+            .unwrap_or_default();
+        println!(
+            "memory> {} | room_kind={} | kind={:?} | source={}{} | confidence={}",
+            memory.title,
+            summarize_retrieved_room_kind(memory),
+            memory.kind,
+            memory.source_kind,
+            room_suffix,
+            memory.confidence_milli,
+        );
+        let summary = truncate_debug_text(&memory.summary, 108);
+        if !summary.is_empty() {
+            println!("memory> summary={summary}");
+        }
+    }
+}
+
+fn summarize_room_kind(candidate: &hc_context::RoomCandidate) -> &'static str {
+    if candidate.room_id.starts_with("room.agent.") || candidate.tags.iter().any(|tag| tag == "agent") {
+        "agent"
+    } else if candidate.room_id.starts_with("room.tool.") || candidate.tags.iter().any(|tag| tag == "tool") {
+        "tool"
+    } else if candidate.room_id.starts_with("room.project.")
+        || candidate.tags.iter().any(|tag| tag == "project")
+    {
+        "project"
+    } else if candidate.room_id.starts_with("room.task.") || candidate.tags.iter().any(|tag| tag == "task") {
+        "task"
+    } else if candidate.room_id.starts_with("room.topic.") || candidate.tags.iter().any(|tag| tag == "topic") {
+        "topic"
+    } else if candidate.room_id.starts_with("room.chat.") || candidate.tags.iter().any(|tag| tag == "chat") {
+        "chat"
+    } else if candidate.room_id.starts_with("room.global.")
+        || candidate.tags.iter().any(|tag| tag == "global")
+    {
+        "global"
+    } else {
+        "other"
+    }
+}
+
+fn summarize_retrieved_room_kind(memory: &hc_context::RetrievedMemory) -> &'static str {
+    if let Some(room_id) = &memory.room_id {
+        if room_id.starts_with("room.agent.") || memory.tags.iter().any(|tag| tag == "agent") {
+            "agent"
+        } else if room_id.starts_with("room.tool.") || memory.tags.iter().any(|tag| tag == "tool") {
+            "tool"
+        } else if room_id.starts_with("room.project.")
+            || memory.tags.iter().any(|tag| tag == "project")
+        {
+            "project"
+        } else if room_id.starts_with("room.task.") || memory.tags.iter().any(|tag| tag == "task") {
+            "task"
+        } else if room_id.starts_with("room.topic.") || memory.tags.iter().any(|tag| tag == "topic") {
+            "topic"
+        } else if room_id.starts_with("room.chat.") || memory.tags.iter().any(|tag| tag == "chat") {
+            "chat"
+        } else if room_id.starts_with("room.global.")
+            || memory.tags.iter().any(|tag| tag == "global")
+        {
+            "global"
+        } else {
+            "other"
+        }
+    } else {
+        "other"
+    }
+}
+
+fn summarize_room_signals(reasons: &[String]) -> String {
+    let mut labels = Vec::new();
+    for reason in reasons {
+        let label = if reason == "anchor-room" {
+            "anchor"
+        } else if reason == "anchor-related" {
+            "anchor-link"
+        } else if reason == "active-cluster" {
+            "cluster"
+        } else if let Some(value) = reason.strip_prefix("recent-hit+") {
+            labels.push(format!("hit={value}"));
+            continue;
+        } else if let Some(value) = reason.strip_prefix("recent+") {
+            labels.push(format!("fs={value}"));
+            continue;
+        } else if reason == "related-room" {
+            "linked"
+        } else if reason == "text-match" {
+            "text"
+        } else if reason == "scope-match" {
+            "scope"
+        } else if reason == "active-room" {
+            "active"
+        } else if let Some(kind) = reason.strip_prefix("room-kind=") {
+            labels.push(format!("kind={kind}"));
+            continue;
+        } else if let Some(tag) = reason.strip_prefix("tag=") {
+            labels.push(format!("tag={tag}"));
+            continue;
+        } else {
+            continue;
+        };
+        labels.push(label.to_owned());
+    }
+
+    if labels.is_empty() {
+        "signals=none".to_owned()
+    } else {
+        format!("signals={}", labels.join(","))
+    }
+}
+
+fn truncate_debug_text(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut truncated = trimmed.chars().take(limit).collect::<String>();
+    if trimmed.chars().count() > limit {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 fn runtime_memory_namespace() -> MemoryNamespace {
@@ -1917,6 +2072,16 @@ fn refresh_context_room_metadata(
         updated_room.summary = merge_context_room_summary(&updated_room.summary, &input_snippet);
 
         let refresh_marker = format!("refreshed:{}", slugify_chat_segment(&input_snippet));
+        let activity_marker = format!(
+            "last-active:{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        updated_room
+            .derived_docs
+            .retain(|item| !item.starts_with("last-active:"));
         if !refresh_marker.ends_with(':')
             && !updated_room
                 .derived_docs
@@ -1928,6 +2093,11 @@ fn refresh_context_room_metadata(
                 let keep_from = updated_room.derived_docs.len().saturating_sub(8);
                 updated_room.derived_docs.drain(0..keep_from);
             }
+        }
+        updated_room.derived_docs.push(activity_marker);
+        if updated_room.derived_docs.len() > 8 {
+            let keep_from = updated_room.derived_docs.len().saturating_sub(8);
+            updated_room.derived_docs.drain(0..keep_from);
         }
     }
 

@@ -962,6 +962,7 @@ fn collect_related_room_ids(
     reason: &str,
     related_room_ids: &mut BTreeMap<String, (u16, Vec<String>)>,
 ) {
+    let cluster_bonus = explicit_activity_score(room) / 2;
     for relation in &room.relations {
         if !relation.target.starts_with("room.") {
             continue;
@@ -969,9 +970,12 @@ fn collect_related_room_ids(
         let entry = related_room_ids
             .entry(relation.target.clone())
             .or_insert_with(|| (0, Vec::new()));
-        entry.0 = entry.0.max(score);
+        entry.0 = entry.0.max(score.saturating_add(cluster_bonus).min(320));
         if !entry.1.iter().any(|existing| existing == reason) {
             entry.1.push(reason.to_owned());
+        }
+        if cluster_bonus > 0 && !entry.1.iter().any(|existing| existing == "active-cluster") {
+            entry.1.push("active-cluster".to_owned());
         }
     }
 }
@@ -1034,6 +1038,12 @@ fn build_room_candidate(
     if room.status == "active" {
         score += 180;
         reasons.push("active-room".to_owned());
+    }
+
+    let activity_bonus = explicit_activity_score(room);
+    if activity_bonus > 0 {
+        score = score.saturating_add(activity_bonus);
+        reasons.push(format!("recent-hit+{activity_bonus}"));
     }
 
     let recency_bonus = recency_score(modified_at);
@@ -1102,6 +1112,21 @@ fn recency_score(modified_at: SystemTime) -> u16 {
     } else {
         0
     }
+}
+
+fn explicit_activity_score(room: &hc_memory::MemoryRoom) -> u16 {
+    let Some(timestamp) = room
+        .derived_docs
+        .iter()
+        .rev()
+        .find_map(|item| item.strip_prefix("last-active:"))
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return 0;
+    };
+
+    let activity_time = UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
+    recency_score(activity_time).saturating_add(80).min(300)
 }
 
 fn room_kind_hint(room: &hc_memory::MemoryRoom) -> Option<&'static str> {
