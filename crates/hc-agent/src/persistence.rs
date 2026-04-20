@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use hc_capability::CapabilityRepository;
+use hc_context::{RoomMemoryWriteRequest, persist_room_memory};
 use hc_memory::{MemoryNamespace, MemoryRepository, MemoryVisibility};
 use hc_persona::PersonaRepository;
 use hc_store::store::{
@@ -32,6 +33,8 @@ pub struct PersistedIncubationArtifacts {
 pub struct PersistedTaskArtifacts {
     pub task_plan_path: PathBuf,
     pub assignment_paths: Vec<PathBuf>,
+    pub task_plan_memory_path: PathBuf,
+    pub assignment_memory_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,11 +173,13 @@ pub fn persist_task_artifacts(
     let store = WorkspaceStore::new(workspace_root.as_ref().to_path_buf());
     let timestamp = current_timestamp_label();
     let task_slug = slugify(&task.id);
+    let room_id = task_room_id(task);
 
     let task_plan_document_id = format!("task-plan.{}", task.id);
+    let task_plan_relative_path = PathBuf::from(format!("decisions/{task_slug}.task-plan.md"));
     let task_plan_path = store.write_markdown_in_namespace(
         &namespace,
-        format!("decisions/{task_slug}.task-plan.md"),
+        &task_plan_relative_path,
         &TaskArtifactFrontmatter {
             id: task_plan_document_id.clone(),
             doc_type: "task_plan".to_owned(),
@@ -188,19 +193,42 @@ pub fn persist_task_artifacts(
         },
         &render_task_plan_body(task, plan),
     )?;
+    let task_plan_memory_path = persist_room_memory(
+        workspace_root.as_ref().to_path_buf(),
+        namespace.clone(),
+        &RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            hc_memory::MemoryLayer::Task,
+            format!("Task Plan | {}", task.title),
+            summarize_task_plan_for_room_memory(task, plan),
+            hc_memory::MemoryKind::Summary,
+        )
+        .with_visibility(MemoryVisibility::Private)
+        .with_owner(hc_memory::MemoryOwnerRef::task(task.id.clone()))
+        .with_tag("task")
+        .with_tag("planning")
+        .with_source_doc(task_plan_relative_path.to_string_lossy().replace('\\', "/"))
+        .with_derived_from(task_plan_document_id.clone())
+        .with_file_name("min.task-plan.summary.md")
+        .with_asset_id(format!("asset.{}.task-plan", room_id)),
+    )?;
 
     let mut assignment_paths = Vec::new();
+    let mut assignment_memory_paths = Vec::new();
     for assignment in &plan.work_item_assignments {
         let work_item = plan
             .work_items
             .iter()
             .find(|item| item.id == assignment.work_item_id);
         let assignment_slug = slugify(&assignment.id);
+        let assignment_relative_path =
+            PathBuf::from(format!("decisions/{task_slug}.{assignment_slug}.assignment.md"));
+        let assignment_document_id = format!("assignment-decision.{}", assignment.id);
         assignment_paths.push(store.write_markdown_in_namespace(
             &namespace,
-            format!("decisions/{task_slug}.{assignment_slug}.assignment.md"),
+            &assignment_relative_path,
             &TaskArtifactFrontmatter {
-                id: format!("assignment-decision.{}", assignment.id),
+                id: assignment_document_id.clone(),
                 doc_type: "assignment_decision".to_owned(),
                 title: format!("Assignment | {} | {}", task.title, assignment.agent_name),
                 tenant_id: task.namespace.tenant_id.clone(),
@@ -212,11 +240,32 @@ pub fn persist_task_artifacts(
             },
             &render_assignment_body(task, plan, assignment, work_item),
         )?);
+        assignment_memory_paths.push(persist_room_memory(
+            workspace_root.as_ref().to_path_buf(),
+            namespace.clone(),
+            &RoomMemoryWriteRequest::new(
+                room_id.clone(),
+                hc_memory::MemoryLayer::Task,
+                format!("Assignment | {} | {}", task.title, assignment.agent_name),
+                summarize_assignment_for_room_memory(task, assignment, work_item),
+                hc_memory::MemoryKind::Decision,
+            )
+            .with_visibility(MemoryVisibility::Private)
+            .with_owner(hc_memory::MemoryOwnerRef::task(task.id.clone()))
+            .with_tag("task")
+            .with_tag("assignment")
+            .with_source_doc(assignment_relative_path.to_string_lossy().replace('\\', "/"))
+            .with_derived_from(assignment_document_id)
+            .with_file_name(format!("min.assignment.{}.md", assignment_slug))
+            .with_asset_id(format!("asset.{}.assignment.{}", room_id, assignment.id)),
+        )?);
     }
 
     Ok(PersistedTaskArtifacts {
         task_plan_path,
         assignment_paths,
+        task_plan_memory_path,
+        assignment_memory_paths,
     })
 }
 
@@ -473,6 +522,46 @@ fn slugify(value: &str) -> String {
     slug.trim_matches(&['.', '-'][..]).to_owned()
 }
 
+fn task_room_id(task: &TaskRequest) -> String {
+    format!("room.task.{}", task.id)
+}
+
+fn summarize_task_plan_for_room_memory(task: &TaskRequest, plan: &TaskPlan) -> String {
+    let planning_note = plan
+        .planning_notes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "No explicit planning notes recorded.".to_owned());
+    format!(
+        "Task {} is {}. Goal: {}. Work items: {}. Assignments: {}. First planning note: {}",
+        task.id,
+        task_plan_status_label(&plan.status),
+        task.goal,
+        plan.work_items.len(),
+        plan.work_item_assignments.len(),
+        planning_note
+    )
+}
+
+fn summarize_assignment_for_room_memory(
+    task: &TaskRequest,
+    assignment: &crate::planning::WorkItemAssignment,
+    work_item: Option<&crate::planning::WorkItem>,
+) -> String {
+    let work_item_summary = work_item
+        .map(|item| format!("{} | {} | stage={}", item.title, item.goal, item.stage))
+        .unwrap_or_else(|| assignment.work_item_id.clone());
+    format!(
+        "Task {} assigned work item {} to {} ({}) with status {}. Rationale: {}",
+        task.id,
+        work_item_summary,
+        assignment.agent_name,
+        assignment.agent_instance_id,
+        assignment.status,
+        assignment.rationale
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -584,11 +673,19 @@ mod tests {
         assert!(persisted.task_plan_path.exists());
         assert_eq!(persisted.assignment_paths.len(), 1);
         assert!(persisted.assignment_paths[0].exists());
+        assert!(persisted.task_plan_memory_path.exists());
+        assert_eq!(persisted.assignment_memory_paths.len(), 1);
+        assert!(persisted.assignment_memory_paths[0].exists());
         assert!(persisted
             .task_plan_path
             .to_string_lossy()
             .replace('/', "\\")
             .contains("tenants\\tenant-a\\users\\user-a\\decisions\\"));
+        assert!(persisted
+            .task_plan_memory_path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .contains("tenants\\tenant-a\\users\\user-a\\memory\\rooms\\task\\room.task.task.demo\\compressed\\"));
 
         let task_plan_content =
             fs::read_to_string(&persisted.task_plan_path).expect("task plan file should be readable");
@@ -599,6 +696,16 @@ mod tests {
             .expect("assignment file should be readable");
         assert!(assignment_content.contains("type: assignment_decision"));
         assert!(assignment_content.contains("reviewer"));
+
+        let task_plan_memory_content = fs::read_to_string(&persisted.task_plan_memory_path)
+            .expect("task plan room memory should be readable");
+        assert!(task_plan_memory_content.contains("type: memory_room_asset"));
+        assert!(task_plan_memory_content.contains("memory_kind: summary"));
+
+        let assignment_memory_content = fs::read_to_string(&persisted.assignment_memory_paths[0])
+            .expect("assignment room memory should be readable");
+        assert!(assignment_memory_content.contains("type: memory_room_asset"));
+        assert!(assignment_memory_content.contains("memory_kind: decision"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -665,6 +772,8 @@ mod tests {
         assert_eq!(document.kind, TaskArtifactKind::AssignmentDecision);
         assert_eq!(document.relative_path, relative_path.to_string_lossy().replace('\\', "/"));
         assert!(document.body.contains("Inspect decisions"));
+        assert!(persisted.task_plan_memory_path.exists());
+        assert_eq!(persisted.assignment_memory_paths.len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }

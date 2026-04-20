@@ -1,11 +1,13 @@
 [workspace]
 members = [
   "apps/hc",
+  "apps/hc-context-cli",
   "apps/hc-llm-cli",
   "apps/hc-responder-cli",
   "crates/hc-agent",
   "crates/hc-capability",
   "crates/hc-claim",
+  "crates/hc-context",
   "crates/hc-protocol",
   "crates/hc-core",
   "crates/hc-llm",

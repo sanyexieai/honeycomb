@@ -406,7 +406,15 @@ pub mod store {
             .ok_or_else(|| anyhow::anyhow!("markdown frontmatter must be a YAML mapping"))?;
         let id = required_string_field(mapping, "id")?;
         let doc_type = required_string_field(mapping, "type")?;
-        let title = required_string_field(mapping, "title")?;
+        let title = optional_string_field(mapping, "title")
+            .or_else(|| title_from_body(body))
+            .or_else(|| {
+                relative_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.replace(['-', '_'], " "))
+            })
+            .unwrap_or_else(|| id.clone());
 
         Ok(MarkdownIndexEntry {
             id,
@@ -482,6 +490,18 @@ pub mod store {
             Value::Bool(value) => Some(value.to_string()),
             _ => None,
         }
+    }
+
+    fn title_from_body(body: &str) -> Option<String> {
+        body.lines()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                trimmed
+                    .strip_prefix('#')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
     }
 
     fn preview_text(body: &str, limit: usize) -> String {

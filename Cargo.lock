@@ -1651,6 +1651,7 @@ dependencies = [
  "anyhow",
  "hc-capability",
  "hc-claim",
+ "hc-context",
  "hc-core",
  "hc-memory",
  "hc-persona",
@@ -1675,6 +1676,30 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hc-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-capability",
+ "hc-llm",
+ "hc-memory",
+ "hc-persona",
+ "hc-store",
+ "serde",
+]
+
+[[package]]
+name = "hc-context-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-context",
+ "hc-llm",
+ "hc-memory",
+ "serde_json",
 ]
 
 [[package]]

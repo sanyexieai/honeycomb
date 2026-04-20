@@ -244,3 +244,44 @@ Avoid hidden fallback behavior.
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn workspace_store_rebuilds_index_when_title_is_missing() {
+    let root = unique_temp_dir("store-missing-title");
+    let store = WorkspaceStore::new(&root);
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+
+    let missing_title_doc = r#"---
+id: human-inbox.message.0001.instance.0001
+type: human_inbox
+tenant_id: tenant-a
+user_id: user-a
+status: completed
+---
+
+# Human Inbox Message
+
+Archived human handoff content.
+"#;
+
+    fs::create_dir_all(store.resolve_in_namespace(&namespace, "inbox/completed"))
+        .expect("inbox directory should exist");
+    fs::write(
+        store.resolve_in_namespace(
+            &namespace,
+            "inbox/completed/human-inbox.message.0001.instance.0001.md",
+        ),
+        missing_title_doc,
+    )
+    .expect("missing title doc should be written");
+
+    let index = store
+        .rebuild_markdown_index_in_namespace(&namespace)
+        .expect("index should rebuild even when title is missing");
+
+    assert_eq!(index.documents.len(), 1);
+    assert_eq!(index.documents[0].id, "human-inbox.message.0001.instance.0001");
+    assert_eq!(index.documents[0].title, "Human Inbox Message");
+
+    let _ = fs::remove_dir_all(root);
+}
