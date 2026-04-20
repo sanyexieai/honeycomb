@@ -4042,11 +4042,18 @@ fn default_llm_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     let provider_id = env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned());
     let api_key = env::var("HC_LLM_API_KEY")
-        .or_else(|_| env::var("OPENAI_API_KEY"))
-        .ok();
+        .ok()
+        .or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {
+            "minimax" => env::var("MINIMAX_API_KEY").ok(),
+            _ => env::var("OPENAI_API_KEY").ok(),
+        });
     let base_url = env::var("HC_LLM_BASE_URL")
-        .or_else(|_| env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| match provider_id.as_str() {
+        .ok()
+        .or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {
+            "minimax" => env::var("MINIMAX_BASE_URL").ok(),
+            _ => env::var("OPENAI_BASE_URL").ok(),
+        })
+        .unwrap_or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {
             "minimax" => "https://api.minimaxi.com/v1".to_owned(),
             _ => "https://api.openai.com/v1".to_owned(),
         });

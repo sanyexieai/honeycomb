@@ -1,8 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::mpsc,
     thread,
     time::Duration,
 };
@@ -23,10 +24,11 @@ use hc_llm::{
     ProviderRegistry, StreamChunk,
 };
 use hc_memory::{
-    MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind, MemoryOwnerRef, MemoryRoom,
-    MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope, MemoryVisibility,
+    MemoryEntityKind, MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind,
+    MemoryOwnerRef, MemoryRelation, MemoryRelationKind, MemoryRoom, MemoryRoomAsset,
+    MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope, MemoryVisibility,
 };
-use hc_store::store::WorkspaceNamespace;
+use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestMode {
@@ -39,6 +41,40 @@ enum StrategyMode {
     Auto,
     Llm,
     Rule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionTriggerMode {
+    Immediate,
+    Deferred,
+    WindowFull,
+    Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextRoomKind {
+    Topic,
+    Task,
+    Agent,
+    Tool,
+    Project,
+}
+
+enum ContextRoomResolution {
+    Created(MemoryRoom),
+    Reused(MemoryRoom),
+    None,
+}
+
+enum BackgroundMemoryTask {
+    GlobalPromotion { content: String },
+    Literary { turn_index: usize, content: String },
+    Shutdown,
+}
+
+struct BackgroundMemoryWorker {
+    sender: mpsc::Sender<BackgroundMemoryTask>,
+    handle: thread::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -296,8 +332,14 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         ModelRef::new(provider, model),
         vec![ChatMessage::new(MessageRole::User, prompt_parts.join(" "))],
     );
+    let prompt_text = prompt_parts.join(" ");
+    let effective_memory_query = if memory_query.memory_query.text.is_some() {
+        memory_query
+    } else {
+        memory_query.with_text(prompt_text.clone())
+    };
     let request = ContextRequest::new(generation)
-        .with_memory_query(memory_query)
+        .with_memory_query(effective_memory_query.clone())
         .with_system_prompt(system_message.unwrap_or_else(|| {
             "Use recalled memory when it is relevant, but do not invent facts from memory that are not present.".to_owned()
         }))
@@ -311,6 +353,31 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         default_workspace_root(),
         workspace_namespace_from_memory_namespace(&memory_namespace),
     );
+    match ensure_context_room_for_input(
+        default_workspace_root(),
+        &workspace_namespace_from_memory_namespace(&memory_namespace),
+        &memory_namespace,
+        &retriever,
+        &effective_memory_query,
+        &prompt_text,
+        None,
+    )? {
+        ContextRoomResolution::Created(room) => {
+            println!(
+                "room> created {} room: {}",
+                format!("{:?}", room.layer).to_ascii_lowercase(),
+                room.id
+            );
+        }
+        ContextRoomResolution::Reused(room) => {
+            println!(
+                "room> reused {} room: {}",
+                format!("{:?}", room.layer).to_ascii_lowercase(),
+                room.id
+            );
+        }
+        ContextRoomResolution::None => {}
+    }
     let composer = DefaultContextComposer;
     let prompt_asset_model = ModelRef::new(
         request.generation.model.provider.clone(),
@@ -396,6 +463,21 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             serde_json::to_string_pretty(&response).context("failed to serialize response")?
         );
     } else if show_memory {
+        let room_candidates = retriever.discover_room_candidates(&effective_memory_query)?;
+        println!("candidate rooms:");
+        if room_candidates.is_empty() {
+            println!("- none");
+        } else {
+            for candidate in room_candidates.iter().take(5) {
+                println!(
+                    "- {} | layer={:?} | score={} | reasons={}",
+                    candidate.room_id,
+                    candidate.layer,
+                    candidate.score_milli,
+                    candidate.reasons.join(",")
+                );
+            }
+        }
         println!("recalled memories:");
         if response.recalled_memories.is_empty() {
             println!("- none");
@@ -429,12 +511,8 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 fn default_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     let provider_id = default_provider();
-    let api_key = env::var("HC_LLM_API_KEY")
-        .or_else(|_| env::var("OPENAI_API_KEY"))
-        .ok();
-    let base_url = env::var("HC_LLM_BASE_URL")
-        .or_else(|_| env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
+    let api_key = provider_api_key(&provider_id);
+    let base_url = provider_base_url(&provider_id);
 
     if let Some(api_key) = api_key {
         if let Ok(provider) = OpenAiCompatibleProvider::new(
@@ -450,10 +528,44 @@ fn default_registry() -> ProviderRegistry {
     registry
 }
 
+fn provider_api_key(provider_id: &str) -> Option<String> {
+    env::var("HC_LLM_API_KEY")
+        .ok()
+        .or_else(|| env::var(provider_api_key_var_name(provider_id)).ok())
+}
+
+fn provider_base_url(provider_id: &str) -> String {
+    env::var("HC_LLM_BASE_URL")
+        .ok()
+        .or_else(|| env::var(provider_base_url_var_name(provider_id)).ok())
+        .unwrap_or_else(|| default_base_url_for_provider(provider_id))
+}
+
+fn provider_api_key_var_name(provider_id: &str) -> &'static str {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MINIMAX_API_KEY",
+        _ => "OPENAI_API_KEY",
+    }
+}
+
+fn provider_base_url_var_name(provider_id: &str) -> &'static str {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MINIMAX_BASE_URL",
+        _ => "OPENAI_BASE_URL",
+    }
+}
+
+fn default_base_url_for_provider(provider_id: &str) -> String {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "https://api.minimaxi.com/v1".to_owned(),
+        _ => "https://api.openai.com/v1".to_owned(),
+    }
+}
+
 fn print_help() -> Result<()> {
     println!("hc-context-cli");
     println!("hc-context-cli                    # start chat");
-    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--literary-memory] [--no-literary-memory] [--chat-room-id <id>] [--organizer-mode <auto|llm|rule>] [--prompt-asset-mode <auto|llm|rule>] [--preference-summary-mode <auto|llm|rule>]");
+    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--literary-memory] [--no-literary-memory] [--chat-room-id <id>] [--organizer-mode <auto|llm|rule>] [--prompt-asset-mode <auto|llm|rule>] [--preference-summary-mode <auto|llm|rule>] [--promotion-trigger <immediate|deferred|window_full|background>] [--promotion-window-size <n>] [--literary-trigger <immediate|deferred|window_full|background>] [--literary-window-size <n>] [--chat-room-window-size <n>]");
     println!("hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]");
     Ok(())
 }
@@ -474,6 +586,11 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     let mut organizer_mode = default_organizer_mode();
     let mut prompt_asset_mode = default_prompt_asset_mode();
     let mut preference_summary_mode = default_preference_summary_mode();
+    let mut promotion_trigger = default_promotion_trigger_mode();
+    let mut promotion_window_size = default_promotion_window_size();
+    let mut literary_trigger = default_literary_trigger_mode();
+    let mut literary_window_size = default_literary_window_size();
+    let mut chat_room_window_size = default_chat_room_window_size();
     let mut memory_query = ContextMemoryQuery::default().for_namespace(runtime_memory_namespace());
 
     let mut owner_kind: Option<MemoryOwnerKind> = None;
@@ -627,6 +744,53 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 )?;
                 index += 2;
             }
+            "--promotion-trigger" => {
+                promotion_trigger = parse_promotion_trigger_mode(
+                    args.get(index + 1)
+                        .context("missing value for --promotion-trigger")?,
+                )?;
+                index += 2;
+            }
+            "--promotion-window-size" => {
+                promotion_window_size = args
+                    .get(index + 1)
+                    .context("missing value for --promotion-window-size")?
+                    .parse::<usize>()
+                    .context("invalid value for --promotion-window-size")?;
+                if promotion_window_size == 0 {
+                    bail!("--promotion-window-size must be greater than 0");
+                }
+                index += 2;
+            }
+            "--literary-trigger" => {
+                literary_trigger = parse_promotion_trigger_mode(
+                    args.get(index + 1)
+                        .context("missing value for --literary-trigger")?,
+                )?;
+                index += 2;
+            }
+            "--literary-window-size" => {
+                literary_window_size = args
+                    .get(index + 1)
+                    .context("missing value for --literary-window-size")?
+                    .parse::<usize>()
+                    .context("invalid value for --literary-window-size")?;
+                if literary_window_size == 0 {
+                    bail!("--literary-window-size must be greater than 0");
+                }
+                index += 2;
+            }
+            "--chat-room-window-size" => {
+                chat_room_window_size = args
+                    .get(index + 1)
+                    .context("missing value for --chat-room-window-size")?
+                    .parse::<usize>()
+                    .context("invalid value for --chat-room-window-size")?;
+                if chat_room_window_size == 0 {
+                    bail!("--chat-room-window-size must be greater than 0");
+                }
+                index += 2;
+            }
             other => bail!("unknown chat option: {other}"),
         }
     }
@@ -639,13 +803,18 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 
     println!("hc-context chat");
     println!(
-        "provider={provider} model={model} request_mode={} memory_scope={} organizer={} prompt_assets={} preference_summary={} literary_memory={}",
+        "provider={provider} model={model} request_mode={} memory_scope={} organizer={} prompt_assets={} preference_summary={} promotion_trigger={} promotion_window_size={} literary_memory={} literary_trigger={} literary_window_size={} chat_room_window_size={}",
         request_mode_label(request_mode),
         memory_scope_label(memory_query.memory_query.scope.as_ref()),
         strategy_mode_label(organizer_mode),
         strategy_mode_label(prompt_asset_mode),
         strategy_mode_label(preference_summary_mode),
+        promotion_trigger_mode_label(promotion_trigger),
+        promotion_window_size,
         if persist_literary_memory { "on" } else { "off" },
+        promotion_trigger_mode_label(literary_trigger),
+        literary_window_size,
+        chat_room_window_size,
     );
     println!("Type /help for commands, /quit to exit.");
 
@@ -672,18 +841,13 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     let prompt_asset_synthesizer =
         build_prompt_asset_synthesizer(registry, &organizer_model, prompt_asset_mode);
     let mut history = Vec::new();
-    let chat_room = if persist_chat_memory {
-        let room_id = chat_room_id.unwrap_or_else(|| default_chat_room_id(&memory_namespace));
-        let room = MemoryRoom::new(
-            room_id,
-            MemoryLayer::Chat,
-            format!("Chat Room | {} / {}", memory_namespace.tenant_id, memory_namespace.user_id),
-            "Interactive chat transcript and compressed reply memory.",
-        )
-        .with_namespace(memory_namespace.clone())
-        .with_visibility(MemoryVisibility::Private)
-        .with_tag("chat")
-        .with_tag("interactive");
+    let mut chat_room = if persist_chat_memory {
+        let room = resolve_chat_room(
+            default_workspace_root(),
+            &workspace_namespace,
+            &memory_namespace,
+            chat_room_id.clone(),
+        )?;
         ensure_chat_room(default_workspace_root(), &workspace_namespace, &room)?;
         println!("chat_memory=on room={}", room.id);
         Some(room)
@@ -692,6 +856,28 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         None
     };
     let mut turn_index = 0usize;
+    let mut pending_global_promotions = VecDeque::new();
+    let mut pending_literary_memory = VecDeque::new();
+    let mut background_worker = if let Some(room) = chat_room.clone() {
+        if promotion_trigger == PromotionTriggerMode::Background
+            || literary_trigger == PromotionTriggerMode::Background
+        {
+            Some(start_background_memory_worker(
+                default_workspace_root().to_path_buf(),
+                workspace_namespace.clone(),
+                memory_namespace.clone(),
+                room,
+                provider.clone(),
+                model.clone(),
+                organizer_mode,
+                preference_summary_mode,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     loop {
         print!("you> ");
@@ -703,10 +889,34 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         }
 
         match trimmed {
-            "/quit" | "/exit" => break,
+            "/quit" | "/exit" => {
+                flush_global_promotion_queue(
+                    &mut pending_global_promotions,
+                    organizer.as_ref(),
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    &memory_namespace,
+                    chat_room.as_ref(),
+                    registry,
+                    &organizer_model,
+                    preference_summary_mode,
+                )?;
+                flush_literary_memory_queue(
+                    &mut pending_literary_memory,
+                    registry,
+                    &organizer_model,
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    chat_room.as_ref(),
+                )?;
+                shutdown_background_memory_worker(background_worker.take());
+                break;
+            }
             "/help" => {
                 println!("/help");
                 println!("/clear");
+                println!("/promote");
+                println!("/wenyan");
                 println!("/system <text>");
                 println!("/quit");
                 continue;
@@ -714,6 +924,41 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             "/clear" => {
                 history.clear();
                 println!("history cleared");
+                continue;
+            }
+            "/promote" => {
+                if promotion_trigger == PromotionTriggerMode::Background {
+                    println!("promotion> background worker is enabled; queued work drains asynchronously");
+                    continue;
+                }
+                let flushed = flush_global_promotion_queue(
+                    &mut pending_global_promotions,
+                    organizer.as_ref(),
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    &memory_namespace,
+                    chat_room.as_ref(),
+                    registry,
+                    &organizer_model,
+                    preference_summary_mode,
+                )?;
+                println!("promotion> flushed {} pending item(s)", flushed);
+                continue;
+            }
+            "/wenyan" => {
+                if literary_trigger == PromotionTriggerMode::Background {
+                    println!("literary> background worker is enabled; queued work drains asynchronously");
+                    continue;
+                }
+                let flushed = flush_literary_memory_queue(
+                    &mut pending_literary_memory,
+                    registry,
+                    &organizer_model,
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    chat_room.as_ref(),
+                )?;
+                println!("literary> flushed {} pending item(s)", flushed);
                 continue;
             }
             _ if trimmed.starts_with("/system ") => {
@@ -742,26 +987,71 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 turn_index,
                 trimmed,
             )?;
-        }
-
-        if let Some(room) = &chat_room {
-            persist_global_promotions_for_chat_input(
-                organizer.as_ref(),
-                default_workspace_root(),
-                &workspace_namespace,
-                &memory_namespace,
-                room,
-                trimmed,
-                registry,
-                &organizer_model,
-                preference_summary_mode,
-            )?;
+            if promotion_trigger == PromotionTriggerMode::Background {
+                if let Some(worker) = &background_worker {
+                    enqueue_background_task(
+                        &worker.sender,
+                        BackgroundMemoryTask::GlobalPromotion {
+                            content: trimmed.to_owned(),
+                        },
+                        "promotion",
+                    );
+                }
+            } else {
+                pending_global_promotions.push_back(trimmed.to_owned());
+                if promotion_trigger == PromotionTriggerMode::Immediate {
+                    flush_global_promotion_queue(
+                        &mut pending_global_promotions,
+                        organizer.as_ref(),
+                        default_workspace_root(),
+                        &workspace_namespace,
+                        &memory_namespace,
+                        Some(room),
+                        registry,
+                        &organizer_model,
+                        preference_summary_mode,
+                    )?;
+                }
+            }
         }
 
         history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+        let mut effective_memory_query = if memory_query.memory_query.text.is_some() {
+            memory_query.clone()
+        } else {
+            memory_query.clone().with_text(trimmed)
+        };
+        if let Some(room) = &chat_room {
+            effective_memory_query = effective_memory_query.with_room_anchor(room.id.clone());
+        }
+        match ensure_context_room_for_input(
+            default_workspace_root(),
+            &workspace_namespace,
+            &memory_namespace,
+            &retriever,
+            &effective_memory_query,
+            trimmed,
+            chat_room.as_ref(),
+        )? {
+            ContextRoomResolution::Created(room) => {
+                println!(
+                    "room> created {} room: {}",
+                    format!("{:?}", room.layer).to_ascii_lowercase(),
+                    room.id
+                );
+            }
+            ContextRoomResolution::Reused(room) if show_memory => {
+                println!(
+                    "room> reused {} room: {}",
+                    format!("{:?}", room.layer).to_ascii_lowercase(),
+                    room.id
+                );
+            }
+            ContextRoomResolution::Reused(_) | ContextRoomResolution::None => {}
+        }
         let generation = GenerateRequest::new(ModelRef::new(provider.clone(), model.clone()), history.clone());
         let request = ContextRequest::new(generation)
-            .with_memory_query(memory_query.clone())
+            .with_memory_query(effective_memory_query.clone())
             .with_system_prompt(system_message.clone().unwrap_or_else(|| {
                 "Use recalled memory when it is relevant, but do not invent facts from memory that are not present.".to_owned()
             }))
@@ -812,23 +1102,150 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 &response.response.message.content,
             )?;
             if persist_literary_memory {
-                match persist_chat_turn_assistant_wenyan(
+                if literary_trigger == PromotionTriggerMode::Background {
+                    if let Some(worker) = &background_worker {
+                        enqueue_background_task(
+                            &worker.sender,
+                            BackgroundMemoryTask::Literary {
+                                turn_index,
+                                content: response.response.message.content.clone(),
+                            },
+                            "literary",
+                        );
+                    }
+                } else {
+                    pending_literary_memory
+                        .push_back((turn_index, response.response.message.content.clone()));
+                    if literary_trigger == PromotionTriggerMode::Immediate {
+                        let flushed = flush_literary_memory_queue(
+                            &mut pending_literary_memory,
+                            registry,
+                            &organizer_model,
+                            default_workspace_root(),
+                            &workspace_namespace,
+                            Some(room),
+                        )?;
+                        if flushed > 0 {
+                            println!("literary> flushed {} pending item(s)", flushed);
+                        }
+                    }
+                }
+            }
+            if let Some(room) = &chat_room
+                && should_flush_promotion_queue(
+                    promotion_trigger,
+                    pending_global_promotions.len(),
+                    promotion_window_size,
+                )
+            {
+                let flushed = flush_global_promotion_queue(
+                    &mut pending_global_promotions,
+                    organizer.as_ref(),
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    &memory_namespace,
+                    Some(room),
+                    registry,
+                    &organizer_model,
+                    preference_summary_mode,
+                )?;
+                if flushed > 0 {
+                    println!("promotion> flushed {} pending item(s)", flushed);
+                }
+            }
+            if persist_literary_memory
+                && should_flush_promotion_queue(
+                    literary_trigger,
+                    pending_literary_memory.len(),
+                    literary_window_size,
+                )
+            {
+                let flushed = flush_literary_memory_queue(
+                    &mut pending_literary_memory,
                     registry,
                     &organizer_model,
                     default_workspace_root(),
                     &workspace_namespace,
-                    room,
-                    turn_index,
-                    &response.response.message.content,
-                ) {
-                    Ok(Some(path)) => println!("literary> persisted wenyan memory: {}", path.display()),
-                    Ok(None) => {}
-                    Err(error) => eprintln!("literary> skipped wenyan memory: {error}"),
+                    Some(room),
+                )?;
+                if flushed > 0 {
+                    println!("literary> flushed {} pending item(s)", flushed);
                 }
             }
         }
 
+        if should_roll_chat_room(chat_room.as_ref(), turn_index, chat_room_window_size) {
+            flush_global_promotion_queue(
+                &mut pending_global_promotions,
+                organizer.as_ref(),
+                default_workspace_root(),
+                &workspace_namespace,
+                &memory_namespace,
+                chat_room.as_ref(),
+                registry,
+                &organizer_model,
+                preference_summary_mode,
+            )?;
+            flush_literary_memory_queue(
+                &mut pending_literary_memory,
+                registry,
+                &organizer_model,
+                default_workspace_root(),
+                &workspace_namespace,
+                chat_room.as_ref(),
+            )?;
+            shutdown_background_memory_worker(background_worker.take());
+
+            if let Some(room) = chat_room.as_ref() {
+                archive_chat_room(
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    room,
+                    turn_index,
+                )?;
+                println!("chat_memory> archived room={} turns={}", room.id, turn_index);
+            }
+
+            let next_room = create_chat_room(&memory_namespace, default_chat_room_id(&memory_namespace));
+            ensure_chat_room(default_workspace_root(), &workspace_namespace, &next_room)?;
+            println!("chat_memory> rolled to room={}", next_room.id);
+            chat_room = Some(next_room.clone());
+            history.clear();
+            turn_index = 0;
+
+            background_worker = if promotion_trigger == PromotionTriggerMode::Background
+                || literary_trigger == PromotionTriggerMode::Background
+            {
+                Some(start_background_memory_worker(
+                    default_workspace_root().to_path_buf(),
+                    workspace_namespace.clone(),
+                    memory_namespace.clone(),
+                    next_room,
+                    provider.clone(),
+                    model.clone(),
+                    organizer_mode,
+                    preference_summary_mode,
+                ))
+            } else {
+                None
+            };
+        }
+
         if show_memory {
+            let room_candidates = retriever.discover_room_candidates(&effective_memory_query)?;
+            if room_candidates.is_empty() {
+                println!("room> none");
+            } else {
+                for candidate in room_candidates.iter().take(5) {
+                    println!(
+                        "room> {} | layer={:?} | score={} | reasons={}",
+                        candidate.room_id,
+                        candidate.layer,
+                        candidate.score_milli,
+                        candidate.reasons.join(",")
+                    );
+                }
+            }
             if response.recalled_memories.is_empty() {
                 println!("memory> none");
             } else {
@@ -870,21 +1287,59 @@ fn default_organizer_mode() -> StrategyMode {
     env::var("HC_CONTEXT_ORGANIZER_MODE")
         .ok()
         .and_then(|value| parse_strategy_mode(&value).ok())
-        .unwrap_or(StrategyMode::Llm)
+        .unwrap_or(StrategyMode::Auto)
 }
 
 fn default_prompt_asset_mode() -> StrategyMode {
     env::var("HC_CONTEXT_PROMPT_ASSET_MODE")
         .ok()
         .and_then(|value| parse_strategy_mode(&value).ok())
-        .unwrap_or(StrategyMode::Llm)
+        .unwrap_or(StrategyMode::Auto)
 }
 
 fn default_preference_summary_mode() -> StrategyMode {
     env::var("HC_CONTEXT_PREFERENCE_SUMMARY_MODE")
         .ok()
         .and_then(|value| parse_strategy_mode(&value).ok())
-        .unwrap_or(StrategyMode::Llm)
+        .unwrap_or(StrategyMode::Auto)
+}
+
+fn default_promotion_trigger_mode() -> PromotionTriggerMode {
+    env::var("HC_CONTEXT_PROMOTION_TRIGGER")
+        .ok()
+        .and_then(|value| parse_promotion_trigger_mode(&value).ok())
+        .unwrap_or(PromotionTriggerMode::WindowFull)
+}
+
+fn default_promotion_window_size() -> usize {
+    env::var("HC_CONTEXT_PROMOTION_WINDOW_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+fn default_literary_trigger_mode() -> PromotionTriggerMode {
+    env::var("HC_CONTEXT_LITERARY_TRIGGER")
+        .ok()
+        .and_then(|value| parse_promotion_trigger_mode(&value).ok())
+        .unwrap_or(PromotionTriggerMode::WindowFull)
+}
+
+fn default_literary_window_size() -> usize {
+    env::var("HC_CONTEXT_LITERARY_WINDOW_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn default_chat_room_window_size() -> usize {
+    env::var("HC_CONTEXT_CHAT_ROOM_WINDOW_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(12)
 }
 
 fn default_typewriter_delay_ms() -> u64 {
@@ -935,6 +1390,18 @@ fn parse_strategy_mode(value: &str) -> Result<StrategyMode> {
     }
 }
 
+fn parse_promotion_trigger_mode(value: &str) -> Result<PromotionTriggerMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "immediate" | "sync" => Ok(PromotionTriggerMode::Immediate),
+        "deferred" | "post_turn" => Ok(PromotionTriggerMode::Deferred),
+        "window_full" | "window" | "batch" => Ok(PromotionTriggerMode::WindowFull),
+        "background" | "async" | "worker" => Ok(PromotionTriggerMode::Background),
+        other => bail!(
+            "unsupported promotion trigger: {other}. supported modes: immediate, deferred, window_full, background"
+        ),
+    }
+}
+
 fn request_mode_label(mode: RequestMode) -> &'static str {
     match mode {
         RequestMode::Direct => "direct",
@@ -947,6 +1414,15 @@ fn strategy_mode_label(mode: StrategyMode) -> &'static str {
         StrategyMode::Auto => "auto",
         StrategyMode::Llm => "llm",
         StrategyMode::Rule => "rule",
+    }
+}
+
+fn promotion_trigger_mode_label(mode: PromotionTriggerMode) -> &'static str {
+    match mode {
+        PromotionTriggerMode::Immediate => "immediate",
+        PromotionTriggerMode::Deferred => "deferred",
+        PromotionTriggerMode::WindowFull => "window_full",
+        PromotionTriggerMode::Background => "background",
     }
 }
 
@@ -1034,6 +1510,710 @@ fn default_chat_room_id(namespace: &MemoryNamespace) -> String {
     )
 }
 
+fn create_chat_room(namespace: &MemoryNamespace, room_id: String) -> MemoryRoom {
+    MemoryRoom::new(
+        room_id,
+        MemoryLayer::Chat,
+        format!("Chat Room | {} / {}", namespace.tenant_id, namespace.user_id),
+        "Interactive chat transcript and compressed reply memory.",
+    )
+    .with_namespace(namespace.clone())
+    .with_visibility(MemoryVisibility::Private)
+    .with_tag("chat")
+    .with_tag("interactive")
+}
+
+fn create_context_room(
+    namespace: &MemoryNamespace,
+    kind: ContextRoomKind,
+    room_slug: &str,
+    title: &str,
+) -> MemoryRoom {
+    let layer = context_room_layer(kind);
+    let kind_name = context_room_kind_name(kind);
+    MemoryRoom::new(
+        format!(
+            "room.{}.{}.{}.{}",
+            kind_name,
+            slugify_chat_segment(&namespace.tenant_id),
+            slugify_chat_segment(&namespace.user_id),
+            room_slug
+        ),
+        layer,
+        title,
+        format!("Derived context room for {kind_name} memory."),
+    )
+    .with_namespace(namespace.clone())
+    .with_visibility(MemoryVisibility::Private)
+    .with_tag(kind_name)
+    .with_tag("derived")
+}
+
+fn resolve_chat_room(
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    memory_namespace: &MemoryNamespace,
+    explicit_room_id: Option<String>,
+) -> Result<MemoryRoom> {
+    if let Some(room_id) = explicit_room_id {
+        return Ok(create_chat_room(memory_namespace, room_id));
+    }
+
+    if let Some(room) = find_latest_active_chat_room(root.as_ref(), workspace_namespace)? {
+        return Ok(room);
+    }
+
+    Ok(create_chat_room(
+        memory_namespace,
+        default_chat_room_id(memory_namespace),
+    ))
+}
+
+fn find_latest_active_chat_room(
+    root: &Path,
+    workspace_namespace: &WorkspaceNamespace,
+) -> Result<Option<MemoryRoom>> {
+    let chat_root = root
+        .join(workspace_namespace.scoped_prefix())
+        .join("memory")
+        .join("rooms")
+        .join("chat");
+    if !chat_root.exists() {
+        return Ok(None);
+    }
+
+    let repository = MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
+    let mut latest_room: Option<(std::time::SystemTime, MemoryRoom)> = None;
+
+    for entry in fs::read_dir(&chat_root)
+        .with_context(|| format!("failed to read chat rooms under {}", chat_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let room_doc = path.join("room.md");
+        if !room_doc.exists() {
+            continue;
+        }
+
+        let modified_at = room_doc
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let relative = room_doc
+            .strip_prefix(root.join(workspace_namespace.scoped_prefix()))
+            .context("chat room path should live under namespace root")?
+            .to_path_buf();
+        let room = repository.read_room(relative)?;
+        if room.status != "active" {
+            continue;
+        }
+
+        match &latest_room {
+            Some((current_modified_at, _)) if modified_at <= *current_modified_at => {}
+            _ => latest_room = Some((modified_at, room)),
+        }
+    }
+
+    Ok(latest_room.map(|(_, room)| room))
+}
+
+fn ensure_context_room_for_input(
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    memory_namespace: &MemoryNamespace,
+    retriever: &WorkspaceMemoryRetriever,
+    query: &ContextMemoryQuery,
+    input: &str,
+    chat_room: Option<&MemoryRoom>,
+) -> Result<ContextRoomResolution> {
+    if !should_materialize_context_room(input) {
+        return Ok(ContextRoomResolution::None);
+    }
+
+    let candidates = retriever.discover_room_candidates(query)?;
+    if let Some(candidate) = strongest_context_room_match(&candidates)
+        && let Some(existing_room) =
+            read_room_by_id(root.as_ref(), workspace_namespace, &candidate.room_id)?
+    {
+        let kind = context_room_kind_for_room(&existing_room);
+        seed_context_room_with_input(
+            root.as_ref(),
+            workspace_namespace,
+            &existing_room,
+            kind,
+            input,
+        )?;
+        let refreshed_room = refresh_context_room_metadata(
+            root.as_ref(),
+            workspace_namespace,
+            &existing_room,
+            input,
+        )?;
+        if let Some(chat_room) = chat_room {
+            link_rooms(root.as_ref(), workspace_namespace, chat_room, &refreshed_room)?;
+        }
+        return Ok(ContextRoomResolution::Reused(refreshed_room));
+    }
+
+    let kind = infer_context_room_kind(input);
+    let slug = summarize_context_room_slug(input);
+    if slug.is_empty() {
+        return Ok(ContextRoomResolution::None);
+    }
+
+    if let Some(existing_room) = find_existing_context_room(
+        root.as_ref(),
+        workspace_namespace,
+        kind,
+        &slug,
+    )? {
+        seed_context_room_with_input(
+            root.as_ref(),
+            workspace_namespace,
+            &existing_room,
+            kind,
+            input,
+        )?;
+        let refreshed_room = refresh_context_room_metadata(
+            root.as_ref(),
+            workspace_namespace,
+            &existing_room,
+            input,
+        )?;
+        if let Some(chat_room) = chat_room {
+            link_rooms(root.as_ref(), workspace_namespace, chat_room, &refreshed_room)?;
+        }
+        return Ok(ContextRoomResolution::Reused(refreshed_room));
+    }
+
+    let room = create_context_room(
+        memory_namespace,
+        kind,
+        &slug,
+        &summarize_context_room_title(input, kind),
+    );
+    ensure_chat_room(root.as_ref(), workspace_namespace, &room)?;
+    seed_context_room_with_input(
+        root.as_ref(),
+        workspace_namespace,
+        &room,
+        kind,
+        input,
+    )?;
+    if let Some(chat_room) = chat_room {
+        link_rooms(root.as_ref(), workspace_namespace, chat_room, &room)?;
+    }
+    Ok(ContextRoomResolution::Created(room))
+}
+
+fn should_materialize_context_room(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "hi" | "hello" | "你好" | "嗨" | "在吗") {
+        return false;
+    }
+
+    trimmed.chars().count() >= 8 || looks_like_task_input(&lowered)
+}
+
+fn strongest_context_room_match(
+    candidates: &[hc_context::RoomCandidate],
+) -> Option<&hc_context::RoomCandidate> {
+    candidates.iter().find(|candidate| {
+        candidate.layer != MemoryLayer::Chat
+            && candidate.layer != MemoryLayer::Global
+            && candidate.score_milli >= 720
+    })
+}
+
+fn infer_context_room_kind(input: &str) -> ContextRoomKind {
+    let lowered = input.to_ascii_lowercase();
+    if looks_like_agent_input(&lowered) {
+        ContextRoomKind::Agent
+    } else if looks_like_tool_input(&lowered) {
+        ContextRoomKind::Tool
+    } else if looks_like_project_input(&lowered) {
+        ContextRoomKind::Project
+    } else if looks_like_task_input(&lowered) {
+        ContextRoomKind::Task
+    } else {
+        ContextRoomKind::Topic
+    }
+}
+
+fn looks_like_task_input(lowered: &str) -> bool {
+    [
+        "implement",
+        "fix",
+        "debug",
+        "refactor",
+        "test",
+        "review",
+        "设计",
+        "实现",
+        "修复",
+        "调试",
+        "重构",
+        "测试",
+        "任务",
+    ]
+    .iter()
+    .any(|keyword| lowered.contains(keyword))
+}
+
+fn looks_like_agent_input(lowered: &str) -> bool {
+    [
+        "agent",
+        "persona",
+        "reviewer",
+        "planner",
+        "coder",
+        "助手",
+        "智能体",
+        "人格",
+        "角色",
+        "审查者",
+        "规划者",
+    ]
+    .iter()
+    .any(|keyword| lowered.contains(keyword))
+}
+
+fn looks_like_tool_input(lowered: &str) -> bool {
+    [
+        "tool",
+        "api",
+        "git",
+        "cargo",
+        "minimax",
+        "openai",
+        "工具",
+        "命令",
+        "接口",
+        "sdk",
+    ]
+    .iter()
+    .any(|keyword| lowered.contains(keyword))
+}
+
+fn looks_like_project_input(lowered: &str) -> bool {
+    [
+        "project",
+        "architecture",
+        "convention",
+        "workspace",
+        "repo",
+        "项目",
+        "架构",
+        "约定",
+        "仓库",
+        "工作区",
+    ]
+    .iter()
+    .any(|keyword| lowered.contains(keyword))
+}
+
+fn summarize_context_room_slug(input: &str) -> String {
+    let text = input
+        .trim()
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .replace('\n', " ");
+    slugify_chat_segment(&text)
+}
+
+fn summarize_context_room_title(input: &str, kind: ContextRoomKind) -> String {
+    let prefix = match kind {
+        ContextRoomKind::Task => "Task Room",
+        ContextRoomKind::Topic => "Topic Room",
+        ContextRoomKind::Agent => "Agent Room",
+        ContextRoomKind::Tool => "Tool Room",
+        ContextRoomKind::Project => "Project Room",
+    };
+    format!("{prefix} | {}", input.trim().chars().take(48).collect::<String>())
+}
+
+fn context_room_layer(kind: ContextRoomKind) -> MemoryLayer {
+    match kind {
+        ContextRoomKind::Topic => MemoryLayer::Topic,
+        ContextRoomKind::Task => MemoryLayer::Task,
+        ContextRoomKind::Agent | ContextRoomKind::Tool | ContextRoomKind::Project => {
+            MemoryLayer::Project
+        }
+    }
+}
+
+fn context_room_kind_name(kind: ContextRoomKind) -> &'static str {
+    match kind {
+        ContextRoomKind::Topic => "topic",
+        ContextRoomKind::Task => "task",
+        ContextRoomKind::Agent => "agent",
+        ContextRoomKind::Tool => "tool",
+        ContextRoomKind::Project => "project",
+    }
+}
+
+fn context_room_kind_for_room(room: &MemoryRoom) -> ContextRoomKind {
+    if room.tags.iter().any(|tag| tag == "agent") || room.id.starts_with("room.agent.") {
+        ContextRoomKind::Agent
+    } else if room.tags.iter().any(|tag| tag == "tool") || room.id.starts_with("room.tool.") {
+        ContextRoomKind::Tool
+    } else if room.tags.iter().any(|tag| tag == "project")
+        || room.id.starts_with("room.project.")
+    {
+        ContextRoomKind::Project
+    } else if room.tags.iter().any(|tag| tag == "task") || room.id.starts_with("room.task.") {
+        ContextRoomKind::Task
+    } else {
+        ContextRoomKind::Topic
+    }
+}
+
+fn read_room_by_id(
+    root: &Path,
+    workspace_namespace: &WorkspaceNamespace,
+    room_id: &str,
+) -> Result<Option<MemoryRoom>> {
+    let store = WorkspaceStore::new(root.to_path_buf());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
+    let query = MarkdownQuery::default()
+        .with_path_prefix("memory/rooms")
+        .with_doc_type("memory_room")
+        .with_id(room_id.to_owned())
+        .with_limit(1);
+    let Some(entry) = store
+        .query_markdown_index_in_namespace(workspace_namespace, &query)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(repository.read_room(entry.relative_path)?))
+}
+
+fn refresh_context_room_metadata(
+    root: &Path,
+    workspace_namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+    input: &str,
+) -> Result<MemoryRoom> {
+    let repository =
+        MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
+    let mut updated_room = room.clone();
+    updated_room.status = "active".to_owned();
+
+    let input_snippet = input.trim().chars().take(96).collect::<String>();
+    if !input_snippet.is_empty() {
+        updated_room.summary = merge_context_room_summary(&updated_room.summary, &input_snippet);
+
+        let refresh_marker = format!("refreshed:{}", slugify_chat_segment(&input_snippet));
+        if !refresh_marker.ends_with(':')
+            && !updated_room
+                .derived_docs
+                .iter()
+                .any(|item| item == &refresh_marker)
+        {
+            updated_room.derived_docs.push(refresh_marker);
+            if updated_room.derived_docs.len() > 8 {
+                let keep_from = updated_room.derived_docs.len().saturating_sub(8);
+                updated_room.derived_docs.drain(0..keep_from);
+            }
+        }
+    }
+
+    repository.write_room(&updated_room)?;
+    Ok(updated_room)
+}
+
+fn merge_context_room_summary(existing_summary: &str, input_snippet: &str) -> String {
+    let existing = existing_summary.trim();
+    let candidate = input_snippet.trim();
+    if existing.is_empty() {
+        return candidate.to_owned();
+    }
+    if candidate.is_empty() {
+        return existing.to_owned();
+    }
+
+    let existing_norm = normalize_seed_text(existing);
+    let candidate_norm = normalize_seed_text(candidate);
+    if existing_norm.is_empty() || existing_norm == candidate_norm || existing_norm.contains(&candidate_norm) {
+        return existing.chars().take(160).collect();
+    }
+    if candidate_norm.contains(&existing_norm) {
+        return candidate.chars().take(160).collect();
+    }
+
+    let prefix = existing.chars().take(72).collect::<String>();
+    let suffix = candidate.chars().take(72).collect::<String>();
+    format!("{prefix} | latest: {suffix}")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn find_existing_context_room(
+    root: &Path,
+    workspace_namespace: &WorkspaceNamespace,
+    kind: ContextRoomKind,
+    slug: &str,
+) -> Result<Option<MemoryRoom>> {
+    let layer = context_room_layer(kind);
+    let layer_dir = match layer {
+        MemoryLayer::Chat => "chat",
+        MemoryLayer::Topic => "topic",
+        MemoryLayer::Task => "task",
+        MemoryLayer::Project => "project",
+        MemoryLayer::Global => "global",
+    };
+    let room_root = root
+        .join(workspace_namespace.scoped_prefix())
+        .join("memory")
+        .join("rooms")
+        .join(layer_dir);
+    if !room_root.exists() {
+        return Ok(None);
+    }
+
+    let kind_name = context_room_kind_name(kind);
+    let repository = MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
+    let mut best_match: Option<(u8, std::time::SystemTime, MemoryRoom)> = None;
+
+    for entry in fs::read_dir(&room_root)
+        .with_context(|| format!("failed to read context rooms under {}", room_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let room_doc = path.join("room.md");
+        if !room_doc.exists() {
+            continue;
+        }
+
+        let relative = room_doc
+            .strip_prefix(root.join(workspace_namespace.scoped_prefix()))
+            .context("context room path should live under namespace root")?
+            .to_path_buf();
+        let room = repository.read_room(relative)?;
+        if room.status != "active" {
+            continue;
+        }
+        if !room.tags.iter().any(|tag| tag == kind_name) {
+            continue;
+        }
+
+        let room_slug = room.id.rsplit('.').next().unwrap_or_default();
+        let match_rank = if room_slug == slug {
+            3
+        } else if room_slug.starts_with(slug) || slug.starts_with(room_slug) {
+            2
+        } else if room.title.to_ascii_lowercase().contains(&slug.replace('.', " ")) {
+            1
+        } else {
+            0
+        };
+        if match_rank == 0 {
+            continue;
+        }
+
+        let modified_at = room_doc
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &best_match {
+            Some((best_rank, best_modified_at, _))
+                if match_rank < *best_rank
+                    || (match_rank == *best_rank && modified_at <= *best_modified_at) => {}
+            _ => best_match = Some((match_rank, modified_at, room)),
+        }
+    }
+
+    Ok(best_match.map(|(_, _, room)| room))
+}
+
+fn seed_context_room_with_input(
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+    kind: ContextRoomKind,
+    input: &str,
+) -> Result<PathBuf> {
+    let summary = input.trim();
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace.clone());
+    if should_skip_seed_write(&repository, room, summary)? {
+        return Ok(MemoryRoomRepository::compressed_doc_relative_path(
+            room,
+            format!("seed.{}.md", slugify_chat_segment(summary)),
+        ));
+    }
+    let memory_kind = match kind {
+        ContextRoomKind::Task => MemoryKind::WorkflowMemory,
+        ContextRoomKind::Topic => MemoryKind::Knowledge,
+        ContextRoomKind::Agent => MemoryKind::WorkflowMemory,
+        ContextRoomKind::Tool => MemoryKind::Knowledge,
+        ContextRoomKind::Project => MemoryKind::Knowledge,
+    };
+    let owner = match kind {
+        ContextRoomKind::Task => MemoryOwnerRef::task(room.id.clone()),
+        ContextRoomKind::Agent => MemoryOwnerRef::persona(room.id.clone()),
+        ContextRoomKind::Tool | ContextRoomKind::Project | ContextRoomKind::Topic => {
+            MemoryOwnerRef::project(room.id.clone())
+        }
+    };
+    let layer_tag = match kind {
+        ContextRoomKind::Task => "task",
+        ContextRoomKind::Topic => "topic",
+        ContextRoomKind::Agent => "agent",
+        ContextRoomKind::Tool => "tool",
+        ContextRoomKind::Project => "project",
+    };
+    let specialization_tag = match kind {
+        ContextRoomKind::Task => "workflow",
+        ContextRoomKind::Topic => "knowledge",
+        ContextRoomKind::Agent => "persona",
+        ContextRoomKind::Tool => "integration",
+        ContextRoomKind::Project => "architecture",
+    };
+    let file_slug = slugify_chat_segment(summary);
+    let write_request = hc_context::RoomMemoryWriteRequest::new(
+        room.id.clone(),
+        room.layer.clone(),
+        room.title.clone(),
+        summary.to_owned(),
+        memory_kind,
+    )
+    .with_visibility(MemoryVisibility::Private)
+    .with_owner(owner)
+    .with_tag(layer_tag)
+    .with_tag(specialization_tag)
+    .with_tag("seed")
+    .with_file_name(format!("seed.{}.md", file_slug))
+    .with_asset_id(format!("asset.{}.seed.{}", room.id, file_slug));
+    persist_room_memory(root.as_ref(), workspace_namespace.clone(), &write_request)
+}
+
+fn should_skip_seed_write(
+    repository: &MemoryRoomRepository,
+    room: &MemoryRoom,
+    summary: &str,
+) -> Result<bool> {
+    let target = normalize_seed_text(summary);
+    if target.is_empty() {
+        return Ok(true);
+    }
+
+    let assets = repository.read_compressed_assets(room)?;
+    for asset in assets {
+        let existing = normalize_seed_text(&asset.summary);
+        if existing.is_empty() {
+            continue;
+        }
+
+        if existing == target {
+            return Ok(true);
+        }
+
+        if existing.contains(&target) || target.contains(&existing) {
+            let shorter = existing.len().min(target.len());
+            let longer = existing.len().max(target.len());
+            if shorter * 10 >= longer * 8 {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn normalize_seed_text(text: &str) -> String {
+    text.trim()
+        .chars()
+        .flat_map(|ch| ch.to_lowercase())
+        .filter(|ch| !ch.is_whitespace() && !ch.is_ascii_punctuation())
+        .collect()
+}
+
+fn link_rooms(
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    chat_room: &MemoryRoom,
+    context_room: &MemoryRoom,
+) -> Result<()> {
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace.clone());
+
+    let mut updated_chat_room = chat_room.clone();
+    if !updated_chat_room
+        .relations
+        .iter()
+        .any(|relation| relation.target == context_room.id)
+    {
+        updated_chat_room.relations.push(
+            MemoryRelation::new(MemoryRelationKind::References, context_room.id.clone())
+                .with_detail(format!("linked {} room", format!("{:?}", context_room.layer).to_ascii_lowercase())),
+        );
+    }
+    if !updated_chat_room
+        .related_entities
+        .iter()
+        .any(|entity| entity.id == context_room.id)
+    {
+        updated_chat_room
+            .related_entities
+            .push(room_entity_ref(context_room));
+    }
+    repository.write_room(&updated_chat_room)?;
+
+    let mut updated_context_room = context_room.clone();
+    if !updated_context_room
+        .relations
+        .iter()
+        .any(|relation| relation.target == chat_room.id)
+    {
+        updated_context_room.relations.push(
+            MemoryRelation::new(MemoryRelationKind::DerivedFrom, chat_room.id.clone())
+                .with_detail("materialized from active chat room"),
+        );
+    }
+    if !updated_context_room
+        .related_entities
+        .iter()
+        .any(|entity| entity.id == chat_room.id)
+    {
+        updated_context_room
+            .related_entities
+            .push(room_entity_ref(chat_room));
+    }
+    repository.write_room(&updated_context_room)?;
+
+    Ok(())
+}
+
+fn room_entity_ref(room: &MemoryRoom) -> MemoryEntityRef {
+    let kind = match room.layer {
+        MemoryLayer::Chat => MemoryEntityKind::Session,
+        MemoryLayer::Topic => MemoryEntityKind::Topic,
+        MemoryLayer::Task => MemoryEntityKind::Task,
+        MemoryLayer::Project => MemoryEntityKind::Project,
+        MemoryLayer::Global => MemoryEntityKind::Other,
+    };
+    MemoryEntityRef::new(kind, room.id.clone())
+}
+
 fn ensure_chat_room(
     root: impl AsRef<Path>,
     namespace: &WorkspaceNamespace,
@@ -1042,6 +2222,25 @@ fn ensure_chat_room(
     let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
     repository.write_room(room)?;
     Ok(())
+}
+
+fn archive_chat_room(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    room: &MemoryRoom,
+    turns: usize,
+) -> Result<()> {
+    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let archived = room
+        .clone()
+        .with_status("archived")
+        .with_derived_doc(format!("rolled-after-{turns}-turns"));
+    repository.write_room(&archived)?;
+    Ok(())
+}
+
+fn should_roll_chat_room(chat_room: Option<&MemoryRoom>, turn_index: usize, window_size: usize) -> bool {
+    chat_room.is_some() && turn_index >= window_size
 }
 
 fn persist_chat_turn_user_message(
@@ -1172,6 +2371,14 @@ fn strip_think_blocks(content: &str) -> String {
     output
 }
 
+fn concise_error_message(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .find(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| "unknown error".to_owned())
+}
+
 fn persist_global_promotions_for_chat_input(
     organizer: &(impl MemoryOrganizer + ?Sized),
     root: impl AsRef<Path>,
@@ -1188,28 +2395,37 @@ fn persist_global_promotions_for_chat_input(
         .with_owner(MemoryOwnerRef::session(chat_room.id.clone()))
         .with_tag("chat");
     let decision = organizer.organize(&input)?;
+    let summary = summarize_preference_for_promotion(registry, model, &input, summary_mode)?;
+    let promotions = if decision.promotions.is_empty() {
+        if summary.is_some() {
+            vec![hc_context::MemoryPromotionSuggestion {
+                target_layer: MemoryLayer::Global,
+                target_room_id: Some(default_global_room_id(memory_namespace)),
+                reason: "detected durable user preference".to_owned(),
+            }]
+        } else {
+            Vec::new()
+        }
+    } else {
+        decision.promotions.clone()
+    };
 
-    if decision.promotions.is_empty() {
+    if promotions.is_empty() {
         return Ok(());
     }
 
-    let Some((summary, memory_kind)) =
-        summarize_preference_for_promotion(registry, model, &input, summary_mode)?
-    else {
+    let Some((summary, memory_kind)) = summary else {
         return Ok(());
     };
 
-    for promotion in &decision.promotions {
+    for promotion in &promotions {
         if promotion.target_layer != MemoryLayer::Global {
             continue;
         }
-        let room_id = promotion.target_room_id.clone().unwrap_or_else(|| {
-            format!(
-                "room.global.{}.{}",
-                slugify_chat_segment(&memory_namespace.tenant_id),
-                slugify_chat_segment(&memory_namespace.user_id)
-            )
-        });
+        let room_id = promotion
+            .target_room_id
+            .clone()
+            .unwrap_or_else(|| default_global_room_id(memory_namespace));
         let file_slug = slugify_chat_segment(&summary);
         let write_request = hc_context::RoomMemoryWriteRequest::new(
             room_id.clone(),
@@ -1230,6 +2446,189 @@ fn persist_global_promotions_for_chat_input(
     }
 
     Ok(())
+}
+
+fn flush_global_promotion_queue(
+    pending: &mut VecDeque<String>,
+    organizer: &(impl MemoryOrganizer + ?Sized),
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    memory_namespace: &MemoryNamespace,
+    chat_room: Option<&MemoryRoom>,
+    registry: &ProviderRegistry,
+    model: &ModelRef,
+    summary_mode: StrategyMode,
+) -> Result<usize> {
+    let Some(chat_room) = chat_room else {
+        pending.clear();
+        return Ok(0);
+    };
+
+    let mut flushed = 0usize;
+    while let Some(content) = pending.front().cloned() {
+        persist_global_promotions_for_chat_input(
+            organizer,
+            root.as_ref(),
+            workspace_namespace,
+            memory_namespace,
+            chat_room,
+            &content,
+            registry,
+            model,
+            summary_mode,
+        )?;
+        pending.pop_front();
+        flushed += 1;
+    }
+
+    Ok(flushed)
+}
+
+fn should_flush_promotion_queue(
+    mode: PromotionTriggerMode,
+    pending_len: usize,
+    promotion_window_size: usize,
+) -> bool {
+    match mode {
+        PromotionTriggerMode::Immediate => false,
+        PromotionTriggerMode::Deferred => pending_len > 0,
+        PromotionTriggerMode::WindowFull => pending_len >= promotion_window_size,
+        PromotionTriggerMode::Background => false,
+    }
+}
+
+fn start_background_memory_worker(
+    root: PathBuf,
+    workspace_namespace: WorkspaceNamespace,
+    memory_namespace: MemoryNamespace,
+    chat_room: MemoryRoom,
+    provider: String,
+    model: String,
+    organizer_mode: StrategyMode,
+    preference_summary_mode: StrategyMode,
+) -> BackgroundMemoryWorker {
+    let (sender, receiver) = mpsc::channel::<BackgroundMemoryTask>();
+    let handle = thread::spawn(move || {
+        let registry = default_registry();
+        let organizer_model = ModelRef::new(provider, model);
+
+        while let Ok(task) = receiver.recv() {
+            match task {
+                BackgroundMemoryTask::GlobalPromotion { content } => {
+                    let organizer = build_memory_organizer(
+                        &registry,
+                        &organizer_model,
+                        organizer_mode,
+                        CompositeMemoryOrganizer::new(
+                            RuleBasedMemoryRoomRouter,
+                            RuleBasedMemoryKindResolver,
+                            KeywordMemoryTagSuggester,
+                            RuleBasedMemoryPromotionAdvisor,
+                        ),
+                    );
+                    if let Err(error) = persist_global_promotions_for_chat_input(
+                        organizer.as_ref(),
+                        &root,
+                        &workspace_namespace,
+                        &memory_namespace,
+                        &chat_room,
+                        &content,
+                        &registry,
+                        &organizer_model,
+                        preference_summary_mode,
+                    ) {
+                        eprintln!(
+                            "promotion> background task failed: {}",
+                            concise_error_message(&error)
+                        );
+                    }
+                }
+                BackgroundMemoryTask::Literary { turn_index, content } => {
+                    match persist_chat_turn_assistant_wenyan(
+                        &registry,
+                        &organizer_model,
+                        &root,
+                        &workspace_namespace,
+                        &chat_room,
+                        turn_index,
+                        &content,
+                    ) {
+                        Ok(Some(_path)) => {}
+                        Ok(None) => {}
+                        Err(error) => eprintln!(
+                            "literary> background task failed: {}",
+                            concise_error_message(&error)
+                        ),
+                    }
+                }
+                BackgroundMemoryTask::Shutdown => break,
+            }
+        }
+    });
+    BackgroundMemoryWorker { sender, handle }
+}
+
+fn enqueue_background_task(
+    sender: &mpsc::Sender<BackgroundMemoryTask>,
+    task: BackgroundMemoryTask,
+    label: &str,
+) {
+    if let Err(error) = sender.send(task) {
+        eprintln!("{label}> failed to enqueue background task: {error}");
+    }
+}
+
+fn shutdown_background_memory_worker(worker: Option<BackgroundMemoryWorker>) {
+    if let Some(worker) = worker {
+        let _ = worker.sender.send(BackgroundMemoryTask::Shutdown);
+        let _ = worker.handle.join();
+    }
+}
+
+fn flush_literary_memory_queue(
+    pending: &mut VecDeque<(usize, String)>,
+    registry: &ProviderRegistry,
+    model: &ModelRef,
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    chat_room: Option<&MemoryRoom>,
+) -> Result<usize> {
+    let Some(chat_room) = chat_room else {
+        pending.clear();
+        return Ok(0);
+    };
+
+    let mut flushed = 0usize;
+    while let Some((turn_index, content)) = pending.front().cloned() {
+        match persist_chat_turn_assistant_wenyan(
+            registry,
+            model,
+            root.as_ref(),
+            namespace,
+            chat_room,
+            turn_index,
+            &content,
+        ) {
+            Ok(Some(path)) => println!("literary> persisted wenyan memory: {}", path.display()),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "literary> skipped wenyan memory: {}. Set HC_CONTEXT_LITERARY_MEMORY=false to disable this optional step.",
+                concise_error_message(&error)
+            ),
+        }
+        pending.pop_front();
+        flushed += 1;
+    }
+
+    Ok(flushed)
+}
+
+fn default_global_room_id(memory_namespace: &MemoryNamespace) -> String {
+    format!(
+        "room.global.{}.{}",
+        slugify_chat_segment(&memory_namespace.tenant_id),
+        slugify_chat_segment(&memory_namespace.user_id)
+    )
 }
 
 fn build_memory_organizer<'a>(

@@ -1,6 +1,7 @@
 //! Minimal pluggable LLM core for Honeycomb.
 
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::io::{BufRead, BufReader};
 
 use reqwest::blocking::Client;
@@ -240,7 +241,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
+            .map_err(|error| LlmError::ProviderFailure(format_transport_error(&error)))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -292,7 +293,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
+            .map_err(|error| LlmError::ProviderFailure(format_transport_error(&error)))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -370,6 +371,19 @@ impl LlmProvider for OpenAiCompatibleProvider {
             raw: Some(serde_json::Value::Array(raw_chunks)),
         })
     }
+}
+
+fn format_transport_error(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(current) = source {
+        let message = current.to_string();
+        if !message.is_empty() && !parts.iter().any(|part| part == &message) {
+            parts.push(message);
+        }
+        source = current.source();
+    }
+    parts.join(": ")
 }
 
 fn build_openai_chat_request(request: &GenerateRequest, stream: bool) -> OpenAiChatRequest {

@@ -14,6 +14,7 @@ use hc_memory::{
 use hc_persona::PersonaProfile;
 use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,18 @@ pub struct RetrievedMemory {
     pub source_kind: String,
     pub confidence_milli: u16,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomCandidate {
+    pub room_id: String,
+    pub layer: MemoryLayer,
+    pub status: String,
+    pub title: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+    pub score_milli: u16,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,6 +262,7 @@ impl From<&MemoryRoomAsset> for RetrievedMemory {
 pub struct ContextMemoryQuery {
     pub memory_query: MemoryQuery,
     pub limit: Option<usize>,
+    pub room_anchor_ids: Vec<String>,
 }
 
 impl ContextMemoryQuery {
@@ -274,6 +288,14 @@ impl ContextMemoryQuery {
 
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    pub fn with_room_anchor(mut self, room_id: impl Into<String>) -> Self {
+        let room_id = room_id.into();
+        if !room_id.trim().is_empty() && !self.room_anchor_ids.iter().any(|id| id == &room_id) {
+            self.room_anchor_ids.push(room_id);
+        }
         self
     }
 }
@@ -665,6 +687,10 @@ impl WorkspaceMemoryRetriever {
             namespace,
         }
     }
+
+    pub fn discover_room_candidates(&self, query: &ContextMemoryQuery) -> Result<Vec<RoomCandidate>> {
+        discover_room_candidates(&self.root, &self.namespace, query)
+    }
 }
 
 impl MemoryRetriever for WorkspaceMemoryRetriever {
@@ -674,6 +700,11 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
         let room_repository =
             MemoryRoomRepository::with_namespace(self.root.clone(), self.namespace.clone());
         let _ = store.rebuild_markdown_index_in_namespace(&self.namespace)?;
+        let room_candidates = self.discover_room_candidates(query)?;
+        let room_candidate_boosts = room_candidates
+            .iter()
+            .map(|candidate| (candidate.room_id.clone(), candidate.score_milli))
+            .collect::<std::collections::BTreeMap<_, _>>();
 
         let mut record_markdown_query = MarkdownQuery::default().with_path_prefix("memory");
         if let Some(tag) = &query.memory_query.tag {
@@ -712,10 +743,43 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
 
         let room_entries =
             store.query_markdown_index_in_namespace(&self.namespace, &room_markdown_query)?;
+        let mut seen_match_ids = matches
+            .iter()
+            .map(|memory| memory.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         for entry in room_entries {
             let asset = room_repository.read_asset(&entry.relative_path)?;
-            let retrieved = RetrievedMemory::from(&asset);
+            let mut retrieved = RetrievedMemory::from(&asset);
+            if let Some(boost) = room_candidate_boosts.get(&asset.room_id) {
+                retrieved.confidence_milli = retrieved.confidence_milli.saturating_add(*boost / 4).min(1000);
+            }
             if room_asset_matches_query(query, &asset, &retrieved) {
+                seen_match_ids.insert(retrieved.id.clone());
+                matches.push(retrieved);
+            }
+        }
+
+        for candidate in room_candidates.iter().filter(|candidate| {
+            candidate.score_milli >= 700
+                && candidate
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "anchor-room" || reason == "anchor-related")
+        }) {
+            let Some((room, _)) = read_room_by_id(&store, &room_repository, &self.namespace, &candidate.room_id)? else {
+                continue;
+            };
+            let assets = room_repository.read_compressed_assets(&room)?;
+            for asset in assets.into_iter().rev().take(2) {
+                if seen_match_ids.contains(&asset.id) {
+                    continue;
+                }
+                let mut retrieved = RetrievedMemory::from(&asset);
+                retrieved.confidence_milli = retrieved
+                    .confidence_milli
+                    .saturating_add(candidate.score_milli / 3)
+                    .min(1000);
+                seen_match_ids.insert(retrieved.id.clone());
                 matches.push(retrieved);
             }
         }
@@ -727,11 +791,409 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
                 .then_with(|| left.id.cmp(&right.id))
         });
         matches.dedup_by(|left, right| left.id == right.id);
+        matches = apply_room_kind_budgets(matches);
         if let Some(limit) = query.limit {
             matches.truncate(limit);
         }
         Ok(matches)
     }
+}
+
+fn apply_room_kind_budgets(matches: Vec<RetrievedMemory>) -> Vec<RetrievedMemory> {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut selected = Vec::new();
+    let mut overflow = Vec::new();
+
+    for memory in matches {
+        let kind = retrieved_memory_room_kind(&memory);
+        let budget = room_kind_budget(kind);
+        let count = counts.entry(kind).or_default();
+        if *count < budget {
+            *count += 1;
+            selected.push(memory);
+        } else {
+            overflow.push(memory);
+        }
+    }
+
+    selected.extend(overflow.into_iter().filter(|memory| {
+        let kind = retrieved_memory_room_kind(memory);
+        kind == "other"
+    }));
+    selected
+}
+
+fn retrieved_memory_room_kind(memory: &RetrievedMemory) -> &'static str {
+    if let Some(room_id) = &memory.room_id {
+        if room_id.starts_with("room.agent.") || memory.tags.iter().any(|tag| tag == "agent") {
+            "agent"
+        } else if room_id.starts_with("room.tool.") || memory.tags.iter().any(|tag| tag == "tool") {
+            "tool"
+        } else if room_id.starts_with("room.project.")
+            || memory.tags.iter().any(|tag| tag == "project")
+        {
+            "project"
+        } else if room_id.starts_with("room.task.") || memory.tags.iter().any(|tag| tag == "task") {
+            "task"
+        } else if room_id.starts_with("room.topic.") || memory.tags.iter().any(|tag| tag == "topic") {
+            "topic"
+        } else if room_id.starts_with("room.chat.") || memory.tags.iter().any(|tag| tag == "chat") {
+            "chat"
+        } else if room_id.starts_with("room.global.")
+            || memory.tags.iter().any(|tag| tag == "global")
+        {
+            "global"
+        } else {
+            "other"
+        }
+    } else if matches!(memory.layer, Some(MemoryLayer::Global))
+        || memory.scope == MemoryScope::Global
+    {
+        "global"
+    } else {
+        "other"
+    }
+}
+
+fn room_kind_budget(kind: &str) -> usize {
+    match kind {
+        "chat" => 4,
+        "task" => 3,
+        "topic" => 2,
+        "tool" => 2,
+        "project" => 2,
+        "agent" => 1,
+        "global" => 1,
+        _ => 2,
+    }
+}
+
+pub fn discover_room_candidates(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    query: &ContextMemoryQuery,
+) -> Result<Vec<RoomCandidate>> {
+    let root = root.as_ref().to_path_buf();
+    let store = WorkspaceStore::new(root.clone());
+    let room_repository = MemoryRoomRepository::with_namespace(root, namespace.clone());
+    let mut markdown_query = MarkdownQuery::default()
+        .with_path_prefix("memory/rooms")
+        .with_doc_type("memory_room");
+
+    if let Some(text) = &query.memory_query.text {
+        markdown_query = markdown_query.with_text(text.clone());
+    }
+    if let Some(tag) = &query.memory_query.tag {
+        markdown_query = markdown_query.with_tag(tag.clone());
+    }
+
+    let entries = store.query_markdown_index_in_namespace(namespace, &markdown_query)?;
+    let mut candidates = Vec::new();
+    let mut seen_room_ids = std::collections::BTreeSet::new();
+    let mut related_room_ids = BTreeMap::<String, (u16, Vec<String>)>::new();
+
+    for entry in entries {
+        let room = room_repository.read_room(&entry.relative_path)?;
+        let modified_at = modified_time_for_relative_path(&store, namespace, &entry.relative_path);
+        collect_related_room_ids(
+            &room,
+            120,
+            "related-room",
+            &mut related_room_ids,
+        );
+        seen_room_ids.insert(room.id.clone());
+        candidates.push(build_room_candidate(&room, query, modified_at, 0, Vec::new()));
+    }
+
+    for room_id in &query.room_anchor_ids {
+        if seen_room_ids.contains(room_id) {
+            continue;
+        }
+        let Some((room, modified_at)) = read_room_by_id(&store, &room_repository, namespace, room_id)? else {
+            continue;
+        };
+        collect_related_room_ids(
+            &room,
+            220,
+            "anchor-related",
+            &mut related_room_ids,
+        );
+        seen_room_ids.insert(room.id.clone());
+        candidates.push(build_room_candidate(
+            &room,
+            query,
+            modified_at,
+            280,
+            vec!["anchor-room".to_owned()],
+        ));
+    }
+
+    for (related_room_id, (extra_score, reasons)) in related_room_ids {
+        if seen_room_ids.contains(&related_room_id) {
+            continue;
+        }
+        let Some((room, modified_at)) =
+            read_room_by_id(&store, &room_repository, namespace, &related_room_id)?
+        else {
+            continue;
+        };
+        candidates.push(build_room_candidate(
+            &room,
+            query,
+            modified_at,
+            extra_score,
+            reasons,
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score_milli
+            .cmp(&left.score_milli)
+            .then_with(|| left.room_id.cmp(&right.room_id))
+    });
+    candidates.dedup_by(|left, right| left.room_id == right.room_id);
+    Ok(candidates)
+}
+
+fn collect_related_room_ids(
+    room: &hc_memory::MemoryRoom,
+    score: u16,
+    reason: &str,
+    related_room_ids: &mut BTreeMap<String, (u16, Vec<String>)>,
+) {
+    for relation in &room.relations {
+        if !relation.target.starts_with("room.") {
+            continue;
+        }
+        let entry = related_room_ids
+            .entry(relation.target.clone())
+            .or_insert_with(|| (0, Vec::new()));
+        entry.0 = entry.0.max(score);
+        if !entry.1.iter().any(|existing| existing == reason) {
+            entry.1.push(reason.to_owned());
+        }
+    }
+}
+
+fn read_room_by_id(
+    store: &WorkspaceStore,
+    repository: &MemoryRoomRepository,
+    namespace: &WorkspaceNamespace,
+    room_id: &str,
+) -> Result<Option<(hc_memory::MemoryRoom, SystemTime)>> {
+    let query = MarkdownQuery::default()
+        .with_path_prefix("memory/rooms")
+        .with_doc_type("memory_room")
+        .with_id(room_id.to_owned())
+        .with_limit(1);
+    let Some(entry) = store
+        .query_markdown_index_in_namespace(namespace, &query)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let room = repository.read_room(&entry.relative_path)?;
+    let modified_at = modified_time_for_relative_path(store, namespace, &entry.relative_path);
+    Ok(Some((room, modified_at)))
+}
+
+fn modified_time_for_relative_path(
+    store: &WorkspaceStore,
+    namespace: &WorkspaceNamespace,
+    relative_path: impl AsRef<Path>,
+) -> SystemTime {
+    store
+        .resolve_in_namespace(namespace, relative_path)
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn base_room_score(room: &hc_memory::MemoryRoom) -> u16 {
+    match room.layer {
+        MemoryLayer::Chat => 620,
+        MemoryLayer::Task => 700,
+        MemoryLayer::Topic => 680,
+        MemoryLayer::Project => 640,
+        MemoryLayer::Global => 560,
+    }
+}
+
+fn build_room_candidate(
+    room: &hc_memory::MemoryRoom,
+    query: &ContextMemoryQuery,
+    modified_at: SystemTime,
+    extra_score: u16,
+    mut reasons: Vec<String>,
+) -> RoomCandidate {
+    let mut score = base_room_score(room).saturating_add(extra_score);
+    reasons.push(format!("layer={:?}", room.layer).to_ascii_lowercase());
+
+    if room.status == "active" {
+        score += 180;
+        reasons.push("active-room".to_owned());
+    }
+
+    let recency_bonus = recency_score(modified_at);
+    if recency_bonus > 0 {
+        score = score.saturating_add(recency_bonus);
+        reasons.push(format!("recent+{recency_bonus}"));
+    }
+
+    if let Some(scope) = &query.memory_query.scope
+        && *scope == memory_scope_for_layer(&room.layer)
+    {
+        score += 140;
+        reasons.push("scope-match".to_owned());
+    }
+
+    if let Some(tag) = &query.memory_query.tag
+        && room.tags.iter().any(|candidate| candidate == tag)
+    {
+        score += 160;
+        reasons.push(format!("tag={tag}"));
+    }
+
+    if let Some(text) = &query.memory_query.text {
+        let lowered = text.to_ascii_lowercase();
+        let haystack = format!("{} {} {}", room.title, room.summary, room.tags.join(" "))
+            .to_ascii_lowercase();
+        if haystack.contains(&lowered) {
+            score += 260;
+            reasons.push("text-match".to_owned());
+        }
+
+        if let Some(kind) = room_kind_hint(room) {
+            if room_kind_matches_query(kind, &lowered) {
+                score += 220;
+                reasons.push(format!("room-kind={kind}"));
+            }
+        }
+    }
+
+    RoomCandidate {
+        room_id: room.id.clone(),
+        layer: room.layer.clone(),
+        status: room.status.clone(),
+        title: room.title.clone(),
+        summary: room.summary.clone(),
+        tags: room.tags.clone(),
+        score_milli: score.min(1000),
+        reasons,
+    }
+}
+
+fn recency_score(modified_at: SystemTime) -> u16 {
+    let Ok(elapsed) = SystemTime::now().duration_since(modified_at) else {
+        return 0;
+    };
+
+    let hours = elapsed.as_secs() / 3600;
+    if hours <= 6 {
+        220
+    } else if hours <= 24 {
+        160
+    } else if hours <= 24 * 3 {
+        100
+    } else if hours <= 24 * 7 {
+        50
+    } else {
+        0
+    }
+}
+
+fn room_kind_hint(room: &hc_memory::MemoryRoom) -> Option<&'static str> {
+    for tag in &room.tags {
+        match tag.as_str() {
+            "agent" => return Some("agent"),
+            "tool" => return Some("tool"),
+            "project" => return Some("project"),
+            "task" => return Some("task"),
+            "topic" => return Some("topic"),
+            _ => {}
+        }
+    }
+
+    if room.id.starts_with("room.agent.") {
+        Some("agent")
+    } else if room.id.starts_with("room.tool.") {
+        Some("tool")
+    } else if room.id.starts_with("room.project.") {
+        Some("project")
+    } else if room.id.starts_with("room.task.") {
+        Some("task")
+    } else if room.id.starts_with("room.topic.") {
+        Some("topic")
+    } else {
+        None
+    }
+}
+
+fn room_kind_matches_query(kind: &str, lowered_query: &str) -> bool {
+    let keywords: &[&str] = match kind {
+        "agent" => &[
+            "agent",
+            "persona",
+            "reviewer",
+            "planner",
+            "coder",
+            "助手",
+            "智能体",
+            "人格",
+            "角色",
+        ],
+        "tool" => &[
+            "tool",
+            "api",
+            "git",
+            "cargo",
+            "minimax",
+            "openai",
+            "工具",
+            "命令",
+            "接口",
+            "sdk",
+        ],
+        "project" => &[
+            "project",
+            "architecture",
+            "convention",
+            "workspace",
+            "repo",
+            "项目",
+            "架构",
+            "约定",
+            "仓库",
+        ],
+        "task" => &[
+            "implement",
+            "fix",
+            "debug",
+            "refactor",
+            "test",
+            "review",
+            "实现",
+            "修复",
+            "调试",
+            "重构",
+            "测试",
+            "任务",
+        ],
+        "topic" => &[
+            "topic",
+            "concept",
+            "knowledge",
+            "reference",
+            "话题",
+            "主题",
+            "知识",
+        ],
+        _ => &[],
+    };
+
+    keywords.iter().any(|keyword| lowered_query.contains(keyword))
 }
 
 impl MemoryRoomRouter for RuleBasedMemoryRoomRouter {

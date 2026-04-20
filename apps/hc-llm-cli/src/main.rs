@@ -72,12 +72,8 @@ fn main() -> Result<()> {
 fn default_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     let provider_id = default_provider();
-    let api_key = env::var("HC_LLM_API_KEY")
-        .or_else(|_| env::var("OPENAI_API_KEY"))
-        .ok();
-    let base_url = env::var("HC_LLM_BASE_URL")
-        .or_else(|_| env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| default_base_url_for_provider(&provider_id));
+    let api_key = provider_api_key(&provider_id);
+    let base_url = provider_base_url(&provider_id);
 
     if let Some(api_key) = api_key {
         if let Ok(provider) = OpenAiCompatibleProvider::new(
@@ -269,12 +265,12 @@ fn run_setup_wizard() -> Result<()> {
     let current_base_url = vars
         .get("HC_LLM_BASE_URL")
         .cloned()
-        .or_else(|| env::var("OPENAI_BASE_URL").ok())
+        .or_else(|| env::var(provider_base_url_var_name(&provider)).ok())
         .unwrap_or_else(|| default_base_url_for_provider(&provider));
     let api_key_hint = vars
         .get("HC_LLM_API_KEY")
         .cloned()
-        .or_else(|| env::var("OPENAI_API_KEY").ok());
+        .or_else(|| env::var(provider_api_key_var_name(&provider)).ok());
 
     println!(
         "API key{}:",
@@ -628,7 +624,38 @@ fn default_provider() -> String {
         return "openai".to_owned();
     }
 
+    if env::var("MINIMAX_API_KEY").is_ok() {
+        return "minimax".to_owned();
+    }
+
     "openai".to_owned()
+}
+
+fn provider_api_key(provider_id: &str) -> Option<String> {
+    env::var("HC_LLM_API_KEY")
+        .ok()
+        .or_else(|| env::var(provider_api_key_var_name(provider_id)).ok())
+}
+
+fn provider_base_url(provider_id: &str) -> String {
+    env::var("HC_LLM_BASE_URL")
+        .ok()
+        .or_else(|| env::var(provider_base_url_var_name(provider_id)).ok())
+        .unwrap_or_else(|| default_base_url_for_provider(provider_id))
+}
+
+fn provider_api_key_var_name(provider_id: &str) -> &'static str {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MINIMAX_API_KEY",
+        _ => "OPENAI_API_KEY",
+    }
+}
+
+fn provider_base_url_var_name(provider_id: &str) -> &'static str {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MINIMAX_BASE_URL",
+        _ => "OPENAI_BASE_URL",
+    }
 }
 
 fn default_model() -> String {

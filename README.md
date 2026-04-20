@@ -94,6 +94,8 @@ cargo run -p hc-llm-cli -- providers
 cargo run -p hc-llm-cli -- generate "hello"
 ```
 
+You can also copy [.env.example](/mnt/code_disk/code/rust/honeycomb/.env.example) to `.env` in the repo root. `hc-llm-cli` and `hc-context-cli` both auto-load that file from the current working directory.
+
 With a real OpenAI-compatible endpoint:
 
 ```powershell
