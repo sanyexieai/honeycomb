@@ -3,11 +3,14 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use hc_llm::{
-    ChatMessage, GenerateRequest, MessageRole, ModelRef, OpenAiCompatibleProvider, ProviderRegistry,
+    ChatMessage, GenerateRequest, GenerateResponse, MessageRole, ModelRef, OpenAiCompatibleProvider,
+    ProviderRegistry, StreamChunk,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +21,18 @@ struct ProviderPreset {
     balanced_model: &'static str,
     fast_model: &'static str,
     coding_model: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestMode {
+    Direct,
+    Stream,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputStyle {
+    typewriter: bool,
+    typewriter_delay_ms: u64,
 }
 
 fn main() -> Result<()> {
@@ -317,7 +332,7 @@ fn run_setup_wizard() -> Result<()> {
 
 fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json]");
+        bail!("usage: hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>]");
     }
 
     let mut provider = default_provider();
@@ -325,6 +340,11 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     let mut system_message: Option<String> = None;
     let mut json = false;
     let mut prompt_parts = Vec::new();
+    let mut request_mode = default_request_mode();
+    let mut output_style = OutputStyle {
+        typewriter: false,
+        typewriter_delay_ms: default_typewriter_delay_ms(),
+    };
 
     let mut index = 0usize;
     while index < args.len() {
@@ -355,6 +375,33 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 json = true;
                 index += 1;
             }
+            "--request-mode" => {
+                request_mode = parse_request_mode(
+                    args.get(index + 1)
+                        .context("missing value for --request-mode")?,
+                )?;
+                index += 2;
+            }
+            "--stream" => {
+                request_mode = RequestMode::Stream;
+                index += 1;
+            }
+            "--direct" => {
+                request_mode = RequestMode::Direct;
+                index += 1;
+            }
+            "--typewriter" => {
+                output_style.typewriter = true;
+                index += 1;
+            }
+            "--typewriter-delay-ms" => {
+                output_style.typewriter_delay_ms = args
+                    .get(index + 1)
+                    .context("missing value for --typewriter-delay-ms")?
+                    .parse::<u64>()
+                    .context("invalid value for --typewriter-delay-ms")?;
+                index += 2;
+            }
             value => {
                 prompt_parts.push(value.to_owned());
                 index += 1;
@@ -373,7 +420,7 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     messages.push(ChatMessage::new(MessageRole::User, prompt_parts.join(" ")));
 
     let request = GenerateRequest::new(ModelRef::new(provider, model), messages);
-    let response = generate_with_guidance(registry, &request)?;
+    let response = generate_with_mode(registry, &request, request_mode, output_style, json)?;
 
     if json {
         println!(
@@ -381,7 +428,7 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             serde_json::to_string_pretty(&response).context("failed to serialize response")?
         );
     } else {
-        println!("{}", response.message.content);
+        println!();
     }
 
     Ok(())
@@ -391,6 +438,11 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     let mut provider = default_provider();
     let mut model = default_model();
     let mut system_message = env::var("HC_LLM_SYSTEM").ok();
+    let mut request_mode = default_request_mode();
+    let mut output_style = OutputStyle {
+        typewriter: true,
+        typewriter_delay_ms: default_typewriter_delay_ms(),
+    };
 
     let mut index = 0usize;
     while index < args.len() {
@@ -417,12 +469,46 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 );
                 index += 2;
             }
+            "--request-mode" => {
+                request_mode = parse_request_mode(
+                    args.get(index + 1)
+                        .context("missing value for --request-mode")?,
+                )?;
+                index += 2;
+            }
+            "--stream" => {
+                request_mode = RequestMode::Stream;
+                index += 1;
+            }
+            "--direct" => {
+                request_mode = RequestMode::Direct;
+                index += 1;
+            }
+            "--typewriter" => {
+                output_style.typewriter = true;
+                index += 1;
+            }
+            "--no-typewriter" => {
+                output_style.typewriter = false;
+                index += 1;
+            }
+            "--typewriter-delay-ms" => {
+                output_style.typewriter_delay_ms = args
+                    .get(index + 1)
+                    .context("missing value for --typewriter-delay-ms")?
+                    .parse::<u64>()
+                    .context("invalid value for --typewriter-delay-ms")?;
+                index += 2;
+            }
             other => bail!("unknown chat option: {other}"),
         }
     }
 
     println!("hc-llm chat");
-    println!("provider={provider} model={model}");
+    println!(
+        "provider={provider} model={model} request_mode={}",
+        request_mode_label(request_mode)
+    );
     println!("Type /help for commands, /quit to exit.");
 
     let mut history = Vec::new();
@@ -487,12 +573,15 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
         let request =
             GenerateRequest::new(ModelRef::new(provider.clone(), model.clone()), history.clone());
-        match generate_with_guidance(registry, &request) {
+        print!("assistant> ");
+        io::stdout().flush().context("failed to flush stdout")?;
+        match generate_with_mode(registry, &request, request_mode, output_style, false) {
             Ok(response) => {
-                println!("assistant> {}", response.message.content);
+                println!();
                 history.push(response.message);
             }
             Err(error) => {
+                println!();
                 println!("error> {error}");
                 let _ = history.pop();
             }
@@ -505,12 +594,12 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 fn print_help() {
     println!("hc-llm-cli");
     println!("hc-llm-cli                    # setup wizard if needed, otherwise start chat");
-    println!("hc-llm-cli chat [--provider <id>] [--model <name>] [--system <text>]");
+    println!("hc-llm-cli chat [--provider <id>] [--model <name>] [--system <text>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>]");
     println!("hc-llm-cli config llm --provider <id> [--model-type <type>] [--model <name>] --api-key <key> [--base-url <url>]");
     println!("hc-llm-cli config openai --api-key <key> [--base-url <url>]");
     println!("hc-llm-cli config show");
     println!("hc-llm-cli providers");
-    println!("hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json]");
+    println!("hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>]");
 }
 
 fn print_config_help() {
@@ -555,6 +644,35 @@ fn default_model() -> String {
     }
 }
 
+fn default_request_mode() -> RequestMode {
+    env::var("HC_LLM_REQUEST_MODE")
+        .ok()
+        .and_then(|value| parse_request_mode(&value).ok())
+        .unwrap_or(RequestMode::Direct)
+}
+
+fn default_typewriter_delay_ms() -> u64 {
+    env::var("HC_LLM_TYPEWRITER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(12)
+}
+
+fn parse_request_mode(value: &str) -> Result<RequestMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "direct" | "sync" => Ok(RequestMode::Direct),
+        "stream" | "streaming" => Ok(RequestMode::Stream),
+        other => bail!("unsupported request mode: {other}. supported modes: direct, stream"),
+    }
+}
+
+fn request_mode_label(mode: RequestMode) -> &'static str {
+    match mode {
+        RequestMode::Direct => "direct",
+        RequestMode::Stream => "stream",
+    }
+}
+
 fn generate_with_guidance(
     registry: &ProviderRegistry,
     request: &GenerateRequest,
@@ -568,6 +686,66 @@ fn generate_with_guidance(
             anyhow::anyhow!(error)
         }
     })
+}
+
+fn generate_with_mode(
+    registry: &ProviderRegistry,
+    request: &GenerateRequest,
+    request_mode: RequestMode,
+    output_style: OutputStyle,
+    json: bool,
+) -> Result<GenerateResponse> {
+    match request_mode {
+        RequestMode::Direct => {
+            let response = generate_with_guidance(registry, request)?;
+            if !json {
+                render_output(&response.message.content, output_style)?;
+            }
+            Ok(response)
+        }
+        RequestMode::Stream => generate_stream_with_guidance(registry, request, output_style, json),
+    }
+}
+
+fn generate_stream_with_guidance(
+    registry: &ProviderRegistry,
+    request: &GenerateRequest,
+    output_style: OutputStyle,
+    json: bool,
+) -> Result<GenerateResponse> {
+    let mut callback = |chunk: StreamChunk| -> Result<(), hc_llm::LlmError> {
+        if !json {
+            render_output(&chunk.delta, output_style)
+                .map_err(|error| hc_llm::LlmError::ProviderFailure(error.to_string()))?;
+        }
+        Ok(())
+    };
+
+    registry.generate_stream(request, &mut callback).map_err(|error| {
+        if request.model.provider == "openai" && matches_openai_not_configured(&error) {
+            anyhow::anyhow!(
+                "{error}\nconfigure it with: hc-llm-cli config llm --provider openai --model-type balanced --api-key <key> [--base-url <url>]"
+            )
+        } else {
+            anyhow::anyhow!(error)
+        }
+    })
+}
+
+fn render_output(text: &str, output_style: OutputStyle) -> Result<()> {
+    if output_style.typewriter {
+        for character in text.chars() {
+            print!("{character}");
+            io::stdout().flush().context("failed to flush stdout")?;
+            if output_style.typewriter_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(output_style.typewriter_delay_ms));
+            }
+        }
+    } else {
+        print!("{text}");
+        io::stdout().flush().context("failed to flush stdout")?;
+    }
+    Ok(())
 }
 
 fn using_legacy_mock_config() -> bool {

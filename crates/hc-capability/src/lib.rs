@@ -59,6 +59,24 @@ pub enum CapabilityOutputType {
     ReviewNotes,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityTier {
+    #[default]
+    KnowledgeInterface,
+    RuntimeFoundation,
+    AtomicUnit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDependence {
+    #[default]
+    Required,
+    Optional,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityProfile {
     pub id: String,
@@ -68,12 +86,18 @@ pub struct CapabilityProfile {
     pub visibility: CapabilityVisibility,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub tier: CapabilityTier,
+    #[serde(default)]
+    pub model_dependence: ModelDependence,
     pub domains: Vec<String>,
     pub skills: Vec<String>,
     pub input_types: Vec<CapabilityInputType>,
     pub output_types: Vec<CapabilityOutputType>,
     pub tool_refs: Vec<String>,
     pub workflow_refs: Vec<String>,
+    pub dependency_refs: Vec<String>,
+    pub optimization_of_refs: Vec<String>,
     pub constraints: Vec<String>,
     pub tags: Vec<String>,
 }
@@ -86,12 +110,16 @@ impl CapabilityProfile {
             visibility: default_capability_visibility(),
             name: name.into(),
             description: String::new(),
+            tier: CapabilityTier::KnowledgeInterface,
+            model_dependence: ModelDependence::Required,
             domains: Vec::new(),
             skills: Vec::new(),
             input_types: Vec::new(),
             output_types: Vec::new(),
             tool_refs: Vec::new(),
             workflow_refs: Vec::new(),
+            dependency_refs: Vec::new(),
+            optimization_of_refs: Vec::new(),
             constraints: Vec::new(),
             tags: Vec::new(),
         }
@@ -109,6 +137,16 @@ impl CapabilityProfile {
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    pub fn with_tier(mut self, tier: CapabilityTier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    pub fn with_model_dependence(mut self, model_dependence: ModelDependence) -> Self {
+        self.model_dependence = model_dependence;
         self
     }
 
@@ -142,6 +180,16 @@ impl CapabilityProfile {
         self
     }
 
+    pub fn with_dependency_ref(mut self, dependency_ref: impl Into<String>) -> Self {
+        self.dependency_refs.push(dependency_ref.into());
+        self
+    }
+
+    pub fn with_optimization_of_ref(mut self, capability_ref: impl Into<String>) -> Self {
+        self.optimization_of_refs.push(capability_ref.into());
+        self
+    }
+
     pub fn with_constraint(mut self, constraint: impl Into<String>) -> Self {
         self.constraints.push(constraint.into());
         self
@@ -159,6 +207,26 @@ impl CapabilityProfile {
             CapabilityVisibility::CrossTenantShared => true,
         }
     }
+
+    pub fn is_shared_knowledge(&self) -> bool {
+        self.tier == CapabilityTier::KnowledgeInterface
+    }
+
+    pub fn is_runtime_foundation(&self) -> bool {
+        self.tier == CapabilityTier::RuntimeFoundation
+    }
+
+    pub fn is_atomic_unit(&self) -> bool {
+        self.tier == CapabilityTier::AtomicUnit
+    }
+
+    pub fn is_fully_deterministic(&self) -> bool {
+        self.model_dependence == ModelDependence::None
+    }
+
+    pub fn is_optimization_of_runtime_foundation(&self) -> bool {
+        self.tier == CapabilityTier::AtomicUnit && !self.optimization_of_refs.is_empty()
+    }
 }
 
 fn default_capability_visibility() -> CapabilityVisibility {
@@ -174,6 +242,8 @@ pub fn seed_capability_for_role(
             .with_namespace(namespace)
             .with_visibility(CapabilityVisibility::TenantShared)
             .with_description("Breaks a task into steps and coordination decisions.")
+            .with_tier(CapabilityTier::KnowledgeInterface)
+            .with_model_dependence(ModelDependence::Required)
             .with_domain("planning")
             .with_skill("task_breakdown")
             .with_skill("coordination")
@@ -184,6 +254,8 @@ pub fn seed_capability_for_role(
             .with_namespace(namespace)
             .with_visibility(CapabilityVisibility::TenantShared)
             .with_description("Reviews outputs for gaps, risks, and regressions.")
+            .with_tier(CapabilityTier::KnowledgeInterface)
+            .with_model_dependence(ModelDependence::Required)
             .with_domain("review")
             .with_skill("risk_identification")
             .with_skill("quality_review")
@@ -194,6 +266,8 @@ pub fn seed_capability_for_role(
             .with_namespace(namespace)
             .with_visibility(CapabilityVisibility::TenantShared)
             .with_description("Executes the main work and produces direct task output.")
+            .with_tier(CapabilityTier::KnowledgeInterface)
+            .with_model_dependence(ModelDependence::Required)
             .with_domain("execution")
             .with_skill("implementation")
             .with_skill("delivery")
@@ -203,6 +277,8 @@ pub fn seed_capability_for_role(
         other => CapabilityProfile::new(format!("capability.seed.{other}"), other)
             .with_namespace(namespace)
             .with_description(format!("Seed capability for role `{other}`."))
+            .with_tier(CapabilityTier::KnowledgeInterface)
+            .with_model_dependence(ModelDependence::Required)
             .with_domain(other)
             .with_input_type(CapabilityInputType::NaturalLanguage)
             .with_output_type(CapabilityOutputType::ChatReply),
@@ -217,12 +293,16 @@ struct CapabilityFrontmatter {
     tenant_id: String,
     user_id: String,
     visibility: CapabilityVisibility,
+    tier: CapabilityTier,
+    model_dependence: ModelDependence,
     domains: Vec<String>,
     skills: Vec<String>,
     input_types: Vec<CapabilityInputType>,
     output_types: Vec<CapabilityOutputType>,
     tool_refs: Vec<String>,
     workflow_refs: Vec<String>,
+    dependency_refs: Vec<String>,
+    optimization_of_refs: Vec<String>,
     constraints: Vec<String>,
     tags: Vec<String>,
 }
@@ -276,12 +356,16 @@ impl CapabilityProfile {
             visibility: frontmatter.visibility,
             name: frontmatter.title,
             description: extract_capability_description(&body),
+            tier: frontmatter.tier,
+            model_dependence: frontmatter.model_dependence,
             domains: frontmatter.domains,
             skills: frontmatter.skills,
             input_types: frontmatter.input_types,
             output_types: frontmatter.output_types,
             tool_refs: frontmatter.tool_refs,
             workflow_refs: frontmatter.workflow_refs,
+            dependency_refs: frontmatter.dependency_refs,
+            optimization_of_refs: frontmatter.optimization_of_refs,
             constraints: frontmatter.constraints,
             tags: frontmatter.tags,
         }
@@ -305,12 +389,16 @@ impl CapabilityFrontmatter {
                 profile.namespace.user_id.clone()
             },
             visibility: profile.visibility.clone(),
+            tier: profile.tier.clone(),
+            model_dependence: profile.model_dependence.clone(),
             domains: profile.domains.clone(),
             skills: profile.skills.clone(),
             input_types: profile.input_types.clone(),
             output_types: profile.output_types.clone(),
             tool_refs: profile.tool_refs.clone(),
             workflow_refs: profile.workflow_refs.clone(),
+            dependency_refs: profile.dependency_refs.clone(),
+            optimization_of_refs: profile.optimization_of_refs.clone(),
             constraints: profile.constraints.clone(),
             tags: profile.tags.clone(),
         }
@@ -318,7 +406,27 @@ impl CapabilityFrontmatter {
 }
 
 fn render_capability_body(profile: &CapabilityProfile) -> String {
-    let mut body = format!("# {}\n\n{}\n", profile.name, profile.description);
+    let mut body = format!(
+        "# {}\n\n{}\n\n## Positioning\n\n- tier: {}\n- model_dependence: {}\n",
+        profile.name,
+        profile.description,
+        render_tier(&profile.tier),
+        render_model_dependence(&profile.model_dependence)
+    );
+
+    if !profile.dependency_refs.is_empty() {
+        body.push_str("\n## Dependencies\n\n");
+        for dependency in &profile.dependency_refs {
+            body.push_str(&format!("- {}\n", dependency));
+        }
+    }
+
+    if !profile.optimization_of_refs.is_empty() {
+        body.push_str("\n## Optimizes\n\n");
+        for capability_ref in &profile.optimization_of_refs {
+            body.push_str(&format!("- {}\n", capability_ref));
+        }
+    }
 
     if !profile.constraints.is_empty() {
         body.push_str("\n## Constraints\n\n");
@@ -333,11 +441,32 @@ fn render_capability_body(profile: &CapabilityProfile) -> String {
 fn extract_capability_description(body: &str) -> String {
     body.lines()
         .skip_while(|line| line.starts_with('#') || line.trim().is_empty())
-        .take_while(|line| !line.trim_start().starts_with("## Constraints"))
+        .take_while(|line| {
+            !line.trim_start().starts_with("## Positioning")
+                && !line.trim_start().starts_with("## Dependencies")
+                && !line.trim_start().starts_with("## Optimizes")
+                && !line.trim_start().starts_with("## Constraints")
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_owned()
+}
+
+fn render_tier(tier: &CapabilityTier) -> &'static str {
+    match tier {
+        CapabilityTier::KnowledgeInterface => "knowledge_interface",
+        CapabilityTier::RuntimeFoundation => "runtime_foundation",
+        CapabilityTier::AtomicUnit => "atomic_unit",
+    }
+}
+
+fn render_model_dependence(model_dependence: &ModelDependence) -> &'static str {
+    match model_dependence {
+        ModelDependence::Required => "required",
+        ModelDependence::Optional => "optional",
+        ModelDependence::None => "none",
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +489,8 @@ mod tests {
         let capability = CapabilityProfile::new("capability.custom.rust", "Rust Coding")
             .with_namespace(CapabilityNamespace::new("tenant-a", "alice"))
             .with_visibility(CapabilityVisibility::CrossTenantShared)
+            .with_tier(CapabilityTier::KnowledgeInterface)
+            .with_model_dependence(ModelDependence::Required)
             .with_domain("rust")
             .with_skill("debugging")
             .with_input_type(CapabilityInputType::NaturalLanguage)
@@ -369,5 +500,23 @@ mod tests {
         assert_eq!(capability.namespace.tenant_id, "tenant-a");
         assert_eq!(capability.visibility, CapabilityVisibility::CrossTenantShared);
         assert!(capability.tags.iter().any(|tag| tag == "shared"));
+    }
+
+    #[test]
+    fn capability_can_be_classified_as_atomic_deterministic_unit() {
+        let capability = CapabilityProfile::new("capability.atomic.reply", "Reply Formatter")
+            .with_tier(CapabilityTier::AtomicUnit)
+            .with_model_dependence(ModelDependence::None)
+            .with_dependency_ref("capability.foundation.reply")
+            .with_optimization_of_ref("capability.foundation.reply")
+            .with_constraint("Must not call external models.");
+
+        assert!(capability.is_atomic_unit());
+        assert!(capability.is_fully_deterministic());
+        assert!(capability.is_optimization_of_runtime_foundation());
+        assert_eq!(
+            capability.dependency_refs,
+            vec!["capability.foundation.reply".to_owned()]
+        );
     }
 }

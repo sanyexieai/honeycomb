@@ -2,6 +2,7 @@
 
 pub mod binding;
 pub mod bootstrap;
+pub mod conversation;
 pub mod incubation;
 pub mod orchestrator;
 pub mod planning;
@@ -13,7 +14,8 @@ pub mod workbench;
 pub use binding::{AgentRuntimeBinding, BindingNamespace};
 pub use hc_capability::{
     CapabilityInputType, CapabilityNamespace, CapabilityOutputType, CapabilityProfile,
-    CapabilityRepository, CapabilityVisibility, seed_capability_for_role,
+    CapabilityRepository, CapabilityTier, CapabilityVisibility, ModelDependence,
+    seed_capability_for_role,
 };
 pub use hc_memory::{MemoryRecord, MemoryScope, MemoryType};
 pub use hc_persona::{
@@ -24,12 +26,21 @@ pub use bootstrap::{
     AgentPlan, AgentSeed, MaterializedAgent, bootstrap_planning_task, bootstrap_task,
     materialize_plan, materialize_seed,
 };
+pub use conversation::{
+    ChannelConversation, ConversationParticipant, ConversationParticipantKind,
+    ConversationParticipantMode, ConversationParticipantState, ConversationStatus,
+    ConversationStopPolicy, ConversationTurnPolicy, ConversationTurnState,
+};
 pub use incubation::{IncubationObservation, IncubationReport, PromotionDecision};
 pub use orchestrator::AgentOrchestrator;
-pub use planning::{AgentProposal, TaskPlan, TaskPlanStatus, WorkItem};
+pub use planning::{
+    AgentProposal, AgentRuntimeBudget, EvolutionIssue, TaskPlan, TaskPlanStatus, WorkItem,
+};
 pub use persistence::{
-    PersistedAgentAssets, PersistedIncubationArtifacts, persist_incubation_report,
-    persist_materialized_agents,
+    PersistedAgentAssets, PersistedIncubationArtifacts, PersistedTaskArtifacts,
+    TaskArtifactDocument, TaskArtifactKind, TaskArtifactQuery, TaskArtifactSummary,
+    persist_incubation_report, persist_materialized_agents, persist_task_artifacts,
+    query_task_artifacts, read_task_artifact, rebuild_task_artifact_index,
 };
 pub use hc_responder::{
     HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse, ResponderBackend,
@@ -39,6 +50,6 @@ pub use hc_trace::{
     ActivityItemView, DecisionTraceView, agent_code_from, behavior_mode_code_from, code_from,
     summarize_trace_body,
 };
-pub use task::{TaskContext, TaskNamespace, TaskRequest};
+pub use task::{TaskBudget, TaskContext, TaskNamespace, TaskRequest};
 pub use view::{AgentCardView, AssetSummaryView, WorkspaceViewModel, build_workspace_view};
 pub use workbench::{AgentWorkbench, WorkspacePhase, bootstrap_task_workbench};

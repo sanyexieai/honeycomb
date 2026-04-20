@@ -1,6 +1,7 @@
 //! Minimal pluggable LLM core for Honeycomb.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,12 @@ pub struct GenerateResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamChunk {
+    pub delta: String,
+    pub finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -107,6 +114,20 @@ pub struct ProviderInfo {
 pub trait LlmProvider: Send + Sync {
     fn info(&self) -> ProviderInfo;
     fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse, LlmError>;
+    fn generate_stream(
+        &self,
+        request: &GenerateRequest,
+        on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
+    ) -> Result<GenerateResponse, LlmError> {
+        let response = self.generate(request)?;
+        if !response.message.content.is_empty() {
+            on_chunk(StreamChunk {
+                delta: response.message.content.clone(),
+                finish_reason: Some(response.finish_reason.clone()),
+            })?;
+        }
+        Ok(response)
+    }
 }
 
 #[derive(Default)]
@@ -136,6 +157,17 @@ impl ProviderRegistry {
             .provider(&request.model.provider)
             .ok_or_else(|| LlmError::ProviderNotFound(request.model.provider.clone()))?;
         provider.generate(request)
+    }
+
+    pub fn generate_stream(
+        &self,
+        request: &GenerateRequest,
+        on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
+    ) -> Result<GenerateResponse, LlmError> {
+        let provider = self
+            .provider(&request.model.provider)
+            .ok_or_else(|| LlmError::ProviderNotFound(request.model.provider.clone()))?;
+        provider.generate_stream(request, on_chunk)
     }
 
     pub fn provider_infos(&self) -> Vec<ProviderInfo> {
@@ -185,7 +217,7 @@ impl OpenAiCompatibleProvider {
                 id: id.into(),
                 display_name: display_name.into(),
                 supports_chat: true,
-                supports_streaming: false,
+                supports_streaming: true,
             },
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
@@ -200,21 +232,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse, LlmError> {
-        let body = OpenAiChatRequest {
-            model: request.model.model.clone(),
-            messages: request
-                .messages
-                .iter()
-                .map(|message| OpenAiMessage {
-                    role: openai_role(&message.role).to_owned(),
-                    content: Some(message.content.clone()),
-                    name: message.name.clone(),
-                })
-                .collect(),
-            temperature: request.temperature,
-            max_tokens: request.max_output_tokens,
-            stream: false,
-        };
+        let body = build_openai_chat_request(request, false);
 
         let response = self
             .client
@@ -260,6 +278,115 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }),
             raw: raw.raw,
         })
+    }
+
+    fn generate_stream(
+        &self,
+        request: &GenerateRequest,
+        on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
+    ) -> Result<GenerateResponse, LlmError> {
+        let body = build_openai_chat_request(request, true);
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response
+                .text()
+                .unwrap_or_else(|_| "<failed to read error body>".to_owned());
+            return Err(LlmError::ProviderFailure(format!(
+                "http {}: {}",
+                status.as_u16(),
+                text
+            )));
+        }
+
+        let mut assistant_role = MessageRole::Assistant;
+        let mut accumulated = String::new();
+        let mut finish_reason = FinishReason::Stop;
+        let mut raw_chunks = Vec::new();
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(payload) = trimmed.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload == "[DONE]" {
+                break;
+            }
+
+            let chunk: OpenAiChatStreamChunk = serde_json::from_str(payload)
+                .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
+            raw_chunks.push(
+                serde_json::to_value(&chunk)
+                    .map_err(|error| LlmError::ProviderFailure(error.to_string()))?,
+            );
+
+            for choice in chunk.choices {
+                if let Some(role) = choice.delta.role.as_deref() {
+                    assistant_role = parse_openai_role(role);
+                }
+                if let Some(content) = choice.delta.content {
+                    accumulated.push_str(&content);
+                    on_chunk(StreamChunk {
+                        delta: content,
+                        finish_reason: None,
+                    })?;
+                }
+                if let Some(reason) = choice.finish_reason.as_deref() {
+                    finish_reason = parse_finish_reason(Some(reason));
+                }
+            }
+        }
+
+        Ok(GenerateResponse {
+            model: request.model.clone(),
+            message: ChatMessage {
+                role: assistant_role,
+                content: accumulated,
+                name: None,
+            },
+            finish_reason,
+            usage: None,
+            raw: Some(serde_json::Value::Array(raw_chunks)),
+        })
+    }
+}
+
+fn build_openai_chat_request(request: &GenerateRequest, stream: bool) -> OpenAiChatRequest {
+    OpenAiChatRequest {
+        model: request.model.model.clone(),
+        messages: request
+            .messages
+            .iter()
+            .map(|message| OpenAiMessage {
+                role: openai_role(&message.role).to_owned(),
+                content: Some(message.content.clone()),
+                name: message.name.clone(),
+            })
+            .collect(),
+        temperature: request.temperature,
+        max_tokens: request.max_output_tokens,
+        stream,
     }
 }
 
@@ -315,6 +442,23 @@ struct OpenAiChatResponse {
     usage: Option<OpenAiUsage>,
     #[serde(flatten)]
     raw: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenAiChatStreamChunk {
+    choices: Vec<OpenAiStreamChoice>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenAiStreamChoice {
+    delta: OpenAiStreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenAiStreamDelta {
+    role: Option<String>,
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

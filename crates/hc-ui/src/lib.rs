@@ -13,8 +13,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use hc_agent::{
     ActivityItemView, AgentOrchestrator, AgentPlan, AgentSeed, AgentWorkbench, MaterializedAgent,
-    TaskNamespace, TaskPlan, TaskRequest, WorkspacePhase, bootstrap_task_workbench,
-    build_workspace_view, materialize_seed,
+    TaskArtifactSummary, TaskBudget, TaskNamespace, TaskPlan, TaskRequest, WorkspacePhase,
+    bootstrap_task_workbench, build_workspace_view, materialize_seed, persist_task_artifacts,
+    query_task_artifacts,
 };
 use hc_core::{
     MessageKind, MessageRoute, RuntimeCommand, RuntimeCommandResult, RuntimeNamespace, SessionRecord,
@@ -25,7 +26,28 @@ use hc_responder::{
     HumanInboxRepository, HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse,
     ResponderBackend, ResponderBinding, require_human, require_llm,
 };
+use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerDraft {
+    notes: Vec<String>,
+    work_items: Vec<PlannerWorkItem>,
+    agent_proposals: Vec<PlannerAgentProposal>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerWorkItem {
+    stage: String,
+    title: String,
+    goal: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerAgentProposal {
+    role: String,
+    reason: String,
+}
 
 slint::slint! {
     import { Button, HorizontalBox, LineEdit, TextEdit, VerticalBox } from "std-widgets.slint";
@@ -108,17 +130,37 @@ slint::slint! {
         in property <int> window-index;
         in property <[string]> open-window-titles;
         in property <string> agent-board-text;
+        in property <string> agent-slot-1;
+        in property <string> agent-slot-2;
+        in property <string> agent-slot-3;
+        in property <string> agent-slot-4;
+        in property <string> agent-slot-5;
+        in property <string> agent-slot-6;
+        in property <string> work-items-text;
         in property <string> inspector-text;
         in property <string> transcript-text;
         in property <string> prompt-label;
+        in property <string> selected-work-item-label;
+        in property <string> work-item-slot-1;
+        in property <string> work-item-slot-2;
+        in property <string> work-item-slot-3;
+        in property <string> work-item-slot-4;
+        in property <string> work-item-slot-5;
+        in property <string> work-item-slot-6;
 
         callback new_window();
         callback close_window();
         callback submit_input(string);
+        callback focus_agent(string);
+        callback clear_focus_target();
+        callback select_work_item(string);
+        callback claim_selected_work_item(string, string);
+        callback resolve_selected_work_item();
+        callback execute_selected_work_item();
 
         title: window-title;
-        width: 720px;
-        height: 520px;
+        width: 980px;
+        height: 620px;
 
         VerticalBox {
             spacing: 12px;
@@ -176,6 +218,81 @@ slint::slint! {
                             color: #666;
                         }
 
+                        HorizontalBox {
+                            spacing: 6px;
+
+                            Button {
+                                text: agent-slot-1;
+                                enabled: !agent-slot-1.is-empty;
+                                clicked => {
+                                    if !agent-slot-1.is-empty {
+                                        root.focus_agent(agent-slot-1);
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: agent-slot-2;
+                                enabled: !agent-slot-2.is-empty;
+                                clicked => {
+                                    if !agent-slot-2.is-empty {
+                                        root.focus_agent(agent-slot-2);
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: agent-slot-3;
+                                enabled: !agent-slot-3.is-empty;
+                                clicked => {
+                                    if !agent-slot-3.is-empty {
+                                        root.focus_agent(agent-slot-3);
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalBox {
+                            spacing: 6px;
+
+                            Button {
+                                text: agent-slot-4;
+                                enabled: !agent-slot-4.is-empty;
+                                clicked => {
+                                    if !agent-slot-4.is-empty {
+                                        root.focus_agent(agent-slot-4);
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: agent-slot-5;
+                                enabled: !agent-slot-5.is-empty;
+                                clicked => {
+                                    if !agent-slot-5.is-empty {
+                                        root.focus_agent(agent-slot-5);
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: agent-slot-6;
+                                enabled: !agent-slot-6.is-empty;
+                                clicked => {
+                                    if !agent-slot-6.is-empty {
+                                        root.focus_agent(agent-slot-6);
+                                    }
+                                }
+                            }
+                        }
+
+                        Button {
+                            text: "Workspace";
+                            clicked => {
+                                root.clear_focus_target();
+                            }
+                        }
+
                         TextEdit {
                             read-only: true;
                             text: agent-board-text;
@@ -221,6 +338,168 @@ slint::slint! {
                         padding: 10px;
                         spacing: 6px;
 
+                        Rectangle {
+                            border-radius: 10px;
+                            background: #fdfdfd;
+                            border-width: 1px;
+                            border-color: #d7d1c6;
+                            preferred-height: 200px;
+
+                            VerticalBox {
+                                padding: 8px;
+                                spacing: 6px;
+
+                                Text {
+                                    text: "Work Queue";
+                                    font-size: 13px;
+                                    color: #666;
+                                }
+
+                                TextEdit {
+                                    read-only: true;
+                                    text: work-items-text;
+                                    vertical-stretch: 1;
+                                }
+
+                                Text {
+                                    text: selected-work-item-label;
+                                    color: #555;
+                                }
+
+                                HorizontalBox {
+                                    spacing: 6px;
+
+                                    Button {
+                                        text: work-item-slot-1;
+                                        enabled: !work-item-slot-1.is-empty;
+                                        clicked => {
+                                            if !work-item-slot-1.is-empty {
+                                                root.select_work_item(work-item-slot-1);
+                                            }
+                                        }
+                                    }
+
+                                    Button {
+                                        text: work-item-slot-2;
+                                        enabled: !work-item-slot-2.is-empty;
+                                        clicked => {
+                                            if !work-item-slot-2.is-empty {
+                                                root.select_work_item(work-item-slot-2);
+                                            }
+                                        }
+                                    }
+
+                                    Button {
+                                        text: work-item-slot-3;
+                                        enabled: !work-item-slot-3.is-empty;
+                                        clicked => {
+                                            if !work-item-slot-3.is-empty {
+                                                root.select_work_item(work-item-slot-3);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 6px;
+
+                                    Button {
+                                        text: work-item-slot-4;
+                                        enabled: !work-item-slot-4.is-empty;
+                                        clicked => {
+                                            if !work-item-slot-4.is-empty {
+                                                root.select_work_item(work-item-slot-4);
+                                            }
+                                        }
+                                    }
+
+                                    Button {
+                                        text: work-item-slot-5;
+                                        enabled: !work-item-slot-5.is-empty;
+                                        clicked => {
+                                            if !work-item-slot-5.is-empty {
+                                                root.select_work_item(work-item-slot-5);
+                                            }
+                                        }
+                                    }
+
+                                    Button {
+                                        text: work-item-slot-6;
+                                        enabled: !work-item-slot-6.is-empty;
+                                        clicked => {
+                                            if !work-item-slot-6.is-empty {
+                                                root.select_work_item(work-item-slot-6);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 6px;
+
+                                    selected_work_item_input := LineEdit {
+                                        placeholder-text: "work-item.0001";
+                                        accepted => {
+                                            if !self.text.is-empty {
+                                                root.select_work_item(self.text);
+                                                self.text = "";
+                                            }
+                                        }
+                                    }
+
+                                    Button {
+                                        text: "Use";
+                                        clicked => {
+                                            if !selected_work_item_input.text.is-empty {
+                                                root.select_work_item(selected_work_item_input.text);
+                                                selected_work_item_input.text = "";
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 6px;
+
+                                    claim_score_input := LineEdit {
+                                        placeholder-text: "score e.g. 0.85";
+                                    }
+
+                                    claim_reason_input := LineEdit {
+                                        placeholder-text: "claim reason";
+                                    }
+
+                                    Button {
+                                        text: "Claim";
+                                        clicked => {
+                                            if !claim_score_input.text.is-empty && !claim_reason_input.text.is-empty {
+                                                root.claim_selected_work_item(claim_score_input.text, claim_reason_input.text);
+                                                claim_reason_input.text = "";
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 6px;
+
+                                    Button {
+                                        text: "Resolve";
+                                        clicked => {
+                                            root.resolve_selected_work_item();
+                                        }
+                                    }
+
+                                    Button {
+                                        text: "Execute";
+                                        clicked => {
+                                            root.execute_selected_work_item();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         Text {
                             text: "Inspector";
                             font-size: 13px;
@@ -240,7 +519,7 @@ slint::slint! {
                 spacing: 8px;
 
                 input := LineEdit {
-                    placeholder-text: "Ask the workspace, focus an agent, or use /reply /run";
+                    placeholder-text: "Describe what you want next. Planning uses natural language by default.";
                     accepted => {
                         if !self.text.is-empty {
                             root.submit_input(self.text);
@@ -291,6 +570,7 @@ struct WindowController {
     instance_name: String,
     role_name: String,
     focused_target: Option<String>,
+    selected_work_item: Option<String>,
     pending_replies: Vec<ReplyRequest>,
     handle: MultiWindowShell,
     transcript_lines: Vec<String>,
@@ -307,6 +587,7 @@ struct UiRegistry {
     workspace_phase: WorkspacePhase,
     namespace: RuntimeNamespace,
     agents: Vec<MaterializedAgent>,
+    task_artifacts: Vec<TaskArtifactSummary>,
     windows: Vec<WindowController>,
     next_window_index: usize,
     events_rx: Receiver<UiEvent>,
@@ -377,6 +658,18 @@ pub fn run() -> Result<()> {
                 });
 
                 spawn_materialized_window(Rc::clone(&registry), primary_agent)?;
+                if let Err(error) = run_planner_natural_language_input(
+                    &registry,
+                    &format!("Initial task request: {}", task_goal.trim()),
+                    true,
+                ) {
+                    append_local_line(
+                        &registry,
+                        0,
+                        format!("[planning] automatic planner draft unavailable: {error}"),
+                    );
+                    sync_windows(&registry);
+                }
                 *app_registry.borrow_mut() = Some(registry);
 
                 if let Some(window) = start_window_handle.upgrade() {
@@ -428,11 +721,17 @@ fn build_registry_for_task(task_goal: &str) -> Result<(Rc<RefCell<UiRegistry>>, 
         workspace_phase: workbench.phase.clone(),
         namespace,
         agents: workbench.agents,
+        task_artifacts: Vec::new(),
         windows: Vec::new(),
         next_window_index: 0,
         events_rx,
         events_tx,
     }));
+
+    {
+        let mut registry_ref = registry.borrow_mut();
+        refresh_persisted_task_artifacts(&mut registry_ref)?;
+    }
 
     Ok((registry, primary_agent))
 }
@@ -480,6 +779,7 @@ fn spawn_materialized_window(
         )
         .into(),
     );
+    window.set_selected_work_item_label("Selected work item: none".into());
 
     {
         let registry = Rc::clone(&registry);
@@ -512,45 +812,128 @@ fn spawn_materialized_window(
         });
     }
 
+    {
+        let registry = Rc::clone(&registry);
+        let window_index = window_index as i32;
+        window.on_focus_agent(move |agent_name| {
+            if let Err(error) =
+                set_window_focus_target(&registry, window_index, agent_name.trim())
+            {
+                eprintln!("focus agent error: {error}");
+            }
+        });
+    }
+
+    {
+        let registry = Rc::clone(&registry);
+        let window_index = window_index as i32;
+        window.on_clear_focus_target(move || {
+            if let Err(error) = clear_window_focus_target(&registry, window_index) {
+                eprintln!("clear focus error: {error}");
+            }
+        });
+    }
+
+    {
+        let registry = Rc::clone(&registry);
+        let window_index = window_index as i32;
+        window.on_select_work_item(move |work_item_id| {
+            if let Err(error) =
+                set_selected_work_item(&registry, window_index, work_item_id.to_string())
+            {
+                eprintln!("select work item error: {error}");
+            }
+        });
+    }
+
+    {
+        let registry = Rc::clone(&registry);
+        let window_index = window_index as i32;
+    {
+        let registry = Rc::clone(&registry);
+        let window_index = window_index as i32;
+        window.on_claim_selected_work_item(move |score_text, reason_text| {
+            if let Err(error) = claim_selected_work_item(
+                &registry,
+                window_index,
+                score_text.to_string(),
+                reason_text.to_string(),
+            ) {
+                eprintln!("claim work item error: {error}");
+            }
+        });
+    }
+
+        window.on_resolve_selected_work_item(move || {
+            if let Err(error) = resolve_selected_work_item(&registry, window_index) {
+                eprintln!("resolve work item error: {error}");
+            }
+        });
+    }
+
+    {
+        let registry = Rc::clone(&registry);
+        let window_index = window_index as i32;
+        window.on_execute_selected_work_item(move || {
+            if let Err(error) = execute_selected_work_item(&registry, window_index) {
+                eprintln!("execute work item error: {error}");
+            }
+        });
+    }
+
     window.show()?;
 
     {
         let mut registry_ref = registry.borrow_mut();
+        let responder_label = agent
+            .binding
+            .responder
+            .as_ref()
+            .map(|responder| responder.label())
+            .unwrap_or_else(|| "not bound".to_owned());
+        let mut transcript_lines = vec![
+            "[task] workspace created".to_owned(),
+            format!("[task] namespace: {}", namespace_label),
+            format!("[task] goal: {}", agent.seed.goal),
+            "[planning] phase started".to_owned(),
+            format!("[planning] planner: {} ({})", agent.persona.name, agent.persona.role),
+            format!("[planning] capabilities: {capability_list}"),
+            format!("[planning] responder: {responder_label}"),
+        ];
+        if agent
+            .binding
+            .responder
+            .as_ref()
+            .is_some_and(|responder| matches!(responder, ResponderBinding::Llm(_)))
+        {
+            transcript_lines.push(
+                "[planning] Honeycomb will try to draft the initial plan automatically from the task description."
+                    .to_owned(),
+            );
+            transcript_lines.push(
+                "[planning] You can keep typing natural language to refine the plan.".to_owned(),
+            );
+        } else {
+            transcript_lines.push(
+                "[planning] Planner is currently human-driven. Type natural language planning guidance and Honeycomb will record it as planning notes."
+                    .to_owned(),
+            );
+            transcript_lines.push(
+                "[planning] The task will stay in planning until work items and agent proposals are added."
+                    .to_owned(),
+            );
+        }
+
         registry_ref.windows.push(WindowController {
             window_index: window_index as i32,
             instance_id: agent.binding.instance_id.clone(),
             instance_name: agent.persona.name.clone(),
             role_name: agent.persona.role.clone(),
             focused_target: None,
+            selected_work_item: None,
             pending_replies: Vec::new(),
             handle: window.clone_strong(),
-            transcript_lines: vec![
-                "Honeycomb agent window ready.".to_owned(),
-                format!("namespace: {}", namespace_label),
-                format!("task goal: {}", agent.seed.goal),
-                "phase: planning".to_owned(),
-                format!("persona: {} ({})", agent.persona.name, agent.persona.role),
-                format!("capabilities: {capability_list}"),
-                format!(
-                    "responder: {}",
-                    agent.binding
-                        .responder
-                        .as_ref()
-                        .map(|responder| responder.label())
-                        .unwrap_or_else(|| "not bound".to_owned())
-                ),
-                "Use /msg <name> <text> to talk to another agent.".to_owned(),
-                "Use @agent <text> to direct a message without command syntax.".to_owned(),
-                "Use /focus <name> to set the current target agent.".to_owned(),
-                "Use /responder human|llm to switch how this agent answers.".to_owned(),
-                "Use /reply <text> to answer the oldest pending human-routed request.".to_owned(),
-                "Use `hc-responder-cli inbox list` or `hc-responder-cli inbox reply-next <text>` in another terminal for remote human replies.".to_owned(),
-                "Use /all <text> for broadcast and /channel <name> <text> for channel chat.".to_owned(),
-                "Use /run <command> for explicit local shell execution.".to_owned(),
-                "Use /channel-create <name>, /join <name>, /leave <name>, /channels.".to_owned(),
-                "Use /name <new-name> to rename this window instance.".to_owned(),
-                "Use /who to list instances.".to_owned(),
-            ],
+            transcript_lines,
         });
     }
 
@@ -625,6 +1008,11 @@ fn handle_window_input(
     if line.is_empty() {
         return Ok(());
     }
+
+    let workspace_phase = {
+        let registry_ref = registry.borrow();
+        registry_ref.workspace_phase.clone()
+    };
 
     if let Some((target_name, body)) = parse_msg_command(line) {
         send_window_message(&registry, window_index, &target_name, &body)?;
@@ -703,16 +1091,29 @@ fn handle_window_input(
         return Ok(());
     }
 
+    if let Some((work_item_id, agent_name, score, reason)) = parse_assign_claim_command(line) {
+        add_work_item_claim(&registry, window_index, &work_item_id, &agent_name, score, &reason)?;
+        return Ok(());
+    }
+
     match line {
         "/help" => {
             append_local_line(
                 &registry,
                 window_index,
-                "Commands: /msg <name> <text>, @name <text>, /focus <name>, /responder human|llm, /pending, /reply <text>, /all <text>, /channel <name> <text>, /run <command>, /plan note <text>, /plan stage <stage> | <title> | <goal>, /plan agent <role> | <reason>, /plan approve, /channel-create <name>, /join <name>, /leave <name>, /channels, /name <new-name>, /who, /help".to_owned(),
+                "Commands: /msg <name> <text>, @name <text>, /focus <name>, /responder human|llm, /pending, /reply <text>, /all <text>, /channel <name> <text>, /run <command>, /plan note <text>, /plan stage <stage> | <title> | <goal>, /plan agent <role> | <reason>, /plan approve, /assign claim <work-item-id> | <agent> | <score> | <reason>, /assign resolve <work-item-id>, /execute <work-item-id>, /channel-create <name>, /join <name>, /leave <name>, /channels, /name <new-name>, /who, /help".to_owned(),
             );
         }
         "/plan approve" => {
             approve_plan(&registry, window_index)?;
+        }
+        _ if line.starts_with("/assign resolve ") => {
+            let work_item_id = line.trim_start_matches("/assign resolve ").trim();
+            resolve_work_item_assignment(&registry, window_index, work_item_id)?;
+        }
+        _ if line.starts_with("/execute ") => {
+            let work_item_id = line.trim_start_matches("/execute ").trim();
+            execute_work_item(&registry, window_index, work_item_id)?;
         }
         "/pending" => {
             let lines = list_pending_replies(&registry, window_index)?;
@@ -739,6 +1140,10 @@ fn handle_window_input(
             }
         }
         _ => {
+            if matches!(workspace_phase, WorkspacePhase::Planning) {
+                run_planner_natural_language_input(&registry, line, false)?;
+                return Ok(());
+            }
             if let Some(target_name) = window_focus_target(&registry, window_index) {
                 send_window_message(&registry, window_index, &target_name, line)?;
             } else {
@@ -1859,6 +2264,7 @@ fn sync_windows(registry: &Rc<RefCell<UiRegistry>>) {
     let (titles, snapshots) = {
         let registry_ref = registry.borrow();
         let workspace_view = current_workspace_view(&registry_ref);
+        let persisted_artifacts = registry_ref.task_artifacts.clone();
         let titles = registry_ref
             .windows
             .iter()
@@ -1871,14 +2277,19 @@ fn sync_windows(registry: &Rc<RefCell<UiRegistry>>) {
             .map(|window| {
                 let transcript_text = render_window_transcript(
                     &workspace_view,
+                    &persisted_artifacts,
                     &window.instance_name,
                     &window.role_name,
                     window.focused_target.as_deref(),
                     &window.transcript_lines,
                 );
                 let agent_board_text = render_agent_board(&workspace_view);
+                let agent_slots = render_agent_slots(&workspace_view);
+                let work_items_text = render_work_queue(&workspace_view);
+                let work_item_slots = render_work_item_slots(&workspace_view);
                 let inspector_text = render_inspector(
                     &workspace_view,
+                    &persisted_artifacts,
                     &window.instance_id,
                     &window.instance_name,
                     window.focused_target.as_deref(),
@@ -1887,6 +2298,24 @@ fn sync_windows(registry: &Rc<RefCell<UiRegistry>>) {
                     window.handle.clone_strong(),
                     render_prompt_label(&workspace_view, window),
                     agent_board_text,
+                    agent_slots[0].clone(),
+                    agent_slots[1].clone(),
+                    agent_slots[2].clone(),
+                    agent_slots[3].clone(),
+                    agent_slots[4].clone(),
+                    agent_slots[5].clone(),
+                    work_items_text,
+                    work_item_slots[0].clone(),
+                    work_item_slots[1].clone(),
+                    work_item_slots[2].clone(),
+                    work_item_slots[3].clone(),
+                    work_item_slots[4].clone(),
+                    work_item_slots[5].clone(),
+                    window
+                        .selected_work_item
+                        .clone()
+                        .map(|id| format!("Selected work item: {id}"))
+                        .unwrap_or_else(|| "Selected work item: none".to_owned()),
                     inspector_text,
                     transcript_text,
                 )
@@ -1897,10 +2326,24 @@ fn sync_windows(registry: &Rc<RefCell<UiRegistry>>) {
     };
 
     let model = ModelRc::new(VecModel::from(titles));
-    for (handle, prompt_label, agent_board_text, inspector_text, transcript_text) in snapshots {
+    for (handle, prompt_label, agent_board_text, agent_slot_1, agent_slot_2, agent_slot_3, agent_slot_4, agent_slot_5, agent_slot_6, work_items_text, work_item_slot_1, work_item_slot_2, work_item_slot_3, work_item_slot_4, work_item_slot_5, work_item_slot_6, selected_work_item_label, inspector_text, transcript_text) in snapshots {
         handle.set_open_window_titles(model.clone());
         handle.set_prompt_label(prompt_label.into());
         handle.set_agent_board_text(agent_board_text.into());
+        handle.set_agent_slot_1(agent_slot_1.into());
+        handle.set_agent_slot_2(agent_slot_2.into());
+        handle.set_agent_slot_3(agent_slot_3.into());
+        handle.set_agent_slot_4(agent_slot_4.into());
+        handle.set_agent_slot_5(agent_slot_5.into());
+        handle.set_agent_slot_6(agent_slot_6.into());
+        handle.set_work_items_text(work_items_text.into());
+        handle.set_work_item_slot_1(work_item_slot_1.into());
+        handle.set_work_item_slot_2(work_item_slot_2.into());
+        handle.set_work_item_slot_3(work_item_slot_3.into());
+        handle.set_work_item_slot_4(work_item_slot_4.into());
+        handle.set_work_item_slot_5(work_item_slot_5.into());
+        handle.set_work_item_slot_6(work_item_slot_6.into());
+        handle.set_selected_work_item_label(selected_work_item_label.into());
         handle.set_inspector_text(inspector_text.into());
         handle.set_transcript_text(transcript_text.into());
     }
@@ -1939,8 +2382,9 @@ fn current_workspace_view(registry: &UiRegistry) -> hc_agent::WorkspaceViewModel
             ),
             seeds: Vec::new(),
         },
-          phase: registry.workspace_phase.clone(),
+        phase: registry.workspace_phase.clone(),
         agents: registry.agents.clone(),
+        channel_conversations: Vec::new(),
     };
     let mut view = build_workspace_view(&registry.runtime, &workbench);
     for card in &mut view.agent_cards {
@@ -1955,8 +2399,41 @@ fn current_workspace_view(registry: &UiRegistry) -> hc_agent::WorkspaceViewModel
     view
 }
 
+fn current_task_request(registry: &UiRegistry) -> TaskRequest {
+    TaskRequest::new(
+        registry.task_id.clone(),
+        registry.task_title.clone(),
+        registry.task_goal.clone(),
+    )
+    .with_namespace(TaskNamespace::new(
+        registry.namespace.tenant_id.clone(),
+        registry.namespace.user_id.clone(),
+    ))
+    .with_budget(TaskBudget {
+        token_budget: registry.task_plan.task_token_budget,
+        time_budget_minutes: registry.task_plan.task_time_budget_minutes,
+        evolution_reserve_tokens: registry.task_plan.evolution_reserve_tokens,
+    })
+}
+
+fn refresh_persisted_task_artifacts(registry: &mut UiRegistry) -> Result<()> {
+    let task = current_task_request(registry);
+    let namespace = hc_store::store::WorkspaceNamespace::new(
+        registry.namespace.tenant_id.clone(),
+        registry.namespace.user_id.clone(),
+    );
+    persist_task_artifacts(workspace_root(), &task, &registry.task_plan)?;
+    registry.task_artifacts = query_task_artifacts(
+        workspace_root(),
+        &namespace,
+        &hc_agent::TaskArtifactQuery::default().for_task(registry.task_id.clone()),
+    )?;
+    Ok(())
+}
+
 fn render_window_transcript(
     workspace: &hc_agent::WorkspaceViewModel,
+    persisted_artifacts: &[TaskArtifactSummary],
     instance_name: &str,
     role_name: &str,
     focused_target: Option<&str>,
@@ -1967,8 +2444,12 @@ fn render_window_transcript(
         format!("Goal: {}", workspace.task_goal),
         format!("Phase: {}", workspace.phase),
         format!(
-            "Plan: {} | Work items: {} | Agent proposals: {}",
-            workspace.plan_status, workspace.work_item_count, workspace.proposed_agent_count
+            "Plan: {} | Work items: {} | Agent proposals: {} | Claims: {} | Assignments: {}",
+            workspace.plan_status,
+            workspace.work_item_count,
+            workspace.proposed_agent_count,
+            workspace.work_item_claim_count,
+            workspace.work_item_assignment_count
         ),
         format!("Target: {}", focused_target.unwrap_or("workspace")),
         format!(
@@ -2019,6 +2500,18 @@ fn render_window_transcript(
                 .map(|note| format!("- {note}")),
         );
     }
+
+    lines.push(String::new());
+    lines.push("Work Items:".to_owned());
+    lines.extend(workspace.work_item_lines.iter().cloned());
+
+    lines.push(String::new());
+    lines.push("Assignments:".to_owned());
+    lines.extend(workspace.assignment_lines.iter().cloned());
+
+    lines.push(String::new());
+    lines.push("Persisted Task Assets:".to_owned());
+    lines.extend(render_persisted_task_artifact_lines(persisted_artifacts, 4));
 
     lines.push(String::new());
     if let Some(card) = workspace
@@ -2094,8 +2587,69 @@ fn render_agent_board(workspace: &hc_agent::WorkspaceViewModel) -> String {
     lines.join("\n")
 }
 
+fn render_work_queue(workspace: &hc_agent::WorkspaceViewModel) -> String {
+    let mut lines = vec![
+        format!("Phase: {}", workspace.phase),
+        format!("Plan: {}", workspace.plan_status),
+        String::new(),
+        "Work Items".to_owned(),
+    ];
+
+    lines.extend(workspace.work_item_lines.iter().cloned());
+    lines.push(String::new());
+    lines.push("Assignments".to_owned());
+    lines.extend(workspace.assignment_lines.iter().cloned());
+
+    lines.join("\n")
+}
+
+fn render_agent_slots(workspace: &hc_agent::WorkspaceViewModel) -> [String; 6] {
+    let names = workspace
+        .agent_cards
+        .iter()
+        .map(|card| card.name.clone())
+        .take(6)
+        .collect::<Vec<_>>();
+
+    [
+        names.first().cloned().unwrap_or_default(),
+        names.get(1).cloned().unwrap_or_default(),
+        names.get(2).cloned().unwrap_or_default(),
+        names.get(3).cloned().unwrap_or_default(),
+        names.get(4).cloned().unwrap_or_default(),
+        names.get(5).cloned().unwrap_or_default(),
+    ]
+}
+
+fn render_work_item_slots(workspace: &hc_agent::WorkspaceViewModel) -> [String; 6] {
+    let ids = workspace
+        .work_item_lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.strip_prefix("- ")?;
+            let (id, _) = trimmed.split_once(' ')?;
+            if id.starts_with("work-item.") {
+                Some(id.to_owned())
+            } else {
+                None
+            }
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+
+    [
+        ids.first().cloned().unwrap_or_default(),
+        ids.get(1).cloned().unwrap_or_default(),
+        ids.get(2).cloned().unwrap_or_default(),
+        ids.get(3).cloned().unwrap_or_default(),
+        ids.get(4).cloned().unwrap_or_default(),
+        ids.get(5).cloned().unwrap_or_default(),
+    ]
+}
+
 fn render_inspector(
     workspace: &hc_agent::WorkspaceViewModel,
+    persisted_artifacts: &[TaskArtifactSummary],
     instance_id: &str,
     instance_name: &str,
     focused_target: Option<&str>,
@@ -2113,6 +2667,10 @@ fn render_inspector(
         format!(
             "Work items: {} | Agent proposals: {}",
             workspace.work_item_count, workspace.proposed_agent_count
+        ),
+        format!(
+            "Claims: {} | Assignments: {}",
+            workspace.work_item_claim_count, workspace.work_item_assignment_count
         ),
         format!(
             "Pending replies: {}",
@@ -2175,6 +2733,14 @@ fn render_inspector(
     }
 
     lines.push(String::new());
+    lines.push("Work items:".to_owned());
+    lines.extend(workspace.work_item_lines.iter().take(4).cloned());
+
+    lines.push(String::new());
+    lines.push("Assignments:".to_owned());
+    lines.extend(workspace.assignment_lines.iter().take(4).cloned());
+
+    lines.push(String::new());
     lines.push("Decision trace:".to_owned());
     if workspace.decision_traces.is_empty() {
         lines.push("- none".to_owned());
@@ -2188,7 +2754,42 @@ fn render_inspector(
         );
     }
 
+    lines.push(String::new());
+    lines.push("Persisted task assets:".to_owned());
+    lines.extend(render_persisted_task_artifact_lines(persisted_artifacts, 5));
+
     lines.join("\n")
+}
+
+fn render_persisted_task_artifact_lines(
+    persisted_artifacts: &[TaskArtifactSummary],
+    limit: usize,
+) -> Vec<String> {
+    if persisted_artifacts.is_empty() {
+        return vec!["- none".to_owned()];
+    }
+
+    persisted_artifacts
+        .iter()
+        .take(limit)
+        .map(|artifact| {
+            let task_hint = artifact
+                .task_hint
+                .clone()
+                .unwrap_or_else(|| "unknown-task".to_owned());
+            format!(
+                "- [{}:{}] {} | {} | {}",
+                match artifact.kind {
+                    hc_agent::TaskArtifactKind::TaskPlan => "task_plan",
+                    hc_agent::TaskArtifactKind::AssignmentDecision => "assignment_decision",
+                },
+                artifact.status,
+                task_hint,
+                artifact.title,
+                artifact.relative_path
+            )
+        })
+        .collect()
 }
 
 fn render_prompt_label(
@@ -2208,13 +2809,14 @@ fn render_prompt_label(
         .map(|card| card.pending_reply_count)
         .unwrap_or(0);
     format!(
-        "{} | {} | phase {} | responder {} | pending {} | target {}",
+        "{} | {} | phase {} | responder {} | pending {} | target {} | work {}",
         workspace.task_title,
         window.instance_name,
         workspace.phase,
         responder,
         pending,
-        window.focused_target.as_deref().unwrap_or("workspace")
+        window.focused_target.as_deref().unwrap_or("workspace"),
+        window.selected_work_item.as_deref().unwrap_or("none")
     )
 }
 
@@ -2275,6 +2877,7 @@ fn add_plan_note(registry: &Rc<RefCell<UiRegistry>>, window_index: i32, note: &s
             .transcript_lines
             .push(format!("[plan] note added: {note}"));
     }
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
     drop(registry_ref);
     sync_windows(registry);
     Ok(())
@@ -2302,6 +2905,7 @@ fn add_plan_stage(
             work_item_id, stage, title, goal
         ));
     }
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
     drop(registry_ref);
     sync_windows(registry);
     Ok(())
@@ -2327,6 +2931,7 @@ fn add_plan_agent_proposal(
             proposal_id, role, reason
         ));
     }
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
     drop(registry_ref);
     sync_windows(registry);
     Ok(())
@@ -2393,7 +2998,833 @@ fn approve_plan(registry: &Rc<RefCell<UiRegistry>>, window_index: i32) -> Result
             ));
         }
     }
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
     drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn add_work_item_claim(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    work_item_id: &str,
+    agent_name: &str,
+    score: f32,
+    reason: &str,
+) -> Result<()> {
+    let mut registry_ref = registry.borrow_mut();
+    let Some(agent) = registry_ref
+        .agents
+        .iter()
+        .find(|agent| agent.persona.name == agent_name)
+        .cloned()
+    else {
+        bail!("unknown agent: {agent_name}");
+    };
+
+    let claim_id = registry_ref.task_plan.add_work_item_claim(
+        work_item_id.to_owned(),
+        agent.binding.instance_id.clone(),
+        agent.persona.name.clone(),
+        score,
+        reason.to_owned(),
+    );
+
+    if let Some(window) = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.window_index == window_index)
+    {
+        window.transcript_lines.push(format!(
+            "[assignment] claim added {} | work item {} | {} | score {:.2} | {}",
+            claim_id, work_item_id, agent_name, score, reason
+        ));
+    }
+
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
+    drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn resolve_work_item_assignment(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    work_item_id: &str,
+) -> Result<()> {
+    let mut registry_ref = registry.borrow_mut();
+    let assignment_id = registry_ref
+        .task_plan
+        .resolve_work_item_assignment(work_item_id)
+        .ok_or_else(|| anyhow::anyhow!("no submitted claims for work item: {work_item_id}"))?;
+    let assignment = registry_ref
+        .task_plan
+        .work_item_assignments
+        .iter()
+        .find(|assignment| assignment.id == assignment_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("assignment not found after resolve: {assignment_id}"))?;
+
+    if let Some(window) = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.window_index == window_index)
+    {
+        window.transcript_lines.push(format!(
+            "[assignment] resolved {} | work item {} -> {} ({})",
+            assignment.id,
+            assignment.work_item_id,
+            assignment.agent_name,
+            assignment.rationale
+        ));
+    }
+
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
+    drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn set_selected_work_item(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    work_item_id: String,
+) -> Result<()> {
+    let mut registry_ref = registry.borrow_mut();
+    if !registry_ref
+        .task_plan
+        .work_items
+        .iter()
+        .any(|item| item.id == work_item_id)
+    {
+        bail!("unknown work item: {work_item_id}");
+    }
+
+    let window = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.window_index == window_index)
+        .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+    window.selected_work_item = Some(work_item_id.clone());
+    window
+        .transcript_lines
+        .push(format!("[work-item] selected {work_item_id}"));
+    drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn claim_selected_work_item(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    score_text: String,
+    reason_text: String,
+) -> Result<()> {
+    let score = score_text
+        .trim()
+        .parse::<f32>()
+        .map_err(|_| anyhow::anyhow!("invalid claim score: {}", score_text.trim()))?;
+    let (work_item_id, agent_name) = {
+        let registry_ref = registry.borrow();
+        let window = registry_ref
+            .windows
+            .iter()
+            .find(|window| window.window_index == window_index)
+            .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+        let work_item_id = window
+            .selected_work_item
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no work item selected"))?;
+        (work_item_id, window.instance_name.clone())
+    };
+    add_work_item_claim(registry, window_index, &work_item_id, &agent_name, score, reason_text.trim())
+}
+
+fn clear_window_focus_target(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+) -> Result<()> {
+    let mut registry_ref = registry.borrow_mut();
+    let window = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.window_index == window_index)
+        .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+    window.focused_target = None;
+    window
+        .transcript_lines
+        .push("[focus] target reset to workspace".to_owned());
+    drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn run_planner_natural_language_input(
+    registry: &Rc<RefCell<UiRegistry>>,
+    input: &str,
+    initial: bool,
+) -> Result<()> {
+    let request = {
+        let registry_ref = registry.borrow();
+        let planner = registry_ref
+            .agents
+            .iter()
+            .find(|agent| agent.persona.role == "planner")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("planner agent not found"))?;
+        let responder = planner
+            .binding
+            .responder
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("planner responder not bound"))?;
+
+        if !matches!(responder, ResponderBinding::Llm(_)) {
+            drop(registry_ref);
+            return apply_manual_planner_input(registry, input, initial, responder.label());
+        }
+
+        let source_body = format!(
+            "You are the planning agent for task '{}'.\nTask goal: {}\nCurrent plan status: {:?}\nCurrent planning notes:\n{}\nCurrent work items:\n{}\nCurrent agent proposals:\n{}\n\nUser planning input:\n{}\n\nReturn ONLY valid JSON in this shape:\n{{\"notes\":[\"...\"],\"work_items\":[{{\"stage\":\"...\",\"title\":\"...\",\"goal\":\"...\"}}],\"agent_proposals\":[{{\"role\":\"...\",\"reason\":\"...\"}}]}}\nDo not include markdown fences. Keep arrays incremental and concise.",
+            registry_ref.task_title,
+            registry_ref.task_goal,
+            registry_ref.task_plan.status,
+            registry_ref.task_plan.planning_notes.join("\n"),
+            registry_ref
+                .task_plan
+                .work_items
+                .iter()
+                .map(|item| format!("{} | {} | {}", item.stage, item.title, item.goal))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            registry_ref
+                .task_plan
+                .agent_proposals
+                .iter()
+                .map(|proposal| format!("{} | {}", proposal.role, proposal.reason))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            input.trim()
+        );
+
+        ReplyRequest {
+            source_message_id: if initial {
+                "planner-input.initial".to_owned()
+            } else {
+                format!("planner-input.{}", current_timestamp_ms())
+            },
+            source_session_id: registry_ref.session_id.clone(),
+            source_from_instance_id: "user.workspace".to_owned(),
+            source_body,
+            replying_instance_id: planner.binding.instance_id.clone(),
+            replying_agent_name: planner.persona.name.clone(),
+            replying_role: planner.persona.role.clone(),
+            responder,
+        }
+    };
+
+    let backend = default_reply_backend();
+    let response = backend.generate_reply(&request)?;
+    let draft = parse_planner_draft(&response.body)?;
+    apply_planner_draft(registry, &draft, input, initial)
+}
+
+fn apply_manual_planner_input(
+    registry: &Rc<RefCell<UiRegistry>>,
+    input: &str,
+    initial: bool,
+    responder_label: String,
+) -> Result<()> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let mut registry_ref = registry.borrow_mut();
+    registry_ref.task_plan.add_note(trimmed.to_owned());
+    if let Some(window) = registry_ref.windows.iter_mut().find(|window| window.role_name == "planner") {
+        if initial {
+            window.transcript_lines.push(format!(
+                "[planning] task captured. Planner is {} so the initial request was stored as a planning note.",
+                responder_label
+            ));
+        } else {
+            window.transcript_lines.push(format!(
+                "[planning] note recorded from natural language input: {}",
+                trimmed
+            ));
+        }
+        window.transcript_lines.push(
+            "[planning] Next: keep describing stages, goals, and needed roles in plain language, or switch planner to an llm responder for automatic structuring."
+                .to_owned(),
+        );
+    }
+    let planning_counts = format!(
+        "[planning] notes now: {} | work items: {} | agent proposals: {}",
+        registry_ref.task_plan.planning_notes.len(),
+        registry_ref.task_plan.work_items.len(),
+        registry_ref.task_plan.agent_proposals.len()
+    );
+    for window in &mut registry_ref.windows {
+        window.transcript_lines.push(planning_counts.clone());
+    }
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
+    drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn parse_planner_draft(body: &str) -> Result<PlannerDraft> {
+    let trimmed = body.trim();
+    serde_json::from_str::<PlannerDraft>(trimmed).map_err(|error| {
+        anyhow::anyhow!("planner returned invalid structured plan: {error}")
+    })
+}
+
+fn apply_planner_draft(
+    registry: &Rc<RefCell<UiRegistry>>,
+    draft: &PlannerDraft,
+    input: &str,
+    initial: bool,
+) -> Result<()> {
+    let mut registry_ref = registry.borrow_mut();
+    if draft.notes.is_empty() && draft.work_items.is_empty() && draft.agent_proposals.is_empty() {
+        bail!("planner returned an empty draft");
+    }
+
+    if let Some(window) = registry_ref.windows.iter_mut().find(|window| window.role_name == "planner")
+    {
+        if initial {
+            window
+                .transcript_lines
+                .push(format!("[planning] planner initialized from task: {}", input.trim()));
+        } else {
+            window
+                .transcript_lines
+                .push(format!("[planning] planner input: {}", input.trim()));
+        }
+    }
+
+    for note in &draft.notes {
+        registry_ref.task_plan.add_note(note.clone());
+    }
+    for item in &draft.work_items {
+        registry_ref.task_plan.add_work_item(
+            item.stage.clone(),
+            item.title.clone(),
+            item.goal.clone(),
+        );
+    }
+    for proposal in &draft.agent_proposals {
+        registry_ref
+            .task_plan
+            .add_agent_proposal(proposal.role.clone(), proposal.reason.clone());
+    }
+
+    let summary = format!(
+        "[planning] drafted {} notes, {} work items, {} agent proposals",
+        draft.notes.len(),
+        draft.work_items.len(),
+        draft.agent_proposals.len()
+    );
+    for window in &mut registry_ref.windows {
+        window.transcript_lines.push(summary.clone());
+    }
+
+    if matches!(registry_ref.workspace_phase, WorkspacePhase::Planning)
+        && !draft.work_items.is_empty()
+    {
+        registry_ref.task_plan.approve();
+        registry_ref.workspace_phase = WorkspacePhase::Assignment;
+
+        let proposed_roles = registry_ref
+            .task_plan
+            .agent_proposals
+            .iter_mut()
+            .filter(|proposal| proposal.status == "proposed")
+            .map(|proposal| {
+                proposal.status = "materialized".to_owned();
+                (proposal.id.clone(), proposal.role.clone(), proposal.reason.clone())
+            })
+            .collect::<Vec<_>>();
+
+        let session_id = registry_ref.session_id.clone();
+        let task_id = registry_ref.task_id.clone();
+        let namespace = TaskNamespace::new(
+            registry_ref.namespace.tenant_id.clone(),
+            registry_ref.namespace.user_id.clone(),
+        );
+
+        let mut created = Vec::new();
+        for (proposal_id, role, reason) in proposed_roles {
+            let proposed_name = next_agent_name_for_role(&registry_ref.agents, &role);
+            let seed = AgentSeed::new(
+                format!("{}.{}", task_id, proposal_id),
+                proposed_name.clone(),
+                role.clone(),
+                reason.clone(),
+            );
+            let mut agent = materialize_seed(
+                &mut registry_ref.runtime,
+                &session_id,
+                &task_id,
+                &namespace,
+                &seed,
+            )?;
+            configure_default_responder(&mut agent);
+            created.push(agent.persona.name.clone());
+            registry_ref.agents.push(agent);
+        }
+
+        let transition = if created.is_empty() {
+            "[assignment] plan auto-approved; no new agents were required".to_owned()
+        } else {
+            format!(
+                "[assignment] plan auto-approved; materialized agents: {}",
+                created.join(", ")
+            )
+        };
+        for window in &mut registry_ref.windows {
+            window.transcript_lines.push(transition.clone());
+        }
+
+        auto_assign_and_execute(&mut registry_ref)?;
+    }
+
+    refresh_persisted_task_artifacts(&mut registry_ref)?;
+    drop(registry_ref);
+    sync_windows(registry);
+    Ok(())
+}
+
+fn auto_assign_and_execute(registry_ref: &mut UiRegistry) -> Result<()> {
+    let work_item_ids = registry_ref
+        .task_plan
+        .work_items
+        .iter()
+        .filter(|item| item.status == "planned")
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+
+    for work_item_id in work_item_ids {
+        let Some(work_item) = registry_ref
+            .task_plan
+            .work_items
+            .iter()
+            .find(|item| item.id == work_item_id)
+            .cloned()
+        else {
+            continue;
+        };
+
+        let best = registry_ref
+            .agents
+            .iter()
+            .map(|agent| {
+                let score = auto_assignment_score(
+                    &agent.persona.role,
+                    &format!("{} {} {}", work_item.stage, work_item.title, work_item.goal),
+                );
+                (agent.clone(), score)
+            })
+            .filter(|(_, score)| *score >= 0.55)
+            .max_by(|(_, left), (_, right)| left.total_cmp(right));
+
+        let Some((agent, score)) = best else {
+            for window in &mut registry_ref.windows {
+                window.transcript_lines.push(format!(
+                    "[assignment] {} has no confident agent match yet; manual guidance needed",
+                    work_item.id
+                ));
+            }
+            continue;
+        };
+
+        let reason = format!("auto match from role {}", agent.persona.role);
+        let claim_id = registry_ref.task_plan.add_work_item_claim(
+            work_item.id.clone(),
+            agent.binding.instance_id.clone(),
+            agent.persona.name.clone(),
+            score,
+            reason.clone(),
+        );
+        let assignment_id = registry_ref
+            .task_plan
+            .resolve_work_item_assignment(&work_item.id)
+            .ok_or_else(|| anyhow::anyhow!("auto assignment failed for {}", work_item.id))?;
+        let assignment = registry_ref
+            .task_plan
+            .work_item_assignments
+            .iter()
+            .find(|assignment| assignment.id == assignment_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("assignment missing after auto resolve"))?;
+
+        for window in &mut registry_ref.windows {
+            window.transcript_lines.push(format!(
+                "[assignment] auto claim {} | {} | {:.2} | {}",
+                claim_id, work_item.id, score, reason
+            ));
+            window.transcript_lines.push(format!(
+                "[assignment] auto resolved {} | {} -> {}",
+                assignment.id, assignment.work_item_id, assignment.agent_name
+            ));
+        }
+    }
+
+    let executable_ids = registry_ref
+        .task_plan
+        .work_items
+        .iter()
+        .filter(|item| item.status == "assigned")
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+
+    if !executable_ids.is_empty() {
+        registry_ref.workspace_phase = WorkspacePhase::Execution;
+    }
+
+    for work_item_id in executable_ids {
+        auto_execute_work_item(registry_ref, &work_item_id)?;
+    }
+
+    refresh_persisted_task_artifacts(registry_ref)?;
+    Ok(())
+}
+
+fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> Result<()> {
+    let source_index = registry_ref
+        .windows
+        .iter()
+        .position(|window| window.role_name == "planner")
+        .unwrap_or(0);
+    let source_id = registry_ref.windows[source_index].instance_id.clone();
+    let source_name = registry_ref.windows[source_index].instance_name.clone();
+    let session_id = registry_ref.session_id.clone();
+
+    let assigned_agent_id = registry_ref
+        .task_plan
+        .start_work_item_execution(work_item_id)
+        .ok_or_else(|| anyhow::anyhow!("work item is not ready for execution: {work_item_id}"))?;
+    let work_item = registry_ref
+        .task_plan
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("work item not found after execution start"))?;
+    let assigned_agent = registry_ref
+        .agents
+        .iter()
+        .find(|agent| agent.binding.instance_id == assigned_agent_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("assigned agent not found: {assigned_agent_id}"))?;
+    let target_name = assigned_agent.persona.name.clone();
+
+    let execution_prompt = format!(
+        "Execute work item {}.\nStage: {}\nTitle: {}\nGoal: {}",
+        work_item.id, work_item.stage, work_item.title, work_item.goal
+    );
+    let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
+        session_id,
+        from: source_id.clone(),
+        route: MessageRoute::Direct {
+            to: assigned_agent_id.clone(),
+        },
+        kind: MessageKind::Chat,
+        body: execution_prompt,
+        reply_to: None,
+    })?;
+    let RuntimeCommandResult::Message(message) = result else {
+        bail!("unexpected runtime result while auto-starting execution");
+    };
+
+    registry_ref.windows[source_index].transcript_lines.push(format!(
+        "[execution] auto-started {} -> {} ({})",
+        work_item.id, target_name, work_item.title
+    ));
+    registry_ref.windows[source_index]
+        .transcript_lines
+        .push(format!("[you -> {target_name}] {}", message.body));
+
+    if let Some(target_window) = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.instance_id == assigned_agent_id)
+    {
+        target_window.transcript_lines.push(format!(
+            "[execute {}] {} -> you: {}",
+            message.id, source_name, message.body
+        ));
+    }
+
+    let orchestrator = registry_ref.orchestrator.clone();
+    let agents = registry_ref.agents.clone();
+    match assigned_agent.binding.responder.as_ref() {
+        Some(responder) if responder.is_human() => {
+            let request = orchestrator.build_direct_reply_request(
+                &registry_ref.runtime,
+                &agents,
+                &message.id,
+                &assigned_agent_id,
+            )?;
+            queue_human_reply(registry_ref, request)?;
+            registry_ref.windows[source_index]
+                .transcript_lines
+                .push(format!("[pending] {target_name} will execute manually"));
+        }
+        Some(ResponderBinding::Llm(_)) => {
+            let reply_backend = default_reply_backend();
+            match orchestrator.generate_and_post_direct_reply(
+                &reply_backend,
+                &mut registry_ref.runtime,
+                &agents,
+                &message.id,
+                &assigned_agent_id,
+            ) {
+                Ok(reply) => {
+                    if let Some(target_window) = registry_ref
+                        .windows
+                        .iter_mut()
+                        .find(|window| window.instance_id == assigned_agent_id)
+                    {
+                        target_window.transcript_lines.push(format!(
+                            "[reply {}] you -> {}: {}",
+                            reply.id, source_name, reply.body
+                        ));
+                    }
+                    registry_ref.windows[source_index].transcript_lines.push(format!(
+                        "[recv {}] {} -> you: {}",
+                        reply.id, target_name, reply.body
+                    ));
+                }
+                Err(error) => {
+                    registry_ref.windows[source_index].transcript_lines.push(format!(
+                        "[llm error] {target_name} could not execute: {error}"
+                    ));
+                }
+            }
+        }
+        Some(other) => {
+            registry_ref.windows[source_index].transcript_lines.push(format!(
+                "[responder] {} is using {}, execution auto reply not implemented yet",
+                target_name,
+                other.label()
+            ));
+        }
+        None => {
+            registry_ref.windows[source_index]
+                .transcript_lines
+                .push(format!("[responder] {} has no responder bound", target_name));
+        }
+    }
+
+    refresh_persisted_task_artifacts(registry_ref)?;
+    Ok(())
+}
+
+fn auto_assignment_score(role: &str, text: &str) -> f32 {
+    let lower = text.to_lowercase();
+    match role {
+        "planner" => {
+            if contains_any(&lower, &["plan", "stage", "phase", "roadmap", "analyze", "??", "??"]) {
+                0.88
+            } else {
+                0.22
+            }
+        }
+        "worker" => {
+            if contains_any(&lower, &["implement", "build", "write", "code", "fix", "??", "??", "??", "??"]) {
+                0.90
+            } else {
+                0.30
+            }
+        }
+        "reviewer" => {
+            if contains_any(&lower, &["review", "check", "verify", "risk", "audit", "??", "??", "??"]) {
+                0.89
+            } else {
+                0.28
+            }
+        }
+        _ => 0.20,
+    }
+}
+
+fn contains_any(body: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| body.contains(keyword))
+}
+
+fn resolve_selected_work_item(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+) -> Result<()> {
+    let work_item_id = {
+        let registry_ref = registry.borrow();
+        registry_ref
+            .windows
+            .iter()
+            .find(|window| window.window_index == window_index)
+            .and_then(|window| window.selected_work_item.clone())
+            .ok_or_else(|| anyhow::anyhow!("no work item selected"))?
+    };
+    resolve_work_item_assignment(registry, window_index, &work_item_id)
+}
+
+fn execute_selected_work_item(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+) -> Result<()> {
+    let work_item_id = {
+        let registry_ref = registry.borrow();
+        registry_ref
+            .windows
+            .iter()
+            .find(|window| window.window_index == window_index)
+            .and_then(|window| window.selected_work_item.clone())
+            .ok_or_else(|| anyhow::anyhow!("no work item selected"))?
+    };
+    execute_work_item(registry, window_index, &work_item_id)
+}
+
+fn execute_work_item(
+    registry: &Rc<RefCell<UiRegistry>>,
+    window_index: i32,
+    work_item_id: &str,
+) -> Result<()> {
+    {
+        let mut registry_ref = registry.borrow_mut();
+        let source_index = registry_ref
+            .windows
+            .iter()
+            .position(|window| window.window_index == window_index)
+            .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
+        let session_id = registry_ref.session_id.clone();
+        let source_id = registry_ref.windows[source_index].instance_id.clone();
+        let source_name = registry_ref.windows[source_index].instance_name.clone();
+
+        let assigned_agent_id = registry_ref
+            .task_plan
+            .start_work_item_execution(work_item_id)
+            .ok_or_else(|| anyhow::anyhow!("work item is not in assigned state: {work_item_id}"))?;
+        registry_ref.workspace_phase = WorkspacePhase::Execution;
+
+        let work_item = registry_ref
+            .task_plan
+            .work_items
+            .iter()
+            .find(|item| item.id == work_item_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("work item not found after execution start: {work_item_id}"))?;
+        let assigned_agent = registry_ref
+            .agents
+            .iter()
+            .find(|agent| agent.binding.instance_id == assigned_agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("assigned agent not found: {assigned_agent_id}"))?;
+        let target_name = assigned_agent.persona.name.clone();
+
+        let execution_prompt = format!(
+            "Execute work item {}.\nStage: {}\nTitle: {}\nGoal: {}",
+            work_item.id, work_item.stage, work_item.title, work_item.goal
+        );
+
+        let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
+            session_id,
+            from: source_id.clone(),
+            route: MessageRoute::Direct {
+                to: assigned_agent_id.clone(),
+            },
+            kind: MessageKind::Chat,
+            body: execution_prompt,
+            reply_to: None,
+        })?;
+        let RuntimeCommandResult::Message(message) = result else {
+            bail!("unexpected runtime result while starting execution");
+        };
+
+        registry_ref.windows[source_index].transcript_lines.push(format!(
+            "[execution] started {} -> {} ({})",
+            work_item.id, target_name, work_item.title
+        ));
+        registry_ref.windows[source_index]
+            .transcript_lines
+            .push(format!("[you -> {target_name}] {}", message.body));
+
+        if let Some(target_window) = registry_ref
+            .windows
+            .iter_mut()
+            .find(|window| window.instance_id == assigned_agent_id)
+        {
+            target_window.transcript_lines.push(format!(
+                "[execute {}] {} -> you: {}",
+                message.id, source_name, message.body
+            ));
+        }
+
+        let orchestrator = registry_ref.orchestrator.clone();
+        let agents = registry_ref.agents.clone();
+        match assigned_agent.binding.responder.as_ref() {
+            Some(responder) if responder.is_human() => {
+                let request = orchestrator.build_direct_reply_request(
+                    &registry_ref.runtime,
+                    &agents,
+                    &message.id,
+                    &assigned_agent_id,
+                )?;
+                queue_human_reply(&mut registry_ref, request)?;
+                registry_ref.windows[source_index]
+                    .transcript_lines
+                    .push(format!("[pending] {target_name} will execute manually"));
+            }
+            Some(ResponderBinding::Llm(_)) => {
+                let reply_backend = default_reply_backend();
+                match orchestrator.generate_and_post_direct_reply(
+                    &reply_backend,
+                    &mut registry_ref.runtime,
+                    &agents,
+                    &message.id,
+                    &assigned_agent_id,
+                ) {
+                    Ok(reply) => {
+                        if let Some(target_window) = registry_ref
+                            .windows
+                            .iter_mut()
+                            .find(|window| window.instance_id == assigned_agent_id)
+                        {
+                            target_window.transcript_lines.push(format!(
+                                "[reply {}] you -> {}: {}",
+                                reply.id, source_name, reply.body
+                            ));
+                        }
+                        registry_ref.windows[source_index].transcript_lines.push(format!(
+                            "[recv {}] {} -> you: {}",
+                            reply.id, target_name, reply.body
+                        ));
+                    }
+                    Err(error) => {
+                        registry_ref.windows[source_index]
+                            .transcript_lines
+                            .push(format!("[llm error] {target_name} could not execute: {error}"));
+                    }
+                }
+            }
+            Some(other) => {
+                registry_ref.windows[source_index].transcript_lines.push(format!(
+                    "[responder] {} is using {}, execution auto reply not implemented yet",
+                    target_name,
+                    other.label()
+                ));
+            }
+            None => {
+                registry_ref.windows[source_index]
+                    .transcript_lines
+                    .push(format!("[responder] {} has no responder bound", target_name));
+            }
+        }
+
+        refresh_persisted_task_artifacts(&mut registry_ref)?;
+    }
+
     sync_windows(registry);
     Ok(())
 }
@@ -2553,6 +3984,21 @@ fn parse_plan_agent_command(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((parts[0].to_owned(), parts[1].to_owned()))
+}
+
+fn parse_assign_claim_command(line: &str) -> Option<(String, String, f32, String)> {
+    let rest = line.strip_prefix("/assign claim ")?;
+    let parts = rest.split(" | ").map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 4 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let score = parts[2].parse::<f32>().ok()?;
+    Some((
+        parts[0].to_owned(),
+        parts[1].to_owned(),
+        score,
+        parts[3].to_owned(),
+    ))
 }
 
 fn runtime_namespace() -> RuntimeNamespace {

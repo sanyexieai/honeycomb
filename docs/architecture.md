@@ -8,6 +8,7 @@ For product-flow and implementation guardrails, also read:
 
 - [task-driven-product.md](/d:/code/honeycomb/docs/task-driven-product.md)
 - [working-rules.md](/d:/code/honeycomb/docs/working-rules.md)
+- [channel-conversation.md](/d:/code/honeycomb/docs/channel-conversation.md)
 
 The system should avoid becoming a tightly coupled super-app. Each part must be:
 

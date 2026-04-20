@@ -15,6 +15,22 @@ The product's primary loop is:
 7. work proceeds
 8. useful roles and results are persisted as durable assets
 
+## Related Product Modes
+
+In addition to the main task lifecycle, Honeycomb also needs a dedicated multi-turn channel discussion mode.
+
+See:
+
+- [channel-conversation.md](/d:/code/honeycomb/docs/channel-conversation.md)
+
+That mode is for:
+
+- user + agent discussion before assignment
+- specialist channel threads
+- multi-turn discussion inside a shared channel
+
+It should not be treated as the same thing as the normal single-message nomination path.
+
 ## Primary Product Model
 
 The primary product object is:

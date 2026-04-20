@@ -1,6 +1,23 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskBudget {
+    pub token_budget: u32,
+    pub time_budget_minutes: u32,
+    pub evolution_reserve_tokens: u32,
+}
+
+impl Default for TaskBudget {
+    fn default() -> Self {
+        Self {
+            token_budget: 12_000,
+            time_budget_minutes: 60,
+            evolution_reserve_tokens: 1_200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskNamespace {
     pub tenant_id: String,
     pub user_id: String,
@@ -32,6 +49,8 @@ pub struct TaskRequest {
     pub namespace: TaskNamespace,
     pub title: String,
     pub goal: String,
+    #[serde(default)]
+    pub budget: TaskBudget,
     pub project_ref: Option<String>,
     pub context_refs: Vec<String>,
 }
@@ -47,6 +66,7 @@ impl TaskRequest {
             namespace: TaskNamespace::local_default(),
             title: title.into(),
             goal: goal.into(),
+            budget: TaskBudget::default(),
             project_ref: None,
             context_refs: Vec::new(),
         }
@@ -64,6 +84,21 @@ impl TaskRequest {
 
     pub fn with_project_ref(mut self, project_ref: impl Into<String>) -> Self {
         self.project_ref = Some(project_ref.into());
+        self
+    }
+
+    pub fn with_budget(mut self, budget: TaskBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    pub fn with_token_budget(mut self, token_budget: u32) -> Self {
+        self.budget.token_budget = token_budget;
+        self
+    }
+
+    pub fn with_time_budget_minutes(mut self, minutes: u32) -> Self {
+        self.budget.time_budget_minutes = minutes;
         self
     }
 }

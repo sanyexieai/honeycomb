@@ -13,17 +13,28 @@ pub struct WorkspaceViewModel {
     pub task_id: String,
     pub task_title: String,
     pub task_goal: String,
+    pub task_token_budget: u32,
+    pub task_time_budget_minutes: u32,
+    pub planned_token_cost: u32,
+    pub planned_time_minutes: u32,
     pub session_id: String,
     pub namespace_label: String,
     pub phase: String,
     pub plan_status: String,
     pub planning_notes: Vec<String>,
+    pub work_item_lines: Vec<String>,
+    pub assignment_lines: Vec<String>,
     pub work_item_count: usize,
     pub proposed_agent_count: usize,
+    pub work_item_claim_count: usize,
+    pub work_item_assignment_count: usize,
+    pub channel_conversation_count: usize,
+    pub channel_conversation_lines: Vec<String>,
     pub agent_cards: Vec<AgentCardView>,
     pub recent_activity: Vec<ActivityItemView>,
     pub decision_traces: Vec<DecisionTraceView>,
     pub asset_summary: AssetSummaryView,
+    pub evolution_issue_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +49,8 @@ pub struct AgentCardView {
     pub memory_scope_refs: Vec<String>,
     pub responder_label: Option<String>,
     pub pending_reply_count: usize,
+    pub token_budget: u32,
+    pub idle_token_budget: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -69,6 +82,10 @@ pub fn build_workspace_view(
         task_id: workbench.task.id.clone(),
         task_title: workbench.task.title.clone(),
         task_goal: workbench.task.goal.clone(),
+        task_token_budget: workbench.task_plan.task_token_budget,
+        task_time_budget_minutes: workbench.task_plan.task_time_budget_minutes,
+        planned_token_cost: workbench.task_plan.planned_token_cost(),
+        planned_time_minutes: workbench.task_plan.planned_time_minutes(),
         session_id: workbench.session.id.clone(),
         namespace_label: format!(
             "{}/{}",
@@ -81,8 +98,14 @@ pub fn build_workspace_view(
             crate::TaskPlanStatus::Approved => "approved".to_owned(),
         },
         planning_notes: workbench.task_plan.planning_notes.clone(),
+        work_item_lines: build_work_item_lines(workbench),
+        assignment_lines: build_assignment_lines(workbench),
         work_item_count: workbench.task_plan.work_items.len(),
         proposed_agent_count: workbench.task_plan.agent_proposals.len(),
+        work_item_claim_count: workbench.task_plan.work_item_claims.len(),
+        work_item_assignment_count: workbench.task_plan.work_item_assignments.len(),
+        channel_conversation_count: workbench.channel_conversations.len(),
+        channel_conversation_lines: build_channel_conversation_lines(workbench),
         agent_cards,
         recent_activity,
         decision_traces: build_decision_traces(runtime, workbench),
@@ -91,7 +114,38 @@ pub fn build_workspace_view(
             capabilities: workbench.agents.iter().map(|agent| agent.capabilities.len()).sum(),
             memory_records: 0,
         },
+        evolution_issue_count: workbench.task_plan.evolution_issues.len(),
     }
+}
+
+fn build_channel_conversation_lines(workbench: &AgentWorkbench) -> Vec<String> {
+    if workbench.channel_conversations.is_empty() {
+        return vec!["No active channel conversations.".to_owned()];
+    }
+
+    workbench
+        .channel_conversations
+        .iter()
+        .map(|conversation| {
+            format!(
+                "{} | #{} | status={} | turn={} | participants={}",
+                conversation.title,
+                conversation.channel_id,
+                match conversation.status {
+                    crate::conversation::ConversationStatus::Draft => "draft",
+                    crate::conversation::ConversationStatus::Active => "active",
+                    crate::conversation::ConversationStatus::Paused => "paused",
+                    crate::conversation::ConversationStatus::Closed => "closed",
+                },
+                match conversation.turn_state {
+                    crate::conversation::ConversationTurnState::Waiting => "waiting",
+                    crate::conversation::ConversationTurnState::Open => "open",
+                    crate::conversation::ConversationTurnState::Resolved => "resolved",
+                },
+                conversation.participants.len()
+            )
+        })
+        .collect()
 }
 
 fn build_agent_card(runtime: &RuntimeSupervisor, agent: &MaterializedAgent) -> AgentCardView {
@@ -121,6 +175,8 @@ fn build_agent_card(runtime: &RuntimeSupervisor, agent: &MaterializedAgent) -> A
             .as_ref()
             .map(|responder| responder.label()),
         pending_reply_count: 0,
+        token_budget: agent.runtime_budget.allocated_tokens,
+        idle_token_budget: agent.runtime_budget.idle_tokens(),
     }
 }
 
@@ -159,12 +215,12 @@ fn build_recent_activity(
                     .join(", "),
             ),
             ActivityItemView::new(
-                "planning",
-                "planning",
-                "planner",
-                "Plan Awaiting Input",
-                "No work items or agent proposals exist yet.",
-            ),
+            "planning",
+            "planning",
+            "planner",
+            "Plan Awaiting Input",
+            "No work items, claims, or agent proposals exist yet.",
+        ),
         ];
     }
 
@@ -194,14 +250,16 @@ fn build_recent_activity(
             "planner",
             "Plan Awaiting Input",
             format!(
-                "status={} | work_items={} | agent_proposals={}",
+                "status={} | work_items={} | agent_proposals={} | claims={} | assignments={}",
                 match workbench.task_plan.status {
                     crate::TaskPlanStatus::AwaitingPlannerInput => "awaiting_planner_input",
                     crate::TaskPlanStatus::Drafted => "drafted",
                     crate::TaskPlanStatus::Approved => "approved",
                 },
                 workbench.task_plan.work_items.len(),
-                workbench.task_plan.agent_proposals.len()
+                workbench.task_plan.agent_proposals.len(),
+                workbench.task_plan.work_item_claims.len(),
+                workbench.task_plan.work_item_assignments.len()
             ),
         ),
     ];
@@ -317,7 +375,74 @@ fn build_decision_traces(
         traces.push(build_grant_trace(grant));
     }
 
+    for work_item in &workbench.task_plan.work_items {
+        traces.push(DecisionTraceView::new(
+            code_from("WRK", &work_item.id),
+            "planning",
+            work_item.title.clone(),
+            work_item.status.clone(),
+            format!("stage {} | {}", work_item.stage, summarize_trace_body(&work_item.goal)),
+        ));
+    }
+
+    for assignment in &workbench.task_plan.work_item_assignments {
+        traces.push(DecisionTraceView::new(
+            code_from("ASN", &assignment.id),
+            "assignment",
+            assignment.work_item_id.clone(),
+            assignment.status.clone(),
+            format!(
+                "{} | {}",
+                assignment.agent_name,
+                summarize_trace_body(&assignment.rationale)
+            ),
+        ));
+    }
+
     traces
+}
+
+fn build_work_item_lines(workbench: &AgentWorkbench) -> Vec<String> {
+    if workbench.task_plan.work_items.is_empty() {
+        return vec!["- none".to_owned()];
+    }
+
+    workbench
+        .task_plan
+        .work_items
+        .iter()
+        .map(|item| {
+            format!(
+                "- {} [{}] {} :: {}",
+                item.id,
+                item.status,
+                item.title,
+                summarize_trace_body(&item.goal)
+            )
+        })
+        .collect()
+}
+
+fn build_assignment_lines(workbench: &AgentWorkbench) -> Vec<String> {
+    if workbench.task_plan.work_item_assignments.is_empty() {
+        return vec!["- none".to_owned()];
+    }
+
+    workbench
+        .task_plan
+        .work_item_assignments
+        .iter()
+        .map(|assignment| {
+            format!(
+                "- {} [{}] {} -> {} :: {}",
+                assignment.id,
+                assignment.status,
+                assignment.work_item_id,
+                assignment.agent_name,
+                summarize_trace_body(&assignment.rationale)
+            )
+        })
+        .collect()
 }
 
 fn build_grant_trace(grant: &SpeakingGrant) -> DecisionTraceView {
@@ -365,8 +490,12 @@ mod tests {
         assert_eq!(view.namespace_label, "tenant-a/user-a");
         assert_eq!(view.phase, "planning");
         assert_eq!(view.plan_status, "awaiting_planner_input");
+        assert_eq!(view.work_item_lines, vec!["- none".to_owned()]);
+        assert_eq!(view.assignment_lines, vec!["- none".to_owned()]);
         assert_eq!(view.work_item_count, 0);
         assert_eq!(view.proposed_agent_count, 0);
+        assert_eq!(view.work_item_claim_count, 0);
+        assert_eq!(view.work_item_assignment_count, 0);
         assert_eq!(view.agent_cards.len(), 1);
         assert_eq!(view.asset_summary.personas, 1);
         assert_eq!(view.asset_summary.capabilities, 1);

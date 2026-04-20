@@ -5,7 +5,9 @@ use hc_persona::{PersonaNamespace, PersonaProfile, seed_persona_for_role};
 use hc_responder::{LlmResponderConfig, ResponderBinding};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentRuntimeBinding, BindingNamespace, TaskNamespace, TaskRequest};
+use crate::{
+    AgentRuntimeBinding, AgentRuntimeBudget, BindingNamespace, TaskNamespace, TaskRequest,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentSeed {
@@ -14,6 +16,7 @@ pub struct AgentSeed {
     pub role: String,
     pub goal: String,
     pub capability_hints: Vec<String>,
+    pub token_budget_hint: Option<u32>,
 }
 
 impl AgentSeed {
@@ -29,7 +32,13 @@ impl AgentSeed {
             role: role.into(),
             goal: goal.into(),
             capability_hints: Vec::new(),
+            token_budget_hint: None,
         }
+    }
+
+    pub fn with_token_budget_hint(mut self, token_budget_hint: u32) -> Self {
+        self.token_budget_hint = Some(token_budget_hint);
+        self
     }
 }
 
@@ -46,10 +55,21 @@ pub struct MaterializedAgent {
     pub persona: PersonaProfile,
     pub capabilities: Vec<CapabilityProfile>,
     pub binding: AgentRuntimeBinding,
+    pub runtime_budget: AgentRuntimeBudget,
 }
 
 pub fn bootstrap_task(task: &TaskRequest) -> AgentPlan {
     let base = task.id.replace(' ', "-");
+    let execution_pool = task
+        .budget
+        .token_budget
+        .saturating_sub(task.budget.evolution_reserve_tokens);
+    let worker_budget = execution_pool / 2;
+    let reviewer_budget = worker_budget / 2;
+    let planner_budget = execution_pool
+        .saturating_sub(worker_budget)
+        .saturating_sub(reviewer_budget);
+
     AgentPlan {
         task_id: task.id.clone(),
         namespace: task.namespace.clone(),
@@ -59,19 +79,22 @@ pub fn bootstrap_task(task: &TaskRequest) -> AgentPlan {
                 "planner",
                 "planner",
                 format!("Plan the work for task: {}", task.title),
-            ),
+            )
+            .with_token_budget_hint(planner_budget),
             AgentSeed::new(
                 format!("{base}.worker"),
                 "worker",
                 "worker",
                 format!("Execute the main work for task: {}", task.goal),
-            ),
+            )
+            .with_token_budget_hint(worker_budget),
             AgentSeed::new(
                 format!("{base}.reviewer"),
                 "reviewer",
                 "reviewer",
                 format!("Review outputs and identify gaps for task: {}", task.title),
-            ),
+            )
+            .with_token_budget_hint(reviewer_budget),
         ],
     }
 }
@@ -86,6 +109,11 @@ pub fn bootstrap_planning_task(task: &TaskRequest) -> AgentPlan {
             "planner",
             "planner",
             format!("Plan the work for task: {}", task.goal),
+        )
+        .with_token_budget_hint(
+            task.budget
+                .token_budget
+                .saturating_sub(task.budget.evolution_reserve_tokens),
         )],
     }
 }
@@ -142,7 +170,7 @@ pub fn materialize_seed(
         &seed.role,
     );
     let mut binding =
-        AgentRuntimeBinding::new(instance.id).with_namespace(BindingNamespace::new(
+        AgentRuntimeBinding::new(instance.id.clone()).with_namespace(BindingNamespace::new(
             persona.namespace.tenant_id.clone(),
             persona.namespace.user_id.clone(),
         ));
@@ -163,6 +191,20 @@ pub fn materialize_seed(
         )),
     }));
 
+    let allocated_tokens = seed.token_budget_hint.unwrap_or(0);
+    let reserved_for_evolution_tokens = allocated_tokens / 5;
+    let reserved_for_execution_tokens =
+        allocated_tokens.saturating_sub(reserved_for_evolution_tokens);
+    let runtime_budget = AgentRuntimeBudget {
+        agent_instance_id: instance.id.clone(),
+        agent_name: persona.name.clone(),
+        allocated_tokens,
+        reserved_for_execution_tokens,
+        reserved_for_evolution_tokens,
+        consumed_tokens: 0,
+        consumed_time_minutes: 0,
+    };
+
     Ok(MaterializedAgent {
         seed: seed.clone(),
         persona: PersonaProfile {
@@ -171,14 +213,15 @@ pub fn materialize_seed(
         },
         capabilities: vec![capability],
         binding,
+        runtime_budget,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
     use crate::TaskRequest;
+    use anyhow::Context;
 
     #[test]
     fn bootstrap_creates_default_seed_roles() {
@@ -193,6 +236,7 @@ mod tests {
         assert_eq!(plan.seeds[0].role, "planner");
         assert_eq!(plan.seeds[1].role, "worker");
         assert_eq!(plan.seeds[2].role, "reviewer");
+        assert!(plan.seeds.iter().all(|seed| seed.token_budget_hint.is_some()));
     }
 
     #[test]
@@ -233,6 +277,7 @@ mod tests {
         assert_eq!(agents[0].capabilities[0].namespace.tenant_id, "tenant-a");
         assert_eq!(agents[0].capabilities[0].namespace.user_id, "user-a");
         assert_eq!(agents[0].persona.role, "planner");
+        assert!(agents[0].runtime_budget.allocated_tokens > 0);
     }
 
     #[test]
@@ -244,5 +289,6 @@ mod tests {
         assert_eq!(plan.seeds.len(), 1);
         assert_eq!(plan.seeds[0].role, "planner");
         assert_eq!(plan.seeds[0].proposed_name, "planner");
+        assert!(plan.seeds[0].token_budget_hint.is_some());
     }
 }

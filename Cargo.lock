@@ -1763,6 +1763,7 @@ dependencies = [
  "anyhow",
  "hc-protocol",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 
@@ -1785,6 +1786,8 @@ dependencies = [
  "hc-protocol",
  "hc-responder",
  "hc-store",
+ "serde",
+ "serde_json",
  "slint",
 ]
 
