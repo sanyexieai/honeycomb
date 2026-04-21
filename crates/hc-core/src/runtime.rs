@@ -141,22 +141,10 @@ pub enum RuntimeCommandResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WorkerReport {
-    JobStateChanged {
-        job_id: String,
-        state: JobState,
-    },
-    Stdout {
-        job_id: String,
-        chunk: String,
-    },
-    Stderr {
-        job_id: String,
-        chunk: String,
-    },
-    Exited {
-        job_id: String,
-        success: bool,
-    },
+    JobStateChanged { job_id: String, state: JobState },
+    Stdout { job_id: String, chunk: String },
+    Stderr { job_id: String, chunk: String },
+    Exited { job_id: String, success: bool },
 }
 
 #[derive(Debug, Default)]
@@ -273,12 +261,12 @@ impl RuntimeSupervisor {
         command: RuntimeCommand,
     ) -> Result<RuntimeCommandResult, RuntimeError> {
         match command {
-            RuntimeCommand::CreateSession { name, namespace } => Ok(
-                RuntimeCommandResult::Session(match namespace {
+            RuntimeCommand::CreateSession { name, namespace } => {
+                Ok(RuntimeCommandResult::Session(match namespace {
                     Some(namespace) => self.create_session_in_namespace(name, namespace),
                     None => self.create_session(name),
-                }),
-            ),
+                }))
+            }
             RuntimeCommand::CreateInstance {
                 session_id,
                 name,
@@ -507,7 +495,8 @@ impl RuntimeSupervisor {
         let session_id = self.state.instances[instance_index].session_id.clone();
         if self.state.channels[channel_index].session_id != session_id {
             return Err(RuntimeError::channel_session_mismatch(
-                channel_id, &session_id,
+                channel_id,
+                &session_id,
             ));
         }
 
@@ -836,7 +825,12 @@ impl RuntimeSupervisor {
         &self,
         message_id: &str,
     ) -> Result<Vec<&ParticipationClaim>, RuntimeError> {
-        if !self.state.messages.iter().any(|message| message.id == message_id) {
+        if !self
+            .state
+            .messages
+            .iter()
+            .any(|message| message.id == message_id)
+        {
             return Err(RuntimeError::message_not_found(message_id));
         }
 
@@ -872,16 +866,12 @@ impl RuntimeSupervisor {
             .iter()
             .filter(|event| {
                 event.session_id == session_id
-                    && (event.source == instance_id
-                        || event.target.as_deref() == Some(instance_id))
+                    && (event.source == instance_id || event.target.as_deref() == Some(instance_id))
             })
             .collect())
     }
 
-    pub fn plan_run_request(
-        &self,
-        request: &RunRequest,
-    ) -> WorkerPlan {
+    pub fn plan_run_request(&self, request: &RunRequest) -> WorkerPlan {
         let job_kind = classify_run_request(request);
         let child_instance = self.classify_child_instance(request);
         let worker_kind = match job_kind {
@@ -1018,11 +1008,8 @@ impl RuntimeSupervisor {
             .instance(&job.instance_id)
             .cloned()
             .ok_or_else(|| RuntimeError::instance_not_found(&job.instance_id))?;
-        let child = self.create_instance(
-            &parent.session_id,
-            child_name,
-            Some(parent.id.clone()),
-        )?;
+        let child =
+            self.create_instance(&parent.session_id, child_name, Some(parent.id.clone()))?;
 
         let event = EventRecord {
             id: self.next_id(IdKind::Event),
@@ -1037,10 +1024,7 @@ impl RuntimeSupervisor {
         Ok(child)
     }
 
-    pub fn classify_child_instance(
-        &self,
-        request: &RunRequest,
-    ) -> ChildInstanceDisposition {
+    pub fn classify_child_instance(&self, request: &RunRequest) -> ChildInstanceDisposition {
         if request.allow_child_instance && classify_run_request(request) == JobKind::Pty {
             ChildInstanceDisposition::PromoteToChildInstance
         } else {
@@ -1631,10 +1615,8 @@ mod tests {
     #[test]
     fn runtime_namespace_propagates_from_session_to_instances_and_channels() {
         let mut runtime = RuntimeSupervisor::new();
-        let session = runtime.create_session_in_namespace(
-            "demo",
-            RuntimeNamespace::new("tenant-a", "user-a"),
-        );
+        let session = runtime
+            .create_session_in_namespace("demo", RuntimeNamespace::new("tenant-a", "user-a"));
         let instance = runtime
             .create_instance(&session.id, "alice", None)
             .expect("instance should be created");
@@ -1647,5 +1629,4 @@ mod tests {
         assert_eq!(instance.namespace, session.namespace);
         assert_eq!(channel.namespace, session.namespace);
     }
-
 }

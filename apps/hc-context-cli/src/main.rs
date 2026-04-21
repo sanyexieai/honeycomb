@@ -15,7 +15,7 @@ use hc_context::{
     LlmPromptAssetSynthesizer, MemoryOrganizationInput, MemoryOrganizer, PromptAssetSynthesizer,
     PromptPolicy, RuleBasedMemoryKindResolver, RuleBasedMemoryPromotionAdvisor,
     RuleBasedMemoryRoomRouter, WorkspaceMemoryRetriever, default_workspace_root,
-    generate_with_context_using_synthesizer, generate_with_context_stream_using_synthesizer,
+    generate_with_context_stream_using_synthesizer, generate_with_context_using_synthesizer,
     persist_room_memory, room_memory_write_request_from_response, summarize_global_preference,
     summarize_global_preference_with_llm, workspace_namespace_from_memory_namespace,
 };
@@ -103,7 +103,9 @@ fn main() -> Result<()> {
 
 fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]");
+        bail!(
+            "usage: hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]"
+        );
     }
 
     let mut provider = default_provider();
@@ -136,11 +138,17 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     while index < args.len() {
         match args[index].as_str() {
             "--provider" => {
-                provider = args.get(index + 1).cloned().context("missing value for --provider")?;
+                provider = args
+                    .get(index + 1)
+                    .cloned()
+                    .context("missing value for --provider")?;
                 index += 2;
             }
             "--model" => {
-                model = args.get(index + 1).cloned().context("missing value for --model")?;
+                model = args
+                    .get(index + 1)
+                    .cloned()
+                    .context("missing value for --model")?;
                 index += 2;
             }
             "--system" => {
@@ -181,7 +189,9 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
             "--tag" => {
                 memory_query = memory_query.with_tag(
-                    args.get(index + 1).cloned().context("missing value for --tag")?,
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tag")?,
                 );
                 index += 2;
             }
@@ -383,11 +393,8 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         request.generation.model.provider.clone(),
         request.generation.model.model.clone(),
     );
-    let prompt_asset_synthesizer = build_prompt_asset_synthesizer(
-        registry,
-        &prompt_asset_model,
-        prompt_asset_mode,
-    );
+    let prompt_asset_synthesizer =
+        build_prompt_asset_synthesizer(registry, &prompt_asset_model, prompt_asset_mode);
 
     let response = match request_mode {
         RequestMode::Direct => {
@@ -427,7 +434,9 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         }
     };
 
-    let persisted_path = if let (Some(room_id), Some(room_layer)) = (write_room_id, write_room_layer) {
+    let persisted_path = if let (Some(room_id), Some(room_layer)) =
+        (write_room_id, write_room_layer)
+    {
         let write_title = write_title.unwrap_or_else(|| summarize_title_from_prompt(&prompt_parts));
         let write_memory_kind = write_memory_kind.unwrap_or(MemoryKind::Summary);
         let mut write_request = room_memory_write_request_from_response(
@@ -532,8 +541,12 @@ fn default_base_url_for_provider(provider_id: &str) -> String {
 fn print_help() -> Result<()> {
     println!("hc-context-cli");
     println!("hc-context-cli                    # start chat");
-    println!("hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--literary-memory] [--no-literary-memory] [--chat-room-id <id>] [--organizer-mode <auto|llm|rule>] [--prompt-asset-mode <auto|llm|rule>] [--preference-summary-mode <auto|llm|rule>] [--promotion-trigger <immediate|deferred|window_full|background>] [--promotion-window-size <n>] [--literary-trigger <immediate|deferred|window_full|background>] [--literary-window-size <n>] [--chat-room-window-size <n>]");
-    println!("hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]");
+    println!(
+        "hc-context-cli chat [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--chat-memory] [--no-chat-memory] [--literary-memory] [--no-literary-memory] [--chat-room-id <id>] [--organizer-mode <auto|llm|rule>] [--prompt-asset-mode <auto|llm|rule>] [--preference-summary-mode <auto|llm|rule>] [--promotion-trigger <immediate|deferred|window_full|background>] [--promotion-window-size <n>] [--literary-trigger <immediate|deferred|window_full|background>] [--literary-window-size <n>] [--chat-room-window-size <n>]"
+    );
+    println!(
+        "hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]"
+    );
     Ok(())
 }
 
@@ -618,7 +631,9 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
             "--tag" => {
                 memory_query = memory_query.with_tag(
-                    args.get(index + 1).cloned().context("missing value for --tag")?,
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tag")?,
                 );
                 index += 2;
             }
@@ -787,10 +802,8 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 
     let memory_namespace = runtime_memory_namespace();
     let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
-    let retriever = WorkspaceMemoryRetriever::new(
-        default_workspace_root(),
-        workspace_namespace.clone(),
-    );
+    let retriever =
+        WorkspaceMemoryRetriever::new(default_workspace_root(), workspace_namespace.clone());
     let composer = DefaultContextComposer;
     let rule_organizer = CompositeMemoryOrganizer::new(
         RuleBasedMemoryRoomRouter,
@@ -799,12 +812,8 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         RuleBasedMemoryPromotionAdvisor,
     );
     let organizer_model = ModelRef::new(provider.clone(), model.clone());
-    let organizer = build_memory_organizer(
-        registry,
-        &organizer_model,
-        organizer_mode,
-        rule_organizer,
-    );
+    let organizer =
+        build_memory_organizer(registry, &organizer_model, organizer_mode, rule_organizer);
     let prompt_asset_synthesizer =
         build_prompt_asset_synthesizer(registry, &organizer_model, prompt_asset_mode);
     let mut history = Vec::new();
@@ -895,7 +904,9 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
             "/promote" => {
                 if promotion_trigger == PromotionTriggerMode::Background {
-                    println!("promotion> background worker is enabled; queued work drains asynchronously");
+                    println!(
+                        "promotion> background worker is enabled; queued work drains asynchronously"
+                    );
                     continue;
                 }
                 let flushed = flush_global_promotion_queue(
@@ -914,7 +925,9 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
             "/wenyan" => {
                 if literary_trigger == PromotionTriggerMode::Background {
-                    println!("literary> background worker is enabled; queued work drains asynchronously");
+                    println!(
+                        "literary> background worker is enabled; queued work drains asynchronously"
+                    );
                     continue;
                 }
                 let flushed = flush_literary_memory_queue(
@@ -1016,7 +1029,10 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
             ContextRoomResolution::Reused(_) | ContextRoomResolution::None => {}
         }
-        let generation = GenerateRequest::new(ModelRef::new(provider.clone(), model.clone()), history.clone());
+        let generation = GenerateRequest::new(
+            ModelRef::new(provider.clone(), model.clone()),
+            history.clone(),
+        );
         let request = ContextRequest::new(generation)
             .with_memory_query(effective_memory_query.clone())
             .with_system_prompt(system_message.clone().unwrap_or_else(|| {
@@ -1029,7 +1045,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 
         print!("assistant> ");
         io::stdout().flush().context("failed to flush stdout")?;
-        let response = match request_mode {
+        let response_result = match request_mode {
             RequestMode::Direct => {
                 let response = generate_with_context_using_synthesizer(
                     registry,
@@ -1037,8 +1053,10 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     &composer,
                     prompt_asset_synthesizer.as_ref(),
                     &request,
-                )?;
-                render_output(&response.response.message.content, output_style)?;
+                );
+                if let Ok(response) = &response {
+                    render_output(&response.response.message.content, output_style)?;
+                }
                 response
             }
             RequestMode::Stream => {
@@ -1054,7 +1072,23 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     prompt_asset_synthesizer.as_ref(),
                     &request,
                     &mut callback,
-                )?
+                )
+            }
+        };
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error) => {
+                println!();
+                history.pop();
+                if is_retryable_provider_error(&error) {
+                    println!(
+                        "assistant> temporary provider error: {}",
+                        concise_error_message(&error)
+                    );
+                    println!("assistant> please retry in a moment.");
+                    continue;
+                }
+                return Err(error);
             }
         };
         println!();
@@ -1170,10 +1204,14 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     room,
                     turn_index,
                 )?;
-                println!("chat_memory> archived room={} turns={}", room.id, turn_index);
+                println!(
+                    "chat_memory> archived room={} turns={}",
+                    room.id, turn_index
+                );
             }
 
-            let next_room = create_chat_room(&memory_namespace, default_chat_room_id(&memory_namespace));
+            let next_room =
+                create_chat_room(&memory_namespace, default_chat_room_id(&memory_namespace));
             ensure_chat_room(default_workspace_root(), &workspace_namespace, &next_room)?;
             println!("chat_memory> rolled to room={}", next_room.id);
             chat_room = Some(next_room.clone());
@@ -1311,19 +1349,29 @@ fn print_recalled_memories_for_chat(memories: &[hc_context::RetrievedMemory]) {
 }
 
 fn summarize_room_kind(candidate: &hc_context::RoomCandidate) -> &'static str {
-    if candidate.room_id.starts_with("room.agent.") || candidate.tags.iter().any(|tag| tag == "agent") {
+    if candidate.room_id.starts_with("room.agent.")
+        || candidate.tags.iter().any(|tag| tag == "agent")
+    {
         "agent"
-    } else if candidate.room_id.starts_with("room.tool.") || candidate.tags.iter().any(|tag| tag == "tool") {
+    } else if candidate.room_id.starts_with("room.tool.")
+        || candidate.tags.iter().any(|tag| tag == "tool")
+    {
         "tool"
     } else if candidate.room_id.starts_with("room.project.")
         || candidate.tags.iter().any(|tag| tag == "project")
     {
         "project"
-    } else if candidate.room_id.starts_with("room.task.") || candidate.tags.iter().any(|tag| tag == "task") {
+    } else if candidate.room_id.starts_with("room.task.")
+        || candidate.tags.iter().any(|tag| tag == "task")
+    {
         "task"
-    } else if candidate.room_id.starts_with("room.topic.") || candidate.tags.iter().any(|tag| tag == "topic") {
+    } else if candidate.room_id.starts_with("room.topic.")
+        || candidate.tags.iter().any(|tag| tag == "topic")
+    {
         "topic"
-    } else if candidate.room_id.starts_with("room.chat.") || candidate.tags.iter().any(|tag| tag == "chat") {
+    } else if candidate.room_id.starts_with("room.chat.")
+        || candidate.tags.iter().any(|tag| tag == "chat")
+    {
         "chat"
     } else if candidate.room_id.starts_with("room.global.")
         || candidate.tags.iter().any(|tag| tag == "global")
@@ -1346,7 +1394,8 @@ fn summarize_retrieved_room_kind(memory: &hc_context::RetrievedMemory) -> &'stat
             "project"
         } else if room_id.starts_with("room.task.") || memory.tags.iter().any(|tag| tag == "task") {
             "task"
-        } else if room_id.starts_with("room.topic.") || memory.tags.iter().any(|tag| tag == "topic") {
+        } else if room_id.starts_with("room.topic.") || memory.tags.iter().any(|tag| tag == "topic")
+        {
             "topic"
         } else if room_id.starts_with("room.chat.") || memory.tags.iter().any(|tag| tag == "chat") {
             "chat"
@@ -1669,7 +1718,10 @@ fn create_chat_room(namespace: &MemoryNamespace, room_id: String) -> MemoryRoom 
     MemoryRoom::new(
         room_id,
         MemoryLayer::Chat,
-        format!("Chat Room | {} / {}", namespace.tenant_id, namespace.user_id),
+        format!(
+            "Chat Room | {} / {}",
+            namespace.tenant_id, namespace.user_id
+        ),
         "Interactive chat transcript and compressed reply memory.",
     )
     .with_namespace(namespace.clone())
@@ -1737,7 +1789,8 @@ fn find_latest_active_chat_room(
         return Ok(None);
     }
 
-    let repository = MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
     let mut latest_room: Option<(std::time::SystemTime, MemoryRoom)> = None;
 
     for entry in fs::read_dir(&chat_root)
@@ -1809,7 +1862,12 @@ fn ensure_context_room_for_input(
             input,
         )?;
         if let Some(chat_room) = chat_room {
-            link_rooms(root.as_ref(), workspace_namespace, chat_room, &refreshed_room)?;
+            link_rooms(
+                root.as_ref(),
+                workspace_namespace,
+                chat_room,
+                &refreshed_room,
+            )?;
         }
         return Ok(ContextRoomResolution::Reused(refreshed_room));
     }
@@ -1820,12 +1878,9 @@ fn ensure_context_room_for_input(
         return Ok(ContextRoomResolution::None);
     }
 
-    if let Some(existing_room) = find_existing_context_room(
-        root.as_ref(),
-        workspace_namespace,
-        kind,
-        &slug,
-    )? {
+    if let Some(existing_room) =
+        find_existing_context_room(root.as_ref(), workspace_namespace, kind, &slug)?
+    {
         seed_context_room_with_input(
             root.as_ref(),
             workspace_namespace,
@@ -1840,7 +1895,12 @@ fn ensure_context_room_for_input(
             input,
         )?;
         if let Some(chat_room) = chat_room {
-            link_rooms(root.as_ref(), workspace_namespace, chat_room, &refreshed_room)?;
+            link_rooms(
+                root.as_ref(),
+                workspace_namespace,
+                chat_room,
+                &refreshed_room,
+            )?;
         }
         return Ok(ContextRoomResolution::Reused(refreshed_room));
     }
@@ -1852,13 +1912,7 @@ fn ensure_context_room_for_input(
         &summarize_context_room_title(input, kind),
     );
     ensure_chat_room(root.as_ref(), workspace_namespace, &room)?;
-    seed_context_room_with_input(
-        root.as_ref(),
-        workspace_namespace,
-        &room,
-        kind,
-        input,
-    )?;
+    seed_context_room_with_input(root.as_ref(), workspace_namespace, &room, kind, input)?;
     if let Some(chat_room) = chat_room {
         link_rooms(root.as_ref(), workspace_namespace, chat_room, &room)?;
     }
@@ -1944,16 +1998,7 @@ fn looks_like_agent_input(lowered: &str) -> bool {
 
 fn looks_like_tool_input(lowered: &str) -> bool {
     [
-        "tool",
-        "api",
-        "git",
-        "cargo",
-        "minimax",
-        "openai",
-        "工具",
-        "命令",
-        "接口",
-        "sdk",
+        "tool", "api", "git", "cargo", "minimax", "openai", "工具", "命令", "接口", "sdk",
     ]
     .iter()
     .any(|keyword| lowered.contains(keyword))
@@ -1994,7 +2039,10 @@ fn summarize_context_room_title(input: &str, kind: ContextRoomKind) -> String {
         ContextRoomKind::Tool => "Tool Room",
         ContextRoomKind::Project => "Project Room",
     };
-    format!("{prefix} | {}", input.trim().chars().take(48).collect::<String>())
+    format!(
+        "{prefix} | {}",
+        input.trim().chars().take(48).collect::<String>()
+    )
 }
 
 fn context_room_layer(kind: ContextRoomKind) -> MemoryLayer {
@@ -2022,9 +2070,7 @@ fn context_room_kind_for_room(room: &MemoryRoom) -> ContextRoomKind {
         ContextRoomKind::Agent
     } else if room.tags.iter().any(|tag| tag == "tool") || room.id.starts_with("room.tool.") {
         ContextRoomKind::Tool
-    } else if room.tags.iter().any(|tag| tag == "project")
-        || room.id.starts_with("room.project.")
-    {
+    } else if room.tags.iter().any(|tag| tag == "project") || room.id.starts_with("room.project.") {
         ContextRoomKind::Project
     } else if room.tags.iter().any(|tag| tag == "task") || room.id.starts_with("room.task.") {
         ContextRoomKind::Task
@@ -2117,7 +2163,10 @@ fn merge_context_room_summary(existing_summary: &str, input_snippet: &str) -> St
 
     let existing_norm = normalize_seed_text(existing);
     let candidate_norm = normalize_seed_text(candidate);
-    if existing_norm.is_empty() || existing_norm == candidate_norm || existing_norm.contains(&candidate_norm) {
+    if existing_norm.is_empty()
+        || existing_norm == candidate_norm
+        || existing_norm.contains(&candidate_norm)
+    {
         return existing.chars().take(160).collect();
     }
     if candidate_norm.contains(&existing_norm) {
@@ -2156,7 +2205,8 @@ fn find_existing_context_room(
     }
 
     let kind_name = context_room_kind_name(kind);
-    let repository = MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.to_path_buf(), workspace_namespace.clone());
     let mut best_match: Option<(u8, std::time::SystemTime, MemoryRoom)> = None;
 
     for entry in fs::read_dir(&room_root)
@@ -2190,7 +2240,11 @@ fn find_existing_context_room(
             3
         } else if room_slug.starts_with(slug) || slug.starts_with(room_slug) {
             2
-        } else if room.title.to_ascii_lowercase().contains(&slug.replace('.', " ")) {
+        } else if room
+            .title
+            .to_ascii_lowercase()
+            .contains(&slug.replace('.', " "))
+        {
             1
         } else {
             0
@@ -2222,8 +2276,10 @@ fn seed_context_room_with_input(
     input: &str,
 ) -> Result<PathBuf> {
     let summary = input.trim();
-    let repository =
-        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace.clone());
+    let repository = MemoryRoomRepository::with_namespace(
+        root.as_ref().to_path_buf(),
+        workspace_namespace.clone(),
+    );
     if should_skip_seed_write(&repository, room, summary)? {
         return Ok(MemoryRoomRepository::compressed_doc_relative_path(
             room,
@@ -2323,8 +2379,10 @@ fn link_rooms(
     chat_room: &MemoryRoom,
     context_room: &MemoryRoom,
 ) -> Result<()> {
-    let repository =
-        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace.clone());
+    let repository = MemoryRoomRepository::with_namespace(
+        root.as_ref().to_path_buf(),
+        workspace_namespace.clone(),
+    );
 
     let mut updated_chat_room = chat_room.clone();
     if !updated_chat_room
@@ -2334,7 +2392,10 @@ fn link_rooms(
     {
         updated_chat_room.relations.push(
             MemoryRelation::new(MemoryRelationKind::References, context_room.id.clone())
-                .with_detail(format!("linked {} room", format!("{:?}", context_room.layer).to_ascii_lowercase())),
+                .with_detail(format!(
+                    "linked {} room",
+                    format!("{:?}", context_room.layer).to_ascii_lowercase()
+                )),
         );
     }
     if !updated_chat_room
@@ -2389,7 +2450,8 @@ fn ensure_chat_room(
     namespace: &WorkspaceNamespace,
     room: &MemoryRoom,
 ) -> Result<()> {
-    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
     repository.write_room(room)?;
     Ok(())
 }
@@ -2400,7 +2462,8 @@ fn archive_chat_room(
     room: &MemoryRoom,
     turns: usize,
 ) -> Result<()> {
-    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
     let archived = room
         .clone()
         .with_status("archived")
@@ -2409,7 +2472,11 @@ fn archive_chat_room(
     Ok(())
 }
 
-fn should_roll_chat_room(chat_room: Option<&MemoryRoom>, turn_index: usize, window_size: usize) -> bool {
+fn should_roll_chat_room(
+    chat_room: Option<&MemoryRoom>,
+    turn_index: usize,
+    window_size: usize,
+) -> bool {
     chat_room.is_some() && turn_index >= window_size
 }
 
@@ -2420,7 +2487,8 @@ fn persist_chat_turn_user_message(
     turn_index: usize,
     content: &str,
 ) -> Result<()> {
-    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
     let asset = MemoryRoomAsset::new(
         format!("asset.{}.turn.{}.user", room.id, turn_index),
         room.id.clone(),
@@ -2430,7 +2498,10 @@ fn persist_chat_turn_user_message(
         format!("User Turn {}", turn_index),
         content.trim(),
     )
-    .with_namespace(MemoryNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()))
+    .with_namespace(MemoryNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    ))
     .with_visibility(MemoryVisibility::Private)
     .with_memory_kind(MemoryKind::Knowledge)
     .with_owner(MemoryOwnerRef::session(room.id.clone()))
@@ -2447,7 +2518,8 @@ fn persist_chat_turn_assistant_reply(
     turn_index: usize,
     content: &str,
 ) -> Result<()> {
-    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
     let asset = MemoryRoomAsset::new(
         format!("asset.{}.turn.{}.assistant", room.id, turn_index),
         room.id.clone(),
@@ -2457,7 +2529,10 @@ fn persist_chat_turn_assistant_reply(
         format!("Assistant Turn {}", turn_index),
         content.trim(),
     )
-    .with_namespace(MemoryNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()))
+    .with_namespace(MemoryNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    ))
     .with_visibility(MemoryVisibility::Private)
     .with_memory_kind(MemoryKind::Summary)
     .with_owner(MemoryOwnerRef::session(room.id.clone()))
@@ -2491,7 +2566,9 @@ fn persist_chat_turn_assistant_wenyan(
             ChatMessage::new(MessageRole::User, source),
         ],
     );
-    let response = registry.generate(&generation).map_err(anyhow::Error::from)?;
+    let response = registry
+        .generate(&generation)
+        .map_err(anyhow::Error::from)?;
     let wenyan = response.message.content.trim();
     if wenyan.is_empty() {
         return Ok(None);
@@ -2547,6 +2624,25 @@ fn concise_error_message(error: &anyhow::Error) -> String {
         .map(ToString::to_string)
         .find(|message| !message.trim().is_empty())
         .unwrap_or_else(|| "unknown error".to_owned())
+}
+
+fn is_retryable_provider_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["http 429", "http 502", "http 503", "http 504", "http 529"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || lower.contains("overloaded_error")
+        || lower.contains("rate limit")
+        || lower.contains("please retry")
+        || lower.contains("retry later")
+        || lower.contains("稍后重试")
+}
+
+fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .any(|message| is_retryable_provider_error_message(&message))
 }
 
 fn persist_global_promotions_for_chat_input(
@@ -2713,7 +2809,10 @@ fn start_background_memory_worker(
                         );
                     }
                 }
-                BackgroundMemoryTask::Literary { turn_index, content } => {
+                BackgroundMemoryTask::Literary {
+                    turn_index,
+                    content,
+                } => {
                     match persist_chat_turn_assistant_wenyan(
                         &registry,
                         &organizer_model,
@@ -2814,9 +2913,11 @@ fn build_memory_organizer<'a>(
 ) -> Box<dyn MemoryOrganizer + 'a> {
     match mode {
         StrategyMode::Rule => Box::new(rule_organizer),
-        StrategyMode::Auto => {
-            Box::new(LlmMemoryOrganizer::new(registry, model.clone(), rule_organizer))
-        }
+        StrategyMode::Auto => Box::new(LlmMemoryOrganizer::new(
+            registry,
+            model.clone(),
+            rule_organizer,
+        )),
         StrategyMode::Llm => Box::new(LlmMemoryOrganizer::strict(
             registry,
             model.clone(),
@@ -2932,8 +3033,8 @@ fn read_env_map(path: &Path) -> Result<BTreeMap<String, String>> {
         return Ok(BTreeMap::new());
     }
 
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut vars = BTreeMap::new();
     for line in content.lines() {
         let trimmed = line.trim();

@@ -504,11 +504,19 @@ impl MemoryQuery {
             return false;
         }
 
-        if self.scope.as_ref().is_some_and(|scope| scope != &record.scope) {
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope != &record.scope)
+        {
             return false;
         }
 
-        if self.owner.as_ref().is_some_and(|owner| owner != &record.owner) {
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner != &record.owner)
+        {
             return false;
         }
 
@@ -713,10 +721,7 @@ impl MemoryRoomRepository {
             .join(file_name.as_ref())
     }
 
-    pub fn compressed_doc_relative_path(
-        room: &MemoryRoom,
-        file_name: impl AsRef<Path>,
-    ) -> PathBuf {
+    pub fn compressed_doc_relative_path(room: &MemoryRoom, file_name: impl AsRef<Path>) -> PathBuf {
         Self::room_root_relative_path(room)
             .join("compressed")
             .join(file_name.as_ref())
@@ -758,11 +763,21 @@ impl MemoryRoomRepository {
             MemoryRoomAssetKind::Compressed => {
                 Self::compressed_doc_relative_path(room, &asset.file_name)
             }
-            MemoryRoomAssetKind::Literary => Self::literary_doc_relative_path(room, &asset.file_name),
-            MemoryRoomAssetKind::Facts => Self::room_root_relative_path(room).join(&asset.file_name),
-            MemoryRoomAssetKind::Timeline => Self::room_root_relative_path(room).join(&asset.file_name),
-            MemoryRoomAssetKind::Entities => Self::room_root_relative_path(room).join(&asset.file_name),
-            MemoryRoomAssetKind::Relations => Self::room_root_relative_path(room).join(&asset.file_name),
+            MemoryRoomAssetKind::Literary => {
+                Self::literary_doc_relative_path(room, &asset.file_name)
+            }
+            MemoryRoomAssetKind::Facts => {
+                Self::room_root_relative_path(room).join(&asset.file_name)
+            }
+            MemoryRoomAssetKind::Timeline => {
+                Self::room_root_relative_path(room).join(&asset.file_name)
+            }
+            MemoryRoomAssetKind::Entities => {
+                Self::room_root_relative_path(room).join(&asset.file_name)
+            }
+            MemoryRoomAssetKind::Relations => {
+                Self::room_root_relative_path(room).join(&asset.file_name)
+            }
         }
     }
 
@@ -785,16 +800,17 @@ impl MemoryRoomRepository {
         let stored: StoredMarkdown<MemoryRoomAssetFrontmatter> = self
             .store
             .read_markdown_in_namespace(&self.namespace, relative_path)?;
-        Ok(MemoryRoomAsset::from_document(stored.frontmatter, stored.body))
+        Ok(MemoryRoomAsset::from_document(
+            stored.frontmatter,
+            stored.body,
+        ))
     }
 
     pub fn read_compressed_assets(&self, room: &MemoryRoom) -> Result<Vec<MemoryRoomAsset>> {
-        let compressed_dir = self
-            .store
-            .resolve_in_namespace(
-                &self.namespace,
-                Self::room_root_relative_path(room).join("compressed"),
-            );
+        let compressed_dir = self.store.resolve_in_namespace(
+            &self.namespace,
+            Self::room_root_relative_path(room).join("compressed"),
+        );
         if !compressed_dir.exists() {
             return Ok(Vec::new());
         }

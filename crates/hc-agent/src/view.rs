@@ -111,7 +111,11 @@ pub fn build_workspace_view(
         decision_traces: build_decision_traces(runtime, workbench),
         asset_summary: AssetSummaryView {
             personas: workbench.agents.len(),
-            capabilities: workbench.agents.iter().map(|agent| agent.capabilities.len()).sum(),
+            capabilities: workbench
+                .agents
+                .iter()
+                .map(|agent| agent.capabilities.len())
+                .sum(),
             memory_records: 0,
         },
         evolution_issue_count: workbench.task_plan.evolution_issues.len(),
@@ -215,12 +219,12 @@ fn build_recent_activity(
                     .join(", "),
             ),
             ActivityItemView::new(
-            "planning",
-            "planning",
-            "planner",
-            "Plan Awaiting Input",
-            "No work items, claims, or agent proposals exist yet.",
-        ),
+                "planning",
+                "planning",
+                "planner",
+                "Plan Awaiting Input",
+                "No work items, claims, or agent proposals exist yet.",
+            ),
         ];
     }
 
@@ -265,38 +269,41 @@ fn build_recent_activity(
     ];
 
     items.extend(recent_messages.into_iter().map(|message| {
-            let route_label = match &message.route {
-                MessageRoute::Direct { .. } => "direct",
-                MessageRoute::Broadcast => "broadcast",
-                MessageRoute::Channel { .. } => "channel",
-            };
-            let nomination = runtime.nomination_for_message(&message.id).ok();
-            let nomination_detail = nomination
-                .map(|nomination| match nomination.status {
-                    NominationStatus::Open => {
-                        format!("nomination round {} open", nomination.current_round)
-                    }
-                    NominationStatus::Granted => {
-                        format!("speaking granted in round {}", nomination.current_round)
-                    }
-                    NominationStatus::Exhausted => {
-                        format!("nomination exhausted after round {}", nomination.current_round)
-                    }
-                })
-                .unwrap_or_else(|| "no nomination".to_owned());
+        let route_label = match &message.route {
+            MessageRoute::Direct { .. } => "direct",
+            MessageRoute::Broadcast => "broadcast",
+            MessageRoute::Channel { .. } => "channel",
+        };
+        let nomination = runtime.nomination_for_message(&message.id).ok();
+        let nomination_detail = nomination
+            .map(|nomination| match nomination.status {
+                NominationStatus::Open => {
+                    format!("nomination round {} open", nomination.current_round)
+                }
+                NominationStatus::Granted => {
+                    format!("speaking granted in round {}", nomination.current_round)
+                }
+                NominationStatus::Exhausted => {
+                    format!(
+                        "nomination exhausted after round {}",
+                        nomination.current_round
+                    )
+                }
+            })
+            .unwrap_or_else(|| "no nomination".to_owned());
 
-            ActivityItemView::new(
-                "message",
-                "message",
-                message.from.clone(),
-                format!("{} ({})", message.id, route_label),
-                format!(
-                    "{} | {}",
-                    summarize_trace_body(&message.body),
-                    nomination_detail
-                ),
-            )
-        }));
+        ActivityItemView::new(
+            "message",
+            "message",
+            message.from.clone(),
+            format!("{} ({})", message.id, route_label),
+            format!(
+                "{} | {}",
+                summarize_trace_body(&message.body),
+                nomination_detail
+            ),
+        )
+    }));
 
     items
 }
@@ -351,11 +358,9 @@ fn build_decision_traces(
     }
 
     for claim in runtime.state().claims.iter().filter(|claim| {
-        runtime
-            .state()
-            .messages
-            .iter()
-            .any(|message| message.id == claim.message_id && message.session_id == workbench.session.id)
+        runtime.state().messages.iter().any(|message| {
+            message.id == claim.message_id && message.session_id == workbench.session.id
+        })
     }) {
         traces.push(DecisionTraceView::new(
             code_from("CLM", &claim.instance_id),
@@ -381,7 +386,11 @@ fn build_decision_traces(
             "planning",
             work_item.title.clone(),
             work_item.status.clone(),
-            format!("stage {} | {}", work_item.stage, summarize_trace_body(&work_item.goal)),
+            format!(
+                "stage {} | {}",
+                work_item.stage,
+                summarize_trace_body(&work_item.goal)
+            ),
         ));
     }
 
@@ -468,7 +477,13 @@ fn build_agent_code(agent: &MaterializedAgent) -> String {
 }
 
 fn build_behavior_mode_code(agent: &MaterializedAgent) -> String {
-    behavior_mode_code_from(agent.binding.responder.as_ref().map(|responder| responder.kind()))
+    behavior_mode_code_from(
+        agent
+            .binding
+            .responder
+            .as_ref()
+            .map(|responder| responder.kind()),
+    )
 }
 
 #[cfg(test)]

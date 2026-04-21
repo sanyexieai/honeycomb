@@ -43,7 +43,9 @@ pub fn build_memory_record_from_report(report: &IncubationReport) -> MemoryRecor
     );
     record.kind = MemoryKind::Summary;
     record.tags.push("incubation".to_owned());
-    record.tags.push(format!("promotion:{:?}", report.promotion).to_ascii_lowercase());
+    record
+        .tags
+        .push(format!("promotion:{:?}", report.promotion).to_ascii_lowercase());
     record
 }
 

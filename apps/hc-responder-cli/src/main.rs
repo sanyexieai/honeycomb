@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    env,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use hc_responder::HumanInboxRepository;
@@ -47,7 +51,10 @@ fn handle_inbox(action: &str, args: &[String]) -> Result<()> {
             let item_id = first_non_flag_arg(args).context("missing item id for inbox show")?;
             let item = repo.read_pending(&item_id)?;
             println!("id: {}", item.id);
-            println!("reply as: {} ({})", item.replying_agent_name, item.replying_role);
+            println!(
+                "reply as: {} ({})",
+                item.replying_agent_name, item.replying_role
+            );
             println!("from: {}", item.source_from_instance_id);
             println!("session: {}", item.source_session_id);
             println!("message: {}", item.source_message_id);
@@ -56,8 +63,8 @@ fn handle_inbox(action: &str, args: &[String]) -> Result<()> {
             Ok(())
         }
         "reply" => {
-            let (item_id, body) =
-                parse_reply_args(args).context("usage: hc-responder-cli inbox reply <item-id> <text...>")?;
+            let (item_id, body) = parse_reply_args(args)
+                .context("usage: hc-responder-cli inbox reply <item-id> <text...>")?;
             repo.mark_answered(&item_id, body, current_timestamp_ms())?;
             println!("answered {item_id}");
             Ok(())

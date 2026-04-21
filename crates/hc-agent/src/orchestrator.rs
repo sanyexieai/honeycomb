@@ -117,12 +117,15 @@ impl AgentOrchestrator {
         let agent = agents
             .iter()
             .find(|agent| agent.binding.instance_id == grant.instance_id)
-            .ok_or_else(|| anyhow::anyhow!("agent not found for instance: {}", grant.instance_id))?;
-        let responder = agent
-            .binding
-            .responder
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("responder binding missing for instance: {}", grant.instance_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent not found for instance: {}", grant.instance_id)
+            })?;
+        let responder = agent.binding.responder.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "responder binding missing for instance: {}",
+                grant.instance_id
+            )
+        })?;
 
         Ok(ReplyRequest {
             source_message_id: message.id.clone(),
@@ -207,12 +210,12 @@ impl AgentOrchestrator {
         let agent = agents
             .iter()
             .find(|agent| agent.binding.instance_id == replying_instance_id)
-            .ok_or_else(|| anyhow::anyhow!("agent not found for instance: {replying_instance_id}"))?;
-        let responder = agent
-            .binding
-            .responder
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("responder binding missing for instance: {replying_instance_id}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent not found for instance: {replying_instance_id}")
+            })?;
+        let responder = agent.binding.responder.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("responder binding missing for instance: {replying_instance_id}")
+        })?;
 
         Ok(ReplyRequest {
             source_message_id: source_message.id.clone(),
@@ -237,7 +240,10 @@ fn role_match_score(role: &str, body: &str, route: &MessageRoute) -> f32 {
 
     let base: f32 = match role {
         "planner" => {
-            if contains_any(&body, &["plan", "strategy", "roadmap", "next step", "arrange"]) {
+            if contains_any(
+                &body,
+                &["plan", "strategy", "roadmap", "next step", "arrange"],
+            ) {
                 0.92
             } else {
                 0.28
@@ -258,7 +264,10 @@ fn role_match_score(role: &str, body: &str, route: &MessageRoute) -> f32 {
             }
         }
         "doctor" => {
-            if contains_any(&body, &["medical", "pain", "symptom", "diagnosis", "health"]) {
+            if contains_any(
+                &body,
+                &["medical", "pain", "symptom", "diagnosis", "health"],
+            ) {
                 0.95
             } else {
                 0.20
@@ -277,8 +286,8 @@ fn contains_any(body: &str, keywords: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hc_responder::ReplyResponse;
     use crate::{TaskRequest, bootstrap_task, materialize_plan};
+    use hc_responder::ReplyResponse;
 
     #[derive(Debug, Clone, Default)]
     struct EchoBackend;

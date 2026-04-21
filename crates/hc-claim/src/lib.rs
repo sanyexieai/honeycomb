@@ -94,7 +94,9 @@ impl Default for NominationPolicy {
 
 impl NominationPolicy {
     pub fn round(&self, round: u32) -> Option<&NominationRound> {
-        self.rounds.iter().find(|candidate| candidate.round == round)
+        self.rounds
+            .iter()
+            .find(|candidate| candidate.round == round)
     }
 }
 

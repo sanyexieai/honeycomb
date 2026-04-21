@@ -233,10 +233,7 @@ fn default_capability_visibility() -> CapabilityVisibility {
     CapabilityVisibility::Private
 }
 
-pub fn seed_capability_for_role(
-    namespace: CapabilityNamespace,
-    role: &str,
-) -> CapabilityProfile {
+pub fn seed_capability_for_role(namespace: CapabilityNamespace, role: &str) -> CapabilityProfile {
     match role {
         "planner" => CapabilityProfile::new("capability.seed.planner", "Planning")
             .with_namespace(namespace)
@@ -344,7 +341,10 @@ impl CapabilityRepository {
         let stored: StoredMarkdown<CapabilityFrontmatter> = self
             .store
             .read_markdown_in_namespace(&self.namespace, relative_path)?;
-        Ok(CapabilityProfile::from_document(stored.frontmatter, stored.body))
+        Ok(CapabilityProfile::from_document(
+            stored.frontmatter,
+            stored.body,
+        ))
     }
 }
 
@@ -475,10 +475,8 @@ mod tests {
 
     #[test]
     fn tenant_shared_capability_is_visible_within_same_tenant() {
-        let capability = seed_capability_for_role(
-            CapabilityNamespace::new("tenant-a", "alice"),
-            "planner",
-        );
+        let capability =
+            seed_capability_for_role(CapabilityNamespace::new("tenant-a", "alice"), "planner");
 
         assert!(capability.is_visible_to(&CapabilityNamespace::new("tenant-a", "bob")));
         assert!(!capability.is_visible_to(&CapabilityNamespace::new("tenant-b", "carol")));
@@ -498,7 +496,10 @@ mod tests {
             .with_tag("shared");
 
         assert_eq!(capability.namespace.tenant_id, "tenant-a");
-        assert_eq!(capability.visibility, CapabilityVisibility::CrossTenantShared);
+        assert_eq!(
+            capability.visibility,
+            CapabilityVisibility::CrossTenantShared
+        );
         assert!(capability.tags.iter().any(|tag| tag == "shared"));
     }
 

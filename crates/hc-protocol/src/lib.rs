@@ -8,4 +8,3 @@ pub mod protocol {
         fn id(&self) -> &str;
     }
 }
-

@@ -1,6 +1,4 @@
-use hc_store::store::{
-    MarkdownQuery, WorkspaceNamespace, WorkspaceStore, parse_markdown_document,
-};
+use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore, parse_markdown_document};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +18,12 @@ fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("honeycomb-{}-{}-{}", name, std::process::id(), nanos))
+    std::env::temp_dir().join(format!(
+        "honeycomb-{}-{}-{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
 }
 
 #[test]
@@ -36,7 +39,11 @@ fn workspace_store_roundtrips_markdown_documents() {
     };
 
     let path = store
-        .write_markdown("memory/task/memory.task.0001.md", &frontmatter, "# Summary\n\nHello")
+        .write_markdown(
+            "memory/task/memory.task.0001.md",
+            &frontmatter,
+            "# Summary\n\nHello",
+        )
         .expect("markdown should be written");
     assert!(path.exists());
 
@@ -52,8 +59,7 @@ fn workspace_store_roundtrips_markdown_documents() {
 
 #[test]
 fn parse_markdown_document_extracts_frontmatter_and_body() {
-    let content =
-        "---\nid: memory.task.0002\ntype: memory\ntitle: Example\ntags: [example]\nstatus: active\n---\n\nBody line";
+    let content = "---\nid: memory.task.0002\ntype: memory\ntitle: Example\ntags: [example]\nstatus: active\n---\n\nBody line";
 
     let parsed: hc_store::store::StoredMarkdown<Frontmatter> =
         parse_markdown_document(content).expect("content should parse");
@@ -159,7 +165,10 @@ Assigned to the reviewer agent.
 
     assert_eq!(index.documents.len(), 2);
     assert!(store.markdown_index_path_in_namespace(&namespace).exists());
-    assert_eq!(index.documents[0].relative_path, "decisions/assignment.0001.md");
+    assert_eq!(
+        index.documents[0].relative_path,
+        "decisions/assignment.0001.md"
+    );
     assert_eq!(index.documents[1].relative_path, "plans/task.plan.0001.md");
     assert_eq!(index.documents[1].relations, vec!["task.demo".to_owned()]);
     assert_eq!(index.documents[0].owners, vec!["planner".to_owned()]);
@@ -280,7 +289,10 @@ Archived human handoff content.
         .expect("index should rebuild even when title is missing");
 
     assert_eq!(index.documents.len(), 1);
-    assert_eq!(index.documents[0].id, "human-inbox.message.0001.instance.0001");
+    assert_eq!(
+        index.documents[0].id,
+        "human-inbox.message.0001.instance.0001"
+    );
     assert_eq!(index.documents[0].title, "Human Inbox Message");
 
     let _ = fs::remove_dir_all(root);

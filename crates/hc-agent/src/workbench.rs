@@ -32,10 +32,7 @@ pub struct AgentWorkbench {
 }
 
 impl AgentWorkbench {
-    pub fn ensure_channel_conversation_for_channel(
-        &mut self,
-        channel: &ChannelRecord,
-    ) -> String {
+    pub fn ensure_channel_conversation_for_channel(&mut self, channel: &ChannelRecord) -> String {
         if let Some(existing) = self
             .channel_conversations
             .iter()
@@ -44,10 +41,7 @@ impl AgentWorkbench {
             return existing.id.clone();
         }
 
-        self.create_channel_conversation(
-            channel.id.clone(),
-            format!("{} discussion", channel.name),
-        )
+        self.create_channel_conversation(channel.id.clone(), format!("{} discussion", channel.name))
     }
 
     pub fn create_channel_conversation(
@@ -55,18 +49,10 @@ impl AgentWorkbench {
         channel_id: impl Into<String>,
         title: impl Into<String>,
     ) -> String {
-        let id = format!(
-            "conversation.{:04}",
-            self.channel_conversations.len() + 1
-        );
+        let id = format!("conversation.{:04}", self.channel_conversations.len() + 1);
         let now = current_timestamp_ms();
-        let mut conversation = ChannelConversation::new(
-            id.clone(),
-            self.session.id.clone(),
-            channel_id,
-            title,
-            now,
-        );
+        let mut conversation =
+            ChannelConversation::new(id.clone(), self.session.id.clone(), channel_id, title, now);
         conversation.activate(now);
         self.channel_conversations.push(conversation);
         id
@@ -83,10 +69,7 @@ impl AgentWorkbench {
             .iter_mut()
             .find(|conversation| conversation.id == conversation_id)
             .ok_or_else(|| anyhow::anyhow!("conversation not found: {conversation_id}"))?;
-        conversation.add_participant(ConversationParticipant::user(
-            user_ref,
-            display_name,
-        ));
+        conversation.add_participant(ConversationParticipant::user(user_ref, display_name));
         Ok(())
     }
 
@@ -126,7 +109,11 @@ impl AgentWorkbench {
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
 
         for instance_id in &channel.member_instance_ids {
-            if self.agents.iter().any(|agent| &agent.binding.instance_id == instance_id) {
+            if self
+                .agents
+                .iter()
+                .any(|agent| &agent.binding.instance_id == instance_id)
+            {
                 self.add_agent_to_conversation(conversation_id, instance_id)?;
             } else if let Some(instance) = runtime.instance(instance_id) {
                 self.add_user_to_conversation(
@@ -226,8 +213,8 @@ pub fn bootstrap_task_workbench(
         task.namespace.tenant_id.clone(),
         task.namespace.user_id.clone(),
     );
-    let session =
-        runtime.create_session_in_namespace(format!("task-{}", task.id.replace(' ', "-")), namespace);
+    let session = runtime
+        .create_session_in_namespace(format!("task-{}", task.id.replace(' ', "-")), namespace);
     let plan = bootstrap_planning_task(&task);
     let mut task_plan = TaskPlan::awaiting_planner_input(&task);
     let agents = materialize_plan(runtime, &session.id, &plan)?;
@@ -361,9 +348,9 @@ mod tests {
         );
         assert!(
             conversation
-            .participants
-            .iter()
-            .any(|participant| participant.display_name == "alice")
+                .participants
+                .iter()
+                .any(|participant| participant.display_name == "alice")
         );
     }
 
@@ -410,7 +397,10 @@ mod tests {
             .expect("conversation should exist");
 
         assert_eq!(conversation.channel_id, channel.id);
-        assert_eq!(conversation.last_message_id.as_deref(), Some(message.id.as_str()));
+        assert_eq!(
+            conversation.last_message_id.as_deref(),
+            Some(message.id.as_str())
+        );
         assert_eq!(conversation.turn_state, crate::ConversationTurnState::Open);
     }
 }

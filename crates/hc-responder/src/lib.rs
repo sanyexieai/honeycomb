@@ -83,7 +83,10 @@ impl ResponderBinding {
             ),
             Self::Rule(config) => format!(
                 "rule:{}",
-                config.profile.clone().unwrap_or_else(|| "default".to_owned())
+                config
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned())
             ),
             Self::Script(config) => format!("script:{}", config.command),
         }
@@ -267,7 +270,9 @@ impl HumanInboxRepository {
         response_body: impl Into<String>,
         answered_at_ms: u64,
     ) -> Result<PathBuf> {
-        let item = self.read_pending(item_id)?.answer(response_body, answered_at_ms);
+        let item = self
+            .read_pending(item_id)?
+            .answer(response_body, answered_at_ms);
         self.remove_if_exists(Self::relative_path("inbox/pending", item_id))?;
         self.write_in_status_dir("inbox/answered", &item)
     }
@@ -320,11 +325,13 @@ impl HumanInboxRepository {
     }
 
     fn read_from(&self, dir: &str, item_id: &str) -> Result<HumanInboxItem> {
-        let stored: StoredMarkdown<HumanInboxFrontmatter> = self.store.read_markdown_in_namespace(
-            &self.namespace,
-            Self::relative_path(dir, item_id),
-        )?;
-        Ok(HumanInboxItem::from_document(stored.frontmatter, stored.body))
+        let stored: StoredMarkdown<HumanInboxFrontmatter> = self
+            .store
+            .read_markdown_in_namespace(&self.namespace, Self::relative_path(dir, item_id))?;
+        Ok(HumanInboxItem::from_document(
+            stored.frontmatter,
+            stored.body,
+        ))
     }
 
     fn read_all_from(&self, dir: &str) -> Result<Vec<HumanInboxItem>> {
@@ -346,16 +353,22 @@ impl HumanInboxRepository {
                 .strip_prefix(self.store.resolve_in_namespace(&self.namespace, ""))
                 .map(PathBuf::from)
                 .map_err(|error| anyhow::anyhow!("failed to relativize path: {error}"))?;
-            let stored: StoredMarkdown<HumanInboxFrontmatter> =
-                self.store.read_markdown_in_namespace(&self.namespace, &relative)?;
-            items.push(HumanInboxItem::from_document(stored.frontmatter, stored.body));
+            let stored: StoredMarkdown<HumanInboxFrontmatter> = self
+                .store
+                .read_markdown_in_namespace(&self.namespace, &relative)?;
+            items.push(HumanInboxItem::from_document(
+                stored.frontmatter,
+                stored.body,
+            ));
         }
         items.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
         Ok(items)
     }
 
     fn remove_if_exists(&self, relative_path: PathBuf) -> Result<()> {
-        let absolute = self.store.resolve_in_namespace(&self.namespace, &relative_path);
+        let absolute = self
+            .store
+            .resolve_in_namespace(&self.namespace, &relative_path);
         if absolute.exists() {
             fs::remove_file(&absolute)?;
         }

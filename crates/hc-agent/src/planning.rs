@@ -262,10 +262,17 @@ impl TaskPlan {
                 claim.status = "lost".to_owned();
             }
         }
-        if let Some(work_item) = self.work_items.iter_mut().find(|item| item.id == work_item_id) {
+        if let Some(work_item) = self
+            .work_items
+            .iter_mut()
+            .find(|item| item.id == work_item_id)
+        {
             work_item.status = "assigned".to_owned();
         }
-        let assignment_id = format!("work-assignment.{:04}", self.work_item_assignments.len() + 1);
+        let assignment_id = format!(
+            "work-assignment.{:04}",
+            self.work_item_assignments.len() + 1
+        );
         self.work_item_assignments.push(WorkItemAssignment {
             id: assignment_id.clone(),
             work_item_id: work_item_id.to_owned(),
@@ -321,7 +328,8 @@ mod tests {
             .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
         let mut plan = TaskPlan::awaiting_planner_input(&task);
 
-        let work_item_id = plan.add_work_item("phase-1", "Inspect repo", "Understand current layout");
+        let work_item_id =
+            plan.add_work_item("phase-1", "Inspect repo", "Understand current layout");
         let proposal_id = plan.add_agent_proposal("reviewer", "Need a reviewer for risk checks");
         plan.add_note("Start with repository structure and runtime boundaries.");
         plan.approve();
@@ -342,7 +350,13 @@ mod tests {
         let work_item_id =
             plan.add_work_item("phase-1", "Inspect repo", "Understand current layout");
 
-        plan.add_work_item_claim(&work_item_id, "instance.worker", "worker", 0.72, "general fit");
+        plan.add_work_item_claim(
+            &work_item_id,
+            "instance.worker",
+            "worker",
+            0.72,
+            "general fit",
+        );
         plan.add_work_item_claim(
             &work_item_id,
             "instance.reviewer",

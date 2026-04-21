@@ -104,17 +104,19 @@ pub fn bootstrap_planning_task(task: &TaskRequest) -> AgentPlan {
     AgentPlan {
         task_id: task.id.clone(),
         namespace: task.namespace.clone(),
-        seeds: vec![AgentSeed::new(
-            format!("{base}.planner"),
-            "planner",
-            "planner",
-            format!("Plan the work for task: {}", task.goal),
-        )
-        .with_token_budget_hint(
-            task.budget
-                .token_budget
-                .saturating_sub(task.budget.evolution_reserve_tokens),
-        )],
+        seeds: vec![
+            AgentSeed::new(
+                format!("{base}.planner"),
+                "planner",
+                "planner",
+                format!("Plan the work for task: {}", task.goal),
+            )
+            .with_token_budget_hint(
+                task.budget
+                    .token_budget
+                    .saturating_sub(task.budget.evolution_reserve_tokens),
+            ),
+        ],
     }
 }
 
@@ -236,7 +238,11 @@ mod tests {
         assert_eq!(plan.seeds[0].role, "planner");
         assert_eq!(plan.seeds[1].role, "worker");
         assert_eq!(plan.seeds[2].role, "reviewer");
-        assert!(plan.seeds.iter().all(|seed| seed.token_budget_hint.is_some()));
+        assert!(
+            plan.seeds
+                .iter()
+                .all(|seed| seed.token_budget_hint.is_some())
+        );
     }
 
     #[test]

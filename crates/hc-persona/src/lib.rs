@@ -195,7 +195,10 @@ impl PersonaRepository {
         let stored: StoredMarkdown<PersonaFrontmatter> = self
             .store
             .read_markdown_in_namespace(&self.namespace, relative_path)?;
-        Ok(PersonaProfile::from_document(stored.frontmatter, stored.body))
+        Ok(PersonaProfile::from_document(
+            stored.frontmatter,
+            stored.body,
+        ))
     }
 }
 

@@ -131,7 +131,10 @@ fn low_score_claim_waits_until_lower_threshold_round() {
     let nomination_after_second_round = runtime
         .nomination_for_message(&message.id)
         .expect("nomination should still exist");
-    assert_eq!(nomination_after_second_round.status, NominationStatus::Granted);
+    assert_eq!(
+        nomination_after_second_round.status,
+        NominationStatus::Granted
+    );
 }
 
 #[test]
@@ -265,18 +268,24 @@ fn nomination_exhausts_when_all_rounds_fail() {
         )
         .expect("broadcast should succeed");
 
-    assert!(runtime
-        .resolve_speaking_grant(&message.id, 1)
-        .expect("round 1 should resolve")
-        .is_none());
-    assert!(runtime
-        .resolve_speaking_grant(&message.id, 2)
-        .expect("round 2 should resolve")
-        .is_none());
-    assert!(runtime
-        .resolve_speaking_grant(&message.id, 3)
-        .expect("round 3 should resolve")
-        .is_none());
+    assert!(
+        runtime
+            .resolve_speaking_grant(&message.id, 1)
+            .expect("round 1 should resolve")
+            .is_none()
+    );
+    assert!(
+        runtime
+            .resolve_speaking_grant(&message.id, 2)
+            .expect("round 2 should resolve")
+            .is_none()
+    );
+    assert!(
+        runtime
+            .resolve_speaking_grant(&message.id, 3)
+            .expect("round 3 should resolve")
+            .is_none()
+    );
 
     let nomination = runtime
         .nomination_for_message(&message.id)

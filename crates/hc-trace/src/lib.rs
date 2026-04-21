@@ -102,7 +102,10 @@ mod tests {
 
     #[test]
     fn generates_codes_and_modes() {
-        assert_eq!(agent_code_from("planner", "instance.0001"), "AGT-PLANNER-INSTANCE");
+        assert_eq!(
+            agent_code_from("planner", "instance.0001"),
+            "AGT-PLANNER-INSTANCE"
+        );
         assert_eq!(
             behavior_mode_code_from(Some(ResponderKind::Human)),
             "MODE-HUMAN-MANUAL"

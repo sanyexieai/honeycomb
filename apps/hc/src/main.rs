@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -180,11 +179,9 @@ fn handle_instance(args: &[String]) -> Result<()> {
 
 fn handle_instance_tokens(tokens: &[String]) -> Result<()> {
     match tokens {
-        [action, session, name] if action == "create" => handle_instance(&[
-            "create".to_owned(),
-            session.clone(),
-            name.clone(),
-        ]),
+        [action, session, name] if action == "create" => {
+            handle_instance(&["create".to_owned(), session.clone(), name.clone()])
+        }
         [action, session] if action == "list" => {
             handle_instance(&["list".to_owned(), session.clone()])
         }
@@ -225,13 +222,17 @@ fn handle_channel(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        [action, session_selector, instance_selector, channel_selector] if action == "join" => {
+        [
+            action,
+            session_selector,
+            instance_selector,
+            channel_selector,
+        ] if action == "join" => {
             let instance = with_locked_runtime_mut(|runtime| {
                 let session_id = resolve_session_selector(runtime, session_selector)?;
                 let instance_id =
                     resolve_instance_selector(runtime, &session_id, instance_selector)?;
-                let channel_id =
-                    resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                let channel_id = resolve_channel_selector(runtime, &session_id, channel_selector)?;
                 let result = runtime.dispatch(RuntimeCommand::JoinChannel {
                     instance_id,
                     channel_id,
@@ -241,16 +242,24 @@ fn handle_channel(args: &[String]) -> Result<()> {
                 };
                 Ok(instance)
             })?;
-            println!("joined {} to channel(s): {}", instance.name, instance.channel_ids.join(", "));
+            println!(
+                "joined {} to channel(s): {}",
+                instance.name,
+                instance.channel_ids.join(", ")
+            );
             Ok(())
         }
-        [action, session_selector, instance_selector, channel_selector] if action == "leave" => {
+        [
+            action,
+            session_selector,
+            instance_selector,
+            channel_selector,
+        ] if action == "leave" => {
             let instance = with_locked_runtime_mut(|runtime| {
                 let session_id = resolve_session_selector(runtime, session_selector)?;
                 let instance_id =
                     resolve_instance_selector(runtime, &session_id, instance_selector)?;
-                let channel_id =
-                    resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                let channel_id = resolve_channel_selector(runtime, &session_id, channel_selector)?;
                 let result = runtime.dispatch(RuntimeCommand::LeaveChannel {
                     instance_id,
                     channel_id,
@@ -263,15 +272,18 @@ fn handle_channel(args: &[String]) -> Result<()> {
             println!("left channel(s): {}", instance.channel_ids.join(", "));
             Ok(())
         }
-        [action, session_selector, from_selector, channel_selector, message @ ..]
-            if action == "send" && !message.is_empty() =>
-        {
+        [
+            action,
+            session_selector,
+            from_selector,
+            channel_selector,
+            message @ ..,
+        ] if action == "send" && !message.is_empty() => {
             let body = message.join(" ");
             let (from_label, route_label, body) = with_locked_runtime_mut(|runtime| {
                 let session_id = resolve_session_selector(runtime, session_selector)?;
                 let from = resolve_instance_selector(runtime, &session_id, from_selector)?;
-                let channel_id =
-                    resolve_channel_selector(runtime, &session_id, channel_selector)?;
+                let channel_id = resolve_channel_selector(runtime, &session_id, channel_selector)?;
                 let result = runtime.dispatch(RuntimeCommand::PostMessage {
                     session_id,
                     from: from.clone(),
@@ -284,7 +296,8 @@ fn handle_channel(args: &[String]) -> Result<()> {
                     bail!("unexpected runtime result");
                 };
                 let from_label = display_instance(runtime, &message.session_id, &message.from);
-                let route_label = display_message_route(runtime, &message.session_id, &message.route);
+                let route_label =
+                    display_message_route(runtime, &message.session_id, &message.route);
                 Ok((from_label, route_label, message.body))
             })?;
             println!("[{from_label} -> {route_label}] {body}");
@@ -298,11 +311,9 @@ fn handle_channel(args: &[String]) -> Result<()> {
 
 fn handle_channel_tokens(tokens: &[String]) -> Result<()> {
     match tokens {
-        [action, session, name] if action == "create" => handle_channel(&[
-            "create".to_owned(),
-            session.clone(),
-            name.clone(),
-        ]),
+        [action, session, name] if action == "create" => {
+            handle_channel(&["create".to_owned(), session.clone(), name.clone()])
+        }
         [action, session] if action == "list" => {
             handle_channel(&["list".to_owned(), session.clone()])
         }
@@ -355,7 +366,9 @@ fn handle_send(args: &[String]) -> Result<()> {
     }
 
     if args.len() < 4 {
-        bail!("usage: hc send <session> <from_instance> <to_instance> <message...> | hc send --all <session> <from_instance> <message...>");
+        bail!(
+            "usage: hc send <session> <from_instance> <to_instance> <message...> | hc send --all <session> <from_instance> <message...>"
+        );
     }
 
     let session_selector = &args[0];
@@ -388,28 +401,29 @@ fn handle_send(args: &[String]) -> Result<()> {
 
 fn handle_claim(args: &[String]) -> Result<()> {
     match args {
-        [action, session_selector, instance_selector, message_id, score]
-            if action == "submit" =>
-        {
-            handle_claim_submit(
-                session_selector,
-                instance_selector,
-                message_id,
-                score,
-                None,
-            )
+        [
+            action,
+            session_selector,
+            instance_selector,
+            message_id,
+            score,
+        ] if action == "submit" => {
+            handle_claim_submit(session_selector, instance_selector, message_id, score, None)
         }
-        [action, session_selector, instance_selector, message_id, score, reason @ ..]
-            if action == "submit" =>
-        {
-            handle_claim_submit(
-                session_selector,
-                instance_selector,
-                message_id,
-                score,
-                Some(reason.join(" ")),
-            )
-        }
+        [
+            action,
+            session_selector,
+            instance_selector,
+            message_id,
+            score,
+            reason @ ..,
+        ] if action == "submit" => handle_claim_submit(
+            session_selector,
+            instance_selector,
+            message_id,
+            score,
+            Some(reason.join(" ")),
+        ),
         [action, message_id] if action == "list" => {
             let runtime = load_runtime()?;
             for claim in runtime.claims_for_message(message_id)? {
@@ -559,11 +573,9 @@ fn handle_claim_tokens(tokens: &[String]) -> Result<()> {
         [action, message_id] if action == "list" => {
             handle_claim(&["list".to_owned(), message_id.clone()])
         }
-        [action, message_id, round] if action == "resolve" => handle_claim(&[
-            "resolve".to_owned(),
-            message_id.clone(),
-            round.clone(),
-        ]),
+        [action, message_id, round] if action == "resolve" => {
+            handle_claim(&["resolve".to_owned(), message_id.clone(), round.clone()])
+        }
         _ => {
             println!(
                 "usage: /claim submit <session> <instance> <message_id> <score> [reason...] | /claim list <message_id> | /claim resolve <message_id> <round>"
@@ -672,9 +684,11 @@ fn handle_inbox(args: &[String]) -> Result<()> {
         [session_selector, instance_selector] => {
             print_inbox(session_selector, instance_selector, None)
         }
-        [session_selector, instance_selector, route_filter] => {
-            print_inbox(session_selector, instance_selector, Some(route_filter.as_str()))
-        }
+        [session_selector, instance_selector, route_filter] => print_inbox(
+            session_selector,
+            instance_selector,
+            Some(route_filter.as_str()),
+        ),
         _ => bail!("usage: hc inbox <session> <instance> [route]"),
     }
 }
@@ -756,7 +770,9 @@ fn handle_watch(args: &[String]) -> Result<()> {
         [target, session_selector, instance_selector] if target == "events" => {
             watch_events(session_selector, Some(instance_selector.as_str()))
         }
-        _ => bail!("usage: hc watch inbox <session> <instance> | hc watch events <session> [instance]"),
+        _ => bail!(
+            "usage: hc watch inbox <session> <instance> | hc watch events <session> [instance]"
+        ),
     }
 }
 
@@ -765,7 +781,9 @@ fn run_term(session_selector: &str, instance_selector: &str) -> Result<()> {
     let session_id = resolve_session_selector(&runtime, session_selector)?;
     let instance_id = resolve_instance_selector(&runtime, &session_id, instance_selector)?;
     let instance_label = display_instance(&runtime, &session_id, &instance_id);
-    let seen = runtime.mailbox_for_instance(&session_id, &instance_id)?.len();
+    let seen = runtime
+        .mailbox_for_instance(&session_id, &instance_id)?
+        .len();
     let stop = Arc::new(AtomicBool::new(false));
     let watch_stop = Arc::clone(&stop);
     let watch_session = session_selector.to_owned();
@@ -1103,7 +1121,10 @@ fn run_demo() -> Result<()> {
         success: true,
     })?;
     let mut lifecycle = runtime.drain_commands().into_iter();
-    let child = match lifecycle.next().context("child instance result should exist")?? {
+    let child = match lifecycle
+        .next()
+        .context("child instance result should exist")??
+    {
         RuntimeCommandResult::Instance(instance) => instance,
         other => bail!("unexpected runtime result: {other:?}"),
     };
@@ -1136,8 +1157,7 @@ fn reset_state() -> Result<()> {
     let path = state_path();
     let temp_path = state_temp_path();
     if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("failed to remove {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
     }
     if temp_path.exists() {
         fs::remove_file(&temp_path)
@@ -1172,16 +1192,20 @@ fn save_runtime_unlocked(runtime: &RuntimeSupervisor) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let temp_path = state_temp_path();
-    let json =
-        serde_json::to_string_pretty(runtime.state()).context("failed to serialize runtime state")?;
+    let json = serde_json::to_string_pretty(runtime.state())
+        .context("failed to serialize runtime state")?;
     fs::write(&temp_path, json)
         .with_context(|| format!("failed to write {}", temp_path.display()))?;
     if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| format!("failed to replace {}", path.display()))?;
     }
-    fs::rename(&temp_path, &path)
-        .with_context(|| format!("failed to rename {} to {}", temp_path.display(), path.display()))?;
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1257,8 +1281,7 @@ fn acquire_state_lock() -> Result<StateLockGuard> {
                 thread::sleep(Duration::from_millis(25));
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to acquire {}", path.display()));
+                return Err(error).with_context(|| format!("failed to acquire {}", path.display()));
             }
         }
     }
@@ -1284,14 +1307,9 @@ fn resolve_instance_selector(
     session_id: &str,
     selector: &str,
 ) -> Result<String> {
-    if let Some(instance) = runtime
-        .state()
-        .instances
-        .iter()
-        .find(|instance| {
-            instance.session_id == session_id && (instance.id == selector || instance.name == selector)
-        })
-    {
+    if let Some(instance) = runtime.state().instances.iter().find(|instance| {
+        instance.session_id == session_id && (instance.id == selector || instance.name == selector)
+    }) {
         return Ok(instance.id.clone());
     }
 
@@ -1303,14 +1321,9 @@ fn resolve_channel_selector(
     session_id: &str,
     selector: &str,
 ) -> Result<String> {
-    if let Some(channel) = runtime
-        .state()
-        .channels
-        .iter()
-        .find(|channel| {
-            channel.session_id == session_id && (channel.id == selector || channel.name == selector)
-        })
-    {
+    if let Some(channel) = runtime.state().channels.iter().find(|channel| {
+        channel.session_id == session_id && (channel.id == selector || channel.name == selector)
+    }) {
         return Ok(channel.id.clone());
     }
 
@@ -1362,8 +1375,9 @@ fn message_matches_filter(
     }
 
     match &message.route {
-        MessageRoute::Direct { to } => Ok(route_filter == to
-            || route_filter == display_instance(runtime, session_id, to)),
+        MessageRoute::Direct { to } => {
+            Ok(route_filter == to || route_filter == display_instance(runtime, session_id, to))
+        }
         MessageRoute::Channel { channel_id } => {
             let channel = runtime
                 .state()
@@ -1393,12 +1407,7 @@ fn watch_inbox(session_selector: &str, instance_selector: &str) -> Result<()> {
 
         for message in messages.iter().skip(seen) {
             let from_label = display_instance(&runtime, &session_id, &message.from);
-            println!(
-                "[{}] {} -> you: {}",
-                message.id,
-                from_label,
-                message.body
-            );
+            println!("[{}] {} -> you: {}", message.id, from_label, message.body);
         }
 
         seen = messages.len();
@@ -1421,9 +1430,7 @@ fn print_new_inbox_messages(
         let from_label = display_instance(&runtime, &session_id, &message.from);
         println!(
             "[recv {}] {} -> you: {}",
-            message.id,
-            from_label,
-            message.body
+            message.id, from_label, message.body
         );
         printed_any = true;
     }

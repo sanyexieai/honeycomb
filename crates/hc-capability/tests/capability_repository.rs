@@ -10,7 +10,12 @@ fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("honeycomb-{}-{}-{}", name, std::process::id(), nanos))
+    std::env::temp_dir().join(format!(
+        "honeycomb-{}-{}-{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
 }
 
 #[test]

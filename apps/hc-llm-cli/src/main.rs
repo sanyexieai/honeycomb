@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_llm::{
-    ChatMessage, GenerateRequest, GenerateResponse, MessageRole, ModelRef, OpenAiCompatibleProvider,
-    ProviderRegistry, StreamChunk,
+    ChatMessage, GenerateRequest, GenerateResponse, MessageRole, ModelRef,
+    OpenAiCompatibleProvider, ProviderRegistry, StreamChunk,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -239,7 +239,10 @@ fn handle_llm_config(args: &[String]) -> Result<()> {
     if let Some(model) = vars.get("HC_LLM_MODEL") {
         println!("HC_LLM_MODEL={model}");
     }
-    println!("HC_LLM_API_KEY={}", redact_secret(vars.get("HC_LLM_API_KEY").unwrap()));
+    println!(
+        "HC_LLM_API_KEY={}",
+        redact_secret(vars.get("HC_LLM_API_KEY").unwrap())
+    );
     if let Some(base_url) = vars.get("HC_LLM_BASE_URL") {
         println!("HC_LLM_BASE_URL={base_url}");
     }
@@ -250,16 +253,20 @@ fn run_setup_wizard() -> Result<()> {
     let env_path = env_file_path()?;
     let mut vars = read_env_map(&env_path)?;
 
-    let current_provider = normalize_provider(&vars
-        .get("HC_LLM_PROVIDER")
-        .cloned()
-        .unwrap_or_else(|| "openai".to_owned()))?;
+    let current_provider = normalize_provider(
+        &vars
+            .get("HC_LLM_PROVIDER")
+            .cloned()
+            .unwrap_or_else(|| "openai".to_owned()),
+    )?;
     let provider = prompt_provider(&current_provider)?;
 
-    let current_model_type = normalize_model_type(&vars
-        .get("HC_LLM_MODEL_TYPE")
-        .cloned()
-        .unwrap_or_else(|| "balanced".to_owned()))?;
+    let current_model_type = normalize_model_type(
+        &vars
+            .get("HC_LLM_MODEL_TYPE")
+            .cloned()
+            .unwrap_or_else(|| "balanced".to_owned()),
+    )?;
     let model_type = prompt_model_type(&current_model_type)?;
 
     let current_base_url = vars
@@ -317,7 +324,11 @@ fn run_setup_wizard() -> Result<()> {
     );
     println!(
         "HC_LLM_API_KEY={}",
-        redact_secret(vars.get("HC_LLM_API_KEY").map(String::as_str).unwrap_or_default())
+        redact_secret(
+            vars.get("HC_LLM_API_KEY")
+                .map(String::as_str)
+                .unwrap_or_default()
+        )
     );
     println!(
         "HC_LLM_BASE_URL={}",
@@ -328,7 +339,9 @@ fn run_setup_wizard() -> Result<()> {
 
 fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>]");
+        bail!(
+            "usage: hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>]"
+        );
     }
 
     let mut provider = default_provider();
@@ -567,8 +580,10 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         }
 
         history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-        let request =
-            GenerateRequest::new(ModelRef::new(provider.clone(), model.clone()), history.clone());
+        let request = GenerateRequest::new(
+            ModelRef::new(provider.clone(), model.clone()),
+            history.clone(),
+        );
         print!("assistant> ");
         io::stdout().flush().context("failed to flush stdout")?;
         match generate_with_mode(registry, &request, request_mode, output_style, false) {
@@ -590,16 +605,24 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
 fn print_help() {
     println!("hc-llm-cli");
     println!("hc-llm-cli                    # setup wizard if needed, otherwise start chat");
-    println!("hc-llm-cli chat [--provider <id>] [--model <name>] [--system <text>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>]");
-    println!("hc-llm-cli config llm --provider <id> [--model-type <type>] [--model <name>] --api-key <key> [--base-url <url>]");
+    println!(
+        "hc-llm-cli chat [--provider <id>] [--model <name>] [--system <text>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--no-typewriter] [--typewriter-delay-ms <n>]"
+    );
+    println!(
+        "hc-llm-cli config llm --provider <id> [--model-type <type>] [--model <name>] --api-key <key> [--base-url <url>]"
+    );
     println!("hc-llm-cli config openai --api-key <key> [--base-url <url>]");
     println!("hc-llm-cli config show");
     println!("hc-llm-cli providers");
-    println!("hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>]");
+    println!(
+        "hc-llm-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--json] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>]"
+    );
 }
 
 fn print_config_help() {
-    println!("hc-llm-cli config llm --provider <id> [--model-type <type>] [--model <name>] --api-key <key> [--base-url <url>]");
+    println!(
+        "hc-llm-cli config llm --provider <id> [--model-type <type>] [--model <name>] --api-key <key> [--base-url <url>]"
+    );
     println!("hc-llm-cli config openai --api-key <key> [--base-url <url>]");
     println!("hc-llm-cli config show");
 }
@@ -807,8 +830,8 @@ fn read_env_map(path: &Path) -> Result<BTreeMap<String, String>> {
         return Ok(BTreeMap::new());
     }
 
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut vars = BTreeMap::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -932,14 +955,20 @@ fn normalize_model_type(model_type: &str) -> Result<String> {
         "balanced" => Ok("balanced".to_owned()),
         "fast" => Ok("fast".to_owned()),
         "coding" => Ok("coding".to_owned()),
-        other => bail!("unsupported model type: {other}. supported model types: balanced, fast, coding"),
+        other => {
+            bail!("unsupported model type: {other}. supported model types: balanced, fast, coding")
+        }
     }
 }
 
 fn prompt_provider(current_provider: &str) -> Result<String> {
     println!("Select provider:");
     for (index, preset) in provider_presets().iter().enumerate() {
-        let marker = if preset.id == current_provider { "*" } else { " " };
+        let marker = if preset.id == current_provider {
+            "*"
+        } else {
+            " "
+        };
         println!(
             "  {}. {} ({}) {}",
             index + 1,
@@ -966,7 +995,11 @@ fn prompt_model_type(current_model_type: &str) -> Result<String> {
     let choices = ["balanced", "fast", "coding"];
     println!("Select model type:");
     for (index, choice) in choices.iter().enumerate() {
-        let marker = if *choice == current_model_type { "*" } else { " " };
+        let marker = if *choice == current_model_type {
+            "*"
+        } else {
+            " "
+        };
         println!("  {}. {} {}", index + 1, choice, marker);
     }
     println!("Model type [{}]:", current_model_type);

@@ -2,8 +2,8 @@
 
 pub mod store {
     use anyhow::{Context, Result, bail};
-    use serde::{Deserialize, Serialize};
     use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Serialize};
     use serde_yaml::Value;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -135,7 +135,10 @@ pub mod store {
             }
 
             if let Some(tag) = &self.tag
-                && !entry.tags.iter().any(|candidate| candidate.eq_ignore_ascii_case(tag))
+                && !entry
+                    .tags
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(tag))
             {
                 return false;
             }
@@ -277,7 +280,10 @@ pub mod store {
         }
 
         pub fn markdown_index_path_in_namespace(&self, namespace: &WorkspaceNamespace) -> PathBuf {
-            self.resolve_in_namespace(namespace, PathBuf::from("indexes").join("markdown-index.json"))
+            self.resolve_in_namespace(
+                namespace,
+                PathBuf::from("indexes").join("markdown-index.json"),
+            )
         }
 
         pub fn rebuild_markdown_index_in_namespace(
@@ -286,7 +292,10 @@ pub mod store {
         ) -> Result<MarkdownIndex> {
             let namespace_root = self.resolve(namespace.scoped_prefix());
             fs::create_dir_all(&namespace_root).with_context(|| {
-                format!("failed to create namespace root {}", namespace_root.display())
+                format!(
+                    "failed to create namespace root {}",
+                    namespace_root.display()
+                )
             })?;
 
             let mut files = Vec::new();
@@ -303,10 +312,13 @@ pub mod store {
                 let path = namespace_root.join(&relative_path);
                 let content = fs::read_to_string(&path)
                     .with_context(|| format!("failed to read markdown file {}", path.display()))?;
-                let stored = parse_markdown_document::<Value>(&content).with_context(|| {
-                    format!("failed to parse markdown file {}", path.display())
-                })?;
-                documents.push(build_index_entry(&relative_path, stored.frontmatter, &stored.body)?);
+                let stored = parse_markdown_document::<Value>(&content)
+                    .with_context(|| format!("failed to parse markdown file {}", path.display()))?;
+                documents.push(build_index_entry(
+                    &relative_path,
+                    stored.frontmatter,
+                    &stored.body,
+                )?);
             }
 
             let index = MarkdownIndex {
@@ -350,7 +362,9 @@ pub mod store {
         }
     }
 
-    pub fn parse_markdown_document<T: DeserializeOwned>(content: &str) -> Result<StoredMarkdown<T>> {
+    pub fn parse_markdown_document<T: DeserializeOwned>(
+        content: &str,
+    ) -> Result<StoredMarkdown<T>> {
         let rest = content
             .strip_prefix("---\n")
             .ok_or_else(|| anyhow::anyhow!("markdown document is missing opening frontmatter"))?;
@@ -359,10 +373,7 @@ pub mod store {
         };
         let frontmatter = serde_yaml::from_str(frontmatter)
             .context("failed to deserialize markdown frontmatter")?;
-        let body = remainder
-            .strip_prefix('\n')
-            .unwrap_or(remainder)
-            .to_owned();
+        let body = remainder.strip_prefix('\n').unwrap_or(remainder).to_owned();
 
         Ok(StoredMarkdown { frontmatter, body })
     }
@@ -377,7 +388,10 @@ pub mod store {
             .with_context(|| format!("failed to read directory {}", current_dir.display()))?
         {
             let entry = entry.with_context(|| {
-                format!("failed to read directory entry in {}", current_dir.display())
+                format!(
+                    "failed to read directory entry in {}",
+                    current_dir.display()
+                )
             })?;
             let path = entry.path();
             let relative = path
@@ -400,7 +414,11 @@ pub mod store {
         Ok(())
     }
 
-    fn build_index_entry(relative_path: &Path, frontmatter: Value, body: &str) -> Result<MarkdownIndexEntry> {
+    fn build_index_entry(
+        relative_path: &Path,
+        frontmatter: Value,
+        body: &str,
+    ) -> Result<MarkdownIndexEntry> {
         let mapping = frontmatter
             .as_mapping()
             .ok_or_else(|| anyhow::anyhow!("markdown frontmatter must be a YAML mapping"))?;
@@ -447,8 +465,9 @@ pub mod store {
     }
 
     fn required_string_field(mapping: &serde_yaml::Mapping, field: &str) -> Result<String> {
-        optional_string_field(mapping, field)
-            .ok_or_else(|| anyhow::anyhow!("markdown frontmatter is missing required field `{field}`"))
+        optional_string_field(mapping, field).ok_or_else(|| {
+            anyhow::anyhow!("markdown frontmatter is missing required field `{field}`")
+        })
     }
 
     fn optional_string_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<String> {
@@ -493,15 +512,14 @@ pub mod store {
     }
 
     fn title_from_body(body: &str) -> Option<String> {
-        body.lines()
-            .find_map(|line| {
-                let trimmed = line.trim();
-                trimmed
-                    .strip_prefix('#')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+        body.lines().find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix('#')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
     }
 
     fn preview_text(body: &str, limit: usize) -> String {

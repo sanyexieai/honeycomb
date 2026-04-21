@@ -56,11 +56,7 @@ pub struct TaskRequest {
 }
 
 impl TaskRequest {
-    pub fn new(
-        id: impl Into<String>,
-        title: impl Into<String>,
-        goal: impl Into<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, title: impl Into<String>, goal: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             namespace: TaskNamespace::local_default(),

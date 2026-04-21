@@ -12,10 +12,10 @@ use hc_store::store::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    TaskPlan, TaskRequest,
     bootstrap::MaterializedAgent,
     incubation::{IncubationReport, build_memory_record_from_report},
     planning::TaskPlanStatus,
-    TaskPlan, TaskRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,8 +221,9 @@ pub fn persist_task_artifacts(
             .iter()
             .find(|item| item.id == assignment.work_item_id);
         let assignment_slug = slugify(&assignment.id);
-        let assignment_relative_path =
-            PathBuf::from(format!("decisions/{task_slug}.{assignment_slug}.assignment.md"));
+        let assignment_relative_path = PathBuf::from(format!(
+            "decisions/{task_slug}.{assignment_slug}.assignment.md"
+        ));
         let assignment_document_id = format!("assignment-decision.{}", assignment.id);
         assignment_paths.push(store.write_markdown_in_namespace(
             &namespace,
@@ -254,7 +255,11 @@ pub fn persist_task_artifacts(
             .with_owner(hc_memory::MemoryOwnerRef::task(task.id.clone()))
             .with_tag("task")
             .with_tag("assignment")
-            .with_source_doc(assignment_relative_path.to_string_lossy().replace('\\', "/"))
+            .with_source_doc(
+                assignment_relative_path
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
             .with_derived_from(assignment_document_id)
             .with_file_name(format!("min.assignment.{}.md", assignment_slug))
             .with_asset_id(format!("asset.{}.assignment.{}", room_id, assignment.id)),
@@ -319,12 +324,12 @@ pub fn read_task_artifact(
     let stored: StoredMarkdown<TaskArtifactFrontmatter> =
         store.read_markdown_in_namespace(namespace, &relative_path)?;
     let kind = TaskArtifactKind::from_doc_type(&stored.frontmatter.doc_type).ok_or_else(|| {
-            anyhow::anyhow!(
-                "document at {} is not a recognized task artifact type: {}",
-                relative_path.display(),
-                stored.frontmatter.doc_type
-            )
-        })?;
+        anyhow::anyhow!(
+            "document at {} is not a recognized task artifact type: {}",
+            relative_path.display(),
+            stored.frontmatter.doc_type
+        )
+    })?;
 
     Ok(TaskArtifactDocument {
         id: stored.frontmatter.id,
@@ -353,7 +358,9 @@ struct TaskArtifactFrontmatter {
     updated_at: String,
 }
 
-fn task_artifact_summary_from_index_entry(entry: MarkdownIndexEntry) -> Option<TaskArtifactSummary> {
+fn task_artifact_summary_from_index_entry(
+    entry: MarkdownIndexEntry,
+) -> Option<TaskArtifactSummary> {
     let task_hint = task_hint_from_entry(&entry);
     let kind = TaskArtifactKind::from_doc_type(&entry.doc_type)?;
     let status = entry.status.unwrap_or_else(|| "unknown".to_owned());
@@ -395,7 +402,9 @@ fn render_task_plan_body(task: &TaskRequest, plan: &TaskPlan) -> String {
     body.push_str(&format!("- goal: {}\n", task.goal));
     body.push_str(&format!(
         "- budget: {} tokens / {} minutes / {} evolution reserve\n\n",
-        task.budget.token_budget, task.budget.time_budget_minutes, task.budget.evolution_reserve_tokens
+        task.budget.token_budget,
+        task.budget.time_budget_minutes,
+        task.budget.evolution_reserve_tokens
     ));
 
     body.push_str("# Planning Notes\n\n");
@@ -414,7 +423,12 @@ fn render_task_plan_body(task: &TaskRequest, plan: &TaskPlan) -> String {
         for item in &plan.work_items {
             body.push_str(&format!(
                 "- {} | stage={} | status={} | {} | {} tokens | {} minutes\n",
-                item.id, item.stage, item.status, item.title, item.estimated_token_cost, item.estimated_time_minutes
+                item.id,
+                item.stage,
+                item.status,
+                item.title,
+                item.estimated_token_cost,
+                item.estimated_time_minutes
             ));
             body.push_str(&format!("  goal: {}\n", item.goal));
         }
@@ -571,8 +585,8 @@ mod tests {
     use hc_core::{RuntimeNamespace, RuntimeSupervisor};
 
     use crate::{
-        IncubationObservation, IncubationReport, PromotionDecision, TaskNamespace, TaskRequest,
-        TaskPlan, bootstrap_task, materialize_plan,
+        IncubationObservation, IncubationReport, PromotionDecision, TaskNamespace, TaskPlan,
+        TaskRequest, bootstrap_task, materialize_plan,
     };
 
     use super::*;
@@ -582,7 +596,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("honeycomb-{}-{}-{}", name, std::process::id(), nanos))
+        std::env::temp_dir().join(format!(
+            "honeycomb-{}-{}-{}",
+            name,
+            std::process::id(),
+            nanos
+        ))
     }
 
     #[test]
@@ -592,10 +611,8 @@ mod tests {
             .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
         let plan = bootstrap_task(&task);
         let mut runtime = RuntimeSupervisor::new();
-        let session = runtime.create_session_in_namespace(
-            "demo",
-            RuntimeNamespace::new("tenant-a", "user-a"),
-        );
+        let session = runtime
+            .create_session_in_namespace("demo", RuntimeNamespace::new("tenant-a", "user-a"));
 
         let agents = materialize_plan(&mut runtime, &session.id, &plan)
             .context("plan should materialize")
@@ -635,11 +652,13 @@ mod tests {
         .expect("memory persistence should succeed");
 
         assert!(persisted.memory_path.exists());
-        assert!(persisted
-            .memory_path
-            .to_string_lossy()
-            .replace('/', "\\")
-            .contains("tenants\\tenant-a\\users\\user-a\\memory\\task"));
+        assert!(
+            persisted
+                .memory_path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .contains("tenants\\tenant-a\\users\\user-a\\memory\\task")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -676,19 +695,21 @@ mod tests {
         assert!(persisted.task_plan_memory_path.exists());
         assert_eq!(persisted.assignment_memory_paths.len(), 1);
         assert!(persisted.assignment_memory_paths[0].exists());
-        assert!(persisted
-            .task_plan_path
-            .to_string_lossy()
-            .replace('/', "\\")
-            .contains("tenants\\tenant-a\\users\\user-a\\decisions\\"));
+        assert!(
+            persisted
+                .task_plan_path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .contains("tenants\\tenant-a\\users\\user-a\\decisions\\")
+        );
         assert!(persisted
             .task_plan_memory_path
             .to_string_lossy()
             .replace('/', "\\")
             .contains("tenants\\tenant-a\\users\\user-a\\memory\\rooms\\task\\room.task.task.demo\\compressed\\"));
 
-        let task_plan_content =
-            fs::read_to_string(&persisted.task_plan_path).expect("task plan file should be readable");
+        let task_plan_content = fs::read_to_string(&persisted.task_plan_path)
+            .expect("task plan file should be readable");
         assert!(task_plan_content.contains("type: task_plan"));
         assert!(task_plan_content.contains("Inspect runtime"));
 
@@ -714,8 +735,12 @@ mod tests {
     fn task_artifacts_can_be_rebuilt_queried_and_read() {
         let root = unique_temp_dir("task-artifact-query");
         let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
-        let task = TaskRequest::new("task.demo.query", "Query Demo", "Persist and inspect task assets")
-            .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+        let task = TaskRequest::new(
+            "task.demo.query",
+            "Query Demo",
+            "Persist and inspect task assets",
+        )
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
         let mut plan = TaskPlan::awaiting_planner_input(&task);
         let work_item_id = plan.add_work_item(
             "phase-1",
@@ -741,10 +766,16 @@ mod tests {
             .context("task index should rebuild")
             .expect("task index should rebuild");
         assert_eq!(rebuilt.len(), 2);
-        assert!(rebuilt.iter().any(|artifact| artifact.kind == TaskArtifactKind::TaskPlan));
-        assert!(rebuilt
-            .iter()
-            .any(|artifact| artifact.kind == TaskArtifactKind::AssignmentDecision));
+        assert!(
+            rebuilt
+                .iter()
+                .any(|artifact| artifact.kind == TaskArtifactKind::TaskPlan)
+        );
+        assert!(
+            rebuilt
+                .iter()
+                .any(|artifact| artifact.kind == TaskArtifactKind::AssignmentDecision)
+        );
 
         let assignment_matches = query_task_artifacts(
             &root,
@@ -757,20 +788,23 @@ mod tests {
         .context("assignment artifacts should query")
         .expect("assignment query should succeed");
         assert_eq!(assignment_matches.len(), 1);
-        assert_eq!(assignment_matches[0].task_hint.as_deref(), Some("task.demo.query"));
+        assert_eq!(
+            assignment_matches[0].task_hint.as_deref(),
+            Some("task.demo.query")
+        );
 
         let relative_path = persisted.assignment_paths[0]
-            .strip_prefix(
-                WorkspaceStore::new(&root)
-                    .resolve(namespace.scoped_prefix()),
-            )
+            .strip_prefix(WorkspaceStore::new(&root).resolve(namespace.scoped_prefix()))
             .expect("assignment path should stay inside namespace root")
             .to_path_buf();
         let document = read_task_artifact(&root, &namespace, &relative_path)
             .context("task artifact should read")
             .expect("task artifact should read");
         assert_eq!(document.kind, TaskArtifactKind::AssignmentDecision);
-        assert_eq!(document.relative_path, relative_path.to_string_lossy().replace('\\', "/"));
+        assert_eq!(
+            document.relative_path,
+            relative_path.to_string_lossy().replace('\\', "/")
+        );
         assert!(document.body.contains("Inspect decisions"));
         assert!(persisted.task_plan_memory_path.exists());
         assert_eq!(persisted.assignment_memory_paths.len(), 1);

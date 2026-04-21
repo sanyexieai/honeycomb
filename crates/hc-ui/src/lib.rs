@@ -18,8 +18,8 @@ use hc_agent::{
     query_task_artifacts,
 };
 use hc_core::{
-    MessageKind, MessageRoute, RuntimeCommand, RuntimeCommandResult, RuntimeNamespace, SessionRecord,
-    RuntimeSupervisor,
+    MessageKind, MessageRoute, RuntimeCommand, RuntimeCommandResult, RuntimeNamespace,
+    RuntimeSupervisor, SessionRecord,
 };
 use hc_llm::{OpenAiCompatibleProvider, ProviderRegistry};
 use hc_responder::{
@@ -688,17 +688,18 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn build_registry_for_task(task_goal: &str) -> Result<(Rc<RefCell<UiRegistry>>, MaterializedAgent)> {
+fn build_registry_for_task(
+    task_goal: &str,
+) -> Result<(Rc<RefCell<UiRegistry>>, MaterializedAgent)> {
     let mut runtime = RuntimeSupervisor::new();
     let namespace = runtime_namespace();
     let task_id = format!("task.ui.{}", current_timestamp_ms());
     let task_title = summarize_task_title(task_goal);
     let mut workbench = bootstrap_task_workbench(
         &mut runtime,
-        TaskRequest::new(task_id, task_title, task_goal.to_owned()).with_namespace(TaskNamespace::new(
-            namespace.tenant_id.clone(),
-            namespace.user_id.clone(),
-        )),
+        TaskRequest::new(task_id, task_title, task_goal.to_owned()).with_namespace(
+            TaskNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()),
+        ),
     )?;
     for agent in &mut workbench.agents {
         configure_default_responder(agent);
@@ -760,7 +761,8 @@ fn spawn_materialized_window(
     let capability_list = if agent.capabilities.is_empty() {
         "none".to_owned()
     } else {
-        agent.capabilities
+        agent
+            .capabilities
             .iter()
             .map(|capability| capability.name.clone())
             .collect::<Vec<_>>()
@@ -816,8 +818,7 @@ fn spawn_materialized_window(
         let registry = Rc::clone(&registry);
         let window_index = window_index as i32;
         window.on_focus_agent(move |agent_name| {
-            if let Err(error) =
-                set_window_focus_target(&registry, window_index, agent_name.trim())
+            if let Err(error) = set_window_focus_target(&registry, window_index, agent_name.trim())
             {
                 eprintln!("focus agent error: {error}");
             }
@@ -849,20 +850,20 @@ fn spawn_materialized_window(
     {
         let registry = Rc::clone(&registry);
         let window_index = window_index as i32;
-    {
-        let registry = Rc::clone(&registry);
-        let window_index = window_index as i32;
-        window.on_claim_selected_work_item(move |score_text, reason_text| {
-            if let Err(error) = claim_selected_work_item(
-                &registry,
-                window_index,
-                score_text.to_string(),
-                reason_text.to_string(),
-            ) {
-                eprintln!("claim work item error: {error}");
-            }
-        });
-    }
+        {
+            let registry = Rc::clone(&registry);
+            let window_index = window_index as i32;
+            window.on_claim_selected_work_item(move |score_text, reason_text| {
+                if let Err(error) = claim_selected_work_item(
+                    &registry,
+                    window_index,
+                    score_text.to_string(),
+                    reason_text.to_string(),
+                ) {
+                    eprintln!("claim work item error: {error}");
+                }
+            });
+        }
 
         window.on_resolve_selected_work_item(move || {
             if let Err(error) = resolve_selected_work_item(&registry, window_index) {
@@ -896,7 +897,10 @@ fn spawn_materialized_window(
             format!("[task] namespace: {}", namespace_label),
             format!("[task] goal: {}", agent.seed.goal),
             "[planning] phase started".to_owned(),
-            format!("[planning] planner: {} ({})", agent.persona.name, agent.persona.role),
+            format!(
+                "[planning] planner: {} ({})",
+                agent.persona.name, agent.persona.role
+            ),
             format!("[planning] capabilities: {capability_list}"),
             format!("[planning] responder: {responder_label}"),
         ];
@@ -1092,7 +1096,14 @@ fn handle_window_input(
     }
 
     if let Some((work_item_id, agent_name, score, reason)) = parse_assign_claim_command(line) {
-        add_work_item_claim(&registry, window_index, &work_item_id, &agent_name, score, &reason)?;
+        add_work_item_claim(
+            &registry,
+            window_index,
+            &work_item_id,
+            &agent_name,
+            score,
+            &reason,
+        )?;
         return Ok(());
     }
 
@@ -1179,10 +1190,12 @@ fn rename_window_instance(
             .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
         let instance_id = registry_ref.windows[target_index].instance_id.clone();
 
-        let result = registry_ref.runtime.dispatch(RuntimeCommand::RenameInstance {
-            instance_id,
-            name: new_name.to_owned(),
-        })?;
+        let result = registry_ref
+            .runtime
+            .dispatch(RuntimeCommand::RenameInstance {
+                instance_id,
+                name: new_name.to_owned(),
+            })?;
         let RuntimeCommandResult::Instance(instance) = result else {
             bail!("unexpected runtime result while renaming instance");
         };
@@ -1192,9 +1205,9 @@ fn rename_window_instance(
             "{}/{}",
             registry_ref.namespace.tenant_id, registry_ref.namespace.user_id
         );
-        registry_ref.windows[target_index]
-            .handle
-            .set_window_title(format!("{} | Honeycomb | {}", instance.name, namespace_label).into());
+        registry_ref.windows[target_index].handle.set_window_title(
+            format!("{} | Honeycomb | {}", instance.name, namespace_label).into(),
+        );
         registry_ref.windows[target_index]
             .transcript_lines
             .push(format!("instance renamed to {}", instance.name));
@@ -1236,10 +1249,7 @@ fn set_window_focus_target(
     Ok(())
 }
 
-fn window_focus_target(
-    registry: &Rc<RefCell<UiRegistry>>,
-    window_index: i32,
-) -> Option<String> {
+fn window_focus_target(registry: &Rc<RefCell<UiRegistry>>, window_index: i32) -> Option<String> {
     let registry_ref = registry.borrow();
     registry_ref
         .windows
@@ -1298,10 +1308,7 @@ fn set_window_responder(
     Ok(())
 }
 
-fn queue_human_reply(
-    registry_ref: &mut UiRegistry,
-    request: ReplyRequest,
-) -> Result<()> {
+fn queue_human_reply(registry_ref: &mut UiRegistry, request: ReplyRequest) -> Result<()> {
     let human = require_human(&request.responder)?;
     let responder_user_ref = human
         .user_ref
@@ -1348,7 +1355,9 @@ fn queue_human_reply(
         .transcript_lines
         .push("[hint] reply locally with /reply ... or remotely with `hc-responder-cli inbox reply-next <text>`".to_owned());
     if responder_user_ref == registry_ref.namespace.user_id {
-        registry_ref.windows[target_index].pending_replies.push(request);
+        registry_ref.windows[target_index]
+            .pending_replies
+            .push(request);
     }
     Ok(())
 }
@@ -1365,7 +1374,10 @@ fn post_human_reply(
             .iter()
             .position(|window| window.window_index == window_index)
             .ok_or_else(|| anyhow::anyhow!("window not found: {window_index}"))?;
-        if registry_ref.windows[source_index].pending_replies.is_empty() {
+        if registry_ref.windows[source_index]
+            .pending_replies
+            .is_empty()
+        {
             bail!("no pending human replies");
         }
 
@@ -1462,11 +1474,17 @@ fn send_window_message(
             .push(format!("[you -> {to_name}] {}", message.body));
         registry_ref.windows[to_index]
             .transcript_lines
-            .push(format!("[recv {}] {from_name} -> you: {}", message.id, message.body));
+            .push(format!(
+                "[recv {}] {from_name} -> you: {}",
+                message.id, message.body
+            ));
 
         let orchestrator = registry_ref.orchestrator.clone();
         let agents = registry_ref.agents.clone();
-        if let Some(agent) = agents.iter().find(|agent| agent.binding.instance_id == to_id) {
+        if let Some(agent) = agents
+            .iter()
+            .find(|agent| agent.binding.instance_id == to_id)
+        {
             match agent.binding.responder.as_ref() {
                 Some(responder) if responder.is_human() => {
                     let request = orchestrator.build_direct_reply_request(
@@ -1490,14 +1508,18 @@ fn send_window_message(
                         &to_id,
                     ) {
                         Ok(reply) => {
-                            registry_ref.windows[to_index].transcript_lines.push(format!(
-                                "[reply {}] you -> {}: {}",
-                                reply.id, from_name, reply.body
-                            ));
-                            registry_ref.windows[from_index].transcript_lines.push(format!(
-                                "[recv {}] {} -> you: {}",
-                                reply.id, to_name, reply.body
-                            ));
+                            registry_ref.windows[to_index]
+                                .transcript_lines
+                                .push(format!(
+                                    "[reply {}] you -> {}: {}",
+                                    reply.id, from_name, reply.body
+                                ));
+                            registry_ref.windows[from_index]
+                                .transcript_lines
+                                .push(format!(
+                                    "[recv {}] {} -> you: {}",
+                                    reply.id, to_name, reply.body
+                                ));
                         }
                         Err(error) => {
                             registry_ref.windows[from_index]
@@ -1507,11 +1529,13 @@ fn send_window_message(
                     }
                 }
                 Some(other) => {
-                    registry_ref.windows[from_index].transcript_lines.push(format!(
-                        "[responder] {} is using {}, auto reply not implemented yet",
-                        to_name,
-                        other.label()
-                    ));
+                    registry_ref.windows[from_index]
+                        .transcript_lines
+                        .push(format!(
+                            "[responder] {} is using {}, auto reply not implemented yet",
+                            to_name,
+                            other.label()
+                        ));
                 }
                 None => {
                     registry_ref.windows[from_index]
@@ -1560,9 +1584,10 @@ fn broadcast_window_message(
                     .transcript_lines
                     .push(format!("[you -> *] {}", message.body));
             } else {
-                window
-                    .transcript_lines
-                    .push(format!("[broadcast {}] {from_name}: {}", message.id, message.body));
+                window.transcript_lines.push(format!(
+                    "[broadcast {}] {from_name}: {}",
+                    message.id, message.body
+                ));
             }
         }
 
@@ -1599,10 +1624,9 @@ fn broadcast_window_message(
                     )?;
                     queue_human_reply(&mut registry_ref, request)?;
                     for window in &mut registry_ref.windows {
-                        window.transcript_lines.push(format!(
-                            "[pending] {} will reply manually",
-                            speaker_name
-                        ));
+                        window
+                            .transcript_lines
+                            .push(format!("[pending] {} will reply manually", speaker_name));
                     }
                 }
                 Some(ResponderBinding::Llm(_)) => {
@@ -1636,7 +1660,8 @@ fn broadcast_window_message(
                                         "[reply {}] you -> {}: {}",
                                         reply.id, target_name, reply.body
                                     ));
-                                } else if matches!(&reply.route, MessageRoute::Direct { to } if to == &window.instance_id) {
+                                } else if matches!(&reply.route, MessageRoute::Direct { to } if to == &window.instance_id)
+                                {
                                     window.transcript_lines.push(format!(
                                         "[recv {}] {} -> you: {}",
                                         reply.id, recipient_name, reply.body
@@ -1680,10 +1705,12 @@ fn create_channel(
     let created_name = {
         let mut registry_ref = registry.borrow_mut();
         let session_id = registry_ref.session_id.clone();
-        let result = registry_ref.runtime.dispatch(RuntimeCommand::CreateChannel {
-            session_id,
-            name: channel_name.to_owned(),
-        })?;
+        let result = registry_ref
+            .runtime
+            .dispatch(RuntimeCommand::CreateChannel {
+                session_id,
+                name: channel_name.to_owned(),
+            })?;
         let RuntimeCommandResult::Channel(channel) = result else {
             bail!("unexpected runtime result while creating channel");
         };
@@ -1763,10 +1790,12 @@ fn leave_channel(
             .find(|channel| channel.id == channel_id)
             .map(|channel| channel.name.clone())
             .context("channel should exist before leave")?;
-        let result = registry_ref.runtime.dispatch(RuntimeCommand::LeaveChannel {
-            instance_id,
-            channel_id,
-        })?;
+        let result = registry_ref
+            .runtime
+            .dispatch(RuntimeCommand::LeaveChannel {
+                instance_id,
+                channel_id,
+            })?;
         let RuntimeCommandResult::Instance(_) = result else {
             bail!("unexpected runtime result while leaving channel");
         };
@@ -1885,10 +1914,9 @@ fn send_channel_message(
                     )?;
                     queue_human_reply(&mut registry_ref, request)?;
                     for window in &mut registry_ref.windows {
-                        window.transcript_lines.push(format!(
-                            "[pending] {} will reply manually",
-                            speaker_name
-                        ));
+                        window
+                            .transcript_lines
+                            .push(format!("[pending] {} will reply manually", speaker_name));
                     }
                 }
                 Some(ResponderBinding::Llm(_)) => {
@@ -1916,7 +1944,8 @@ fn send_channel_message(
                                         "[reply {}] you -> {}: {}",
                                         reply.id, target_name, reply.body
                                     ));
-                                } else if matches!(&reply.route, MessageRoute::Direct { to } if to == &window.instance_id) {
+                                } else if matches!(&reply.route, MessageRoute::Direct { to } if to == &window.instance_id)
+                                {
                                     window.transcript_lines.push(format!(
                                         "[recv {}] {} -> you: {}",
                                         reply.id, speaker_name, reply.body
@@ -2168,7 +2197,10 @@ fn pump_ui_events(registry: &Rc<RefCell<UiRegistry>>) {
                         changed = true;
                     }
                 }
-                UiEvent::CommandExit { window_index, status } => {
+                UiEvent::CommandExit {
+                    window_index,
+                    status,
+                } => {
                     if let Some(window) = registry_ref
                         .windows
                         .iter_mut()
@@ -2268,7 +2300,9 @@ fn sync_windows(registry: &Rc<RefCell<UiRegistry>>) {
         let titles = registry_ref
             .windows
             .iter()
-            .map(|window| SharedString::from(format!("{} [{}]", window.instance_name, window.role_name)))
+            .map(|window| {
+                SharedString::from(format!("{} [{}]", window.instance_name, window.role_name))
+            })
             .collect::<Vec<_>>();
 
         let snapshots = registry_ref
@@ -2326,7 +2360,28 @@ fn sync_windows(registry: &Rc<RefCell<UiRegistry>>) {
     };
 
     let model = ModelRc::new(VecModel::from(titles));
-    for (handle, prompt_label, agent_board_text, agent_slot_1, agent_slot_2, agent_slot_3, agent_slot_4, agent_slot_5, agent_slot_6, work_items_text, work_item_slot_1, work_item_slot_2, work_item_slot_3, work_item_slot_4, work_item_slot_5, work_item_slot_6, selected_work_item_label, inspector_text, transcript_text) in snapshots {
+    for (
+        handle,
+        prompt_label,
+        agent_board_text,
+        agent_slot_1,
+        agent_slot_2,
+        agent_slot_3,
+        agent_slot_4,
+        agent_slot_5,
+        agent_slot_6,
+        work_items_text,
+        work_item_slot_1,
+        work_item_slot_2,
+        work_item_slot_3,
+        work_item_slot_4,
+        work_item_slot_5,
+        work_item_slot_6,
+        selected_work_item_label,
+        inspector_text,
+        transcript_text,
+    ) in snapshots
+    {
         handle.set_open_window_titles(model.clone());
         handle.set_prompt_label(prompt_label.into());
         handle.set_agent_board_text(agent_board_text.into());
@@ -2715,7 +2770,13 @@ fn render_inspector(
     if workspace.recent_activity.is_empty() {
         lines.push("- none".to_owned());
     } else {
-        lines.extend(workspace.recent_activity.iter().take(3).map(render_activity_line));
+        lines.extend(
+            workspace
+                .recent_activity
+                .iter()
+                .take(3)
+                .map(render_activity_line),
+        );
     }
 
     lines.push(String::new());
@@ -2949,7 +3010,11 @@ fn approve_plan(registry: &Rc<RefCell<UiRegistry>>, window_index: i32) -> Result
         .filter(|proposal| proposal.status == "proposed")
         .map(|proposal| {
             proposal.status = "materialized".to_owned();
-            (proposal.id.clone(), proposal.role.clone(), proposal.reason.clone())
+            (
+                proposal.id.clone(),
+                proposal.role.clone(),
+                proposal.reason.clone(),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -3072,10 +3137,7 @@ fn resolve_work_item_assignment(
     {
         window.transcript_lines.push(format!(
             "[assignment] resolved {} | work item {} -> {} ({})",
-            assignment.id,
-            assignment.work_item_id,
-            assignment.agent_name,
-            assignment.rationale
+            assignment.id, assignment.work_item_id, assignment.agent_name, assignment.rationale
         ));
     }
 
@@ -3137,13 +3199,17 @@ fn claim_selected_work_item(
             .ok_or_else(|| anyhow::anyhow!("no work item selected"))?;
         (work_item_id, window.instance_name.clone())
     };
-    add_work_item_claim(registry, window_index, &work_item_id, &agent_name, score, reason_text.trim())
+    add_work_item_claim(
+        registry,
+        window_index,
+        &work_item_id,
+        &agent_name,
+        score,
+        reason_text.trim(),
+    )
 }
 
-fn clear_window_focus_target(
-    registry: &Rc<RefCell<UiRegistry>>,
-    window_index: i32,
-) -> Result<()> {
+fn clear_window_focus_target(registry: &Rc<RefCell<UiRegistry>>, window_index: i32) -> Result<()> {
     let mut registry_ref = registry.borrow_mut();
     let window = registry_ref
         .windows
@@ -3241,7 +3307,11 @@ fn apply_manual_planner_input(
 
     let mut registry_ref = registry.borrow_mut();
     registry_ref.task_plan.add_note(trimmed.to_owned());
-    if let Some(window) = registry_ref.windows.iter_mut().find(|window| window.role_name == "planner") {
+    if let Some(window) = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.role_name == "planner")
+    {
         if initial {
             window.transcript_lines.push(format!(
                 "[planning] task captured. Planner is {} so the initial request was stored as a planning note.",
@@ -3275,9 +3345,8 @@ fn apply_manual_planner_input(
 
 fn parse_planner_draft(body: &str) -> Result<PlannerDraft> {
     let trimmed = body.trim();
-    serde_json::from_str::<PlannerDraft>(trimmed).map_err(|error| {
-        anyhow::anyhow!("planner returned invalid structured plan: {error}")
-    })
+    serde_json::from_str::<PlannerDraft>(trimmed)
+        .map_err(|error| anyhow::anyhow!("planner returned invalid structured plan: {error}"))
 }
 
 fn apply_planner_draft(
@@ -3291,12 +3360,16 @@ fn apply_planner_draft(
         bail!("planner returned an empty draft");
     }
 
-    if let Some(window) = registry_ref.windows.iter_mut().find(|window| window.role_name == "planner")
+    if let Some(window) = registry_ref
+        .windows
+        .iter_mut()
+        .find(|window| window.role_name == "planner")
     {
         if initial {
-            window
-                .transcript_lines
-                .push(format!("[planning] planner initialized from task: {}", input.trim()));
+            window.transcript_lines.push(format!(
+                "[planning] planner initialized from task: {}",
+                input.trim()
+            ));
         } else {
             window
                 .transcript_lines
@@ -3343,7 +3416,11 @@ fn apply_planner_draft(
             .filter(|proposal| proposal.status == "proposed")
             .map(|proposal| {
                 proposal.status = "materialized".to_owned();
-                (proposal.id.clone(), proposal.role.clone(), proposal.reason.clone())
+                (
+                    proposal.id.clone(),
+                    proposal.role.clone(),
+                    proposal.reason.clone(),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -3538,10 +3615,12 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
         bail!("unexpected runtime result while auto-starting execution");
     };
 
-    registry_ref.windows[source_index].transcript_lines.push(format!(
-        "[execution] auto-started {} -> {} ({})",
-        work_item.id, target_name, work_item.title
-    ));
+    registry_ref.windows[source_index]
+        .transcript_lines
+        .push(format!(
+            "[execution] auto-started {} -> {} ({})",
+            work_item.id, target_name, work_item.title
+        ));
     registry_ref.windows[source_index]
         .transcript_lines
         .push(format!("[you -> {target_name}] {}", message.body));
@@ -3592,29 +3671,38 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
                             reply.id, source_name, reply.body
                         ));
                     }
-                    registry_ref.windows[source_index].transcript_lines.push(format!(
-                        "[recv {}] {} -> you: {}",
-                        reply.id, target_name, reply.body
-                    ));
+                    registry_ref.windows[source_index]
+                        .transcript_lines
+                        .push(format!(
+                            "[recv {}] {} -> you: {}",
+                            reply.id, target_name, reply.body
+                        ));
                 }
                 Err(error) => {
-                    registry_ref.windows[source_index].transcript_lines.push(format!(
-                        "[llm error] {target_name} could not execute: {error}"
-                    ));
+                    registry_ref.windows[source_index]
+                        .transcript_lines
+                        .push(format!(
+                            "[llm error] {target_name} could not execute: {error}"
+                        ));
                 }
             }
         }
         Some(other) => {
-            registry_ref.windows[source_index].transcript_lines.push(format!(
-                "[responder] {} is using {}, execution auto reply not implemented yet",
-                target_name,
-                other.label()
-            ));
+            registry_ref.windows[source_index]
+                .transcript_lines
+                .push(format!(
+                    "[responder] {} is using {}, execution auto reply not implemented yet",
+                    target_name,
+                    other.label()
+                ));
         }
         None => {
             registry_ref.windows[source_index]
                 .transcript_lines
-                .push(format!("[responder] {} has no responder bound", target_name));
+                .push(format!(
+                    "[responder] {} has no responder bound",
+                    target_name
+                ));
         }
     }
 
@@ -3626,21 +3714,42 @@ fn auto_assignment_score(role: &str, text: &str) -> f32 {
     let lower = text.to_lowercase();
     match role {
         "planner" => {
-            if contains_any(&lower, &["plan", "stage", "phase", "roadmap", "analyze", "??", "??"]) {
+            if contains_any(
+                &lower,
+                &["plan", "stage", "phase", "roadmap", "analyze", "??", "??"],
+            ) {
                 0.88
             } else {
                 0.22
             }
         }
         "worker" => {
-            if contains_any(&lower, &["implement", "build", "write", "code", "fix", "??", "??", "??", "??"]) {
+            if contains_any(
+                &lower,
+                &[
+                    "implement",
+                    "build",
+                    "write",
+                    "code",
+                    "fix",
+                    "??",
+                    "??",
+                    "??",
+                    "??",
+                ],
+            ) {
                 0.90
             } else {
                 0.30
             }
         }
         "reviewer" => {
-            if contains_any(&lower, &["review", "check", "verify", "risk", "audit", "??", "??", "??"]) {
+            if contains_any(
+                &lower,
+                &[
+                    "review", "check", "verify", "risk", "audit", "??", "??", "??",
+                ],
+            ) {
                 0.89
             } else {
                 0.28
@@ -3654,10 +3763,7 @@ fn contains_any(body: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|keyword| body.contains(keyword))
 }
 
-fn resolve_selected_work_item(
-    registry: &Rc<RefCell<UiRegistry>>,
-    window_index: i32,
-) -> Result<()> {
+fn resolve_selected_work_item(registry: &Rc<RefCell<UiRegistry>>, window_index: i32) -> Result<()> {
     let work_item_id = {
         let registry_ref = registry.borrow();
         registry_ref
@@ -3670,10 +3776,7 @@ fn resolve_selected_work_item(
     resolve_work_item_assignment(registry, window_index, &work_item_id)
 }
 
-fn execute_selected_work_item(
-    registry: &Rc<RefCell<UiRegistry>>,
-    window_index: i32,
-) -> Result<()> {
+fn execute_selected_work_item(registry: &Rc<RefCell<UiRegistry>>, window_index: i32) -> Result<()> {
     let work_item_id = {
         let registry_ref = registry.borrow();
         registry_ref
@@ -3714,7 +3817,9 @@ fn execute_work_item(
             .iter()
             .find(|item| item.id == work_item_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("work item not found after execution start: {work_item_id}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("work item not found after execution start: {work_item_id}")
+            })?;
         let assigned_agent = registry_ref
             .agents
             .iter()
@@ -3742,10 +3847,12 @@ fn execute_work_item(
             bail!("unexpected runtime result while starting execution");
         };
 
-        registry_ref.windows[source_index].transcript_lines.push(format!(
-            "[execution] started {} -> {} ({})",
-            work_item.id, target_name, work_item.title
-        ));
+        registry_ref.windows[source_index]
+            .transcript_lines
+            .push(format!(
+                "[execution] started {} -> {} ({})",
+                work_item.id, target_name, work_item.title
+            ));
         registry_ref.windows[source_index]
             .transcript_lines
             .push(format!("[you -> {target_name}] {}", message.body));
@@ -3796,29 +3903,38 @@ fn execute_work_item(
                                 reply.id, source_name, reply.body
                             ));
                         }
-                        registry_ref.windows[source_index].transcript_lines.push(format!(
-                            "[recv {}] {} -> you: {}",
-                            reply.id, target_name, reply.body
-                        ));
+                        registry_ref.windows[source_index]
+                            .transcript_lines
+                            .push(format!(
+                                "[recv {}] {} -> you: {}",
+                                reply.id, target_name, reply.body
+                            ));
                     }
                     Err(error) => {
                         registry_ref.windows[source_index]
                             .transcript_lines
-                            .push(format!("[llm error] {target_name} could not execute: {error}"));
+                            .push(format!(
+                                "[llm error] {target_name} could not execute: {error}"
+                            ));
                     }
                 }
             }
             Some(other) => {
-                registry_ref.windows[source_index].transcript_lines.push(format!(
-                    "[responder] {} is using {}, execution auto reply not implemented yet",
-                    target_name,
-                    other.label()
-                ));
+                registry_ref.windows[source_index]
+                    .transcript_lines
+                    .push(format!(
+                        "[responder] {} is using {}, execution auto reply not implemented yet",
+                        target_name,
+                        other.label()
+                    ));
             }
             None => {
                 registry_ref.windows[source_index]
                     .transcript_lines
-                    .push(format!("[responder] {} has no responder bound", target_name));
+                    .push(format!(
+                        "[responder] {} has no responder bound",
+                        target_name
+                    ));
             }
         }
 
@@ -4041,12 +4157,12 @@ fn workspace_root() -> std::path::PathBuf {
 fn default_llm_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     let provider_id = env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned());
-    let api_key = env::var("HC_LLM_API_KEY")
-        .ok()
-        .or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {
+    let api_key = env::var("HC_LLM_API_KEY").ok().or_else(|| {
+        match provider_id.trim().to_ascii_lowercase().as_str() {
             "minimax" => env::var("MINIMAX_API_KEY").ok(),
             _ => env::var("OPENAI_API_KEY").ok(),
-        });
+        }
+    });
     let base_url = env::var("HC_LLM_BASE_URL")
         .ok()
         .or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {

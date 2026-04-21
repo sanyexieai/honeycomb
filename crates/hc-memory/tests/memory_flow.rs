@@ -1,8 +1,8 @@
 use hc_memory::{
     MemoryCatalog, MemoryEntityKind, MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace,
-    MemoryOwnerRef, MemoryQuery, MemoryRecord, MemoryRelation, MemoryRelationKind, MemoryRepository,
-    MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope,
-    MemoryVisibility,
+    MemoryOwnerRef, MemoryQuery, MemoryRecord, MemoryRelation, MemoryRelationKind,
+    MemoryRepository, MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository,
+    MemoryScope, MemoryVisibility,
 };
 use hc_store::store::WorkspaceNamespace;
 use std::fs;
@@ -13,7 +13,12 @@ fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("honeycomb-{}-{}-{}", name, std::process::id(), nanos))
+    std::env::temp_dir().join(format!(
+        "honeycomb-{}-{}-{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
 }
 
 #[test]
@@ -31,9 +36,17 @@ fn task_summary_builder_sets_expected_defaults() {
     assert_eq!(record.scope, MemoryScope::Task);
     assert_eq!(record.owner, MemoryOwnerRef::task("task.demo"));
     assert_eq!(record.kind, MemoryKind::Summary);
-    assert_eq!(record.namespace, MemoryNamespace::new("tenant-demo", "user-demo"));
+    assert_eq!(
+        record.namespace,
+        MemoryNamespace::new("tenant-demo", "user-demo")
+    );
     assert_eq!(record.visibility, MemoryVisibility::Private);
-    assert!(record.derived_from.iter().any(|value| value == "instance.0001"));
+    assert!(
+        record
+            .derived_from
+            .iter()
+            .any(|value| value == "instance.0001")
+    );
     assert!(record.tags.iter().any(|value| value == "incubation"));
     assert_eq!(record.confidence_milli, 920);
 }
@@ -192,18 +205,21 @@ fn memory_room_captures_layer_entities_and_relations() {
     assert_eq!(room.layer, MemoryLayer::Task);
     assert_eq!(room.status, "active");
     assert!(room.tags.iter().any(|tag| tag == "runtime"));
-    assert!(room
-        .related_entities
-        .iter()
-        .any(|entity| entity.id == "crate.hc-core"));
-    assert!(room
-        .relations
-        .iter()
-        .any(|relation| relation.kind == MemoryRelationKind::About));
-    assert!(room
-        .source_docs
-        .iter()
-        .any(|path| path == "raw/doc.0001.user-request.md"));
+    assert!(
+        room.related_entities
+            .iter()
+            .any(|entity| entity.id == "crate.hc-core")
+    );
+    assert!(
+        room.relations
+            .iter()
+            .any(|relation| relation.kind == MemoryRelationKind::About)
+    );
+    assert!(
+        room.source_docs
+            .iter()
+            .any(|path| path == "raw/doc.0001.user-request.md")
+    );
 }
 
 #[test]
@@ -275,10 +291,12 @@ fn memory_room_repository_roundtrips_room_markdown() {
     assert_eq!(loaded.visibility, room.visibility);
     assert_eq!(loaded.summary, room.summary);
     assert!(loaded.tags.iter().any(|value| value == "runtime"));
-    assert!(loaded
-        .source_docs
-        .iter()
-        .any(|value| value == "raw/doc.0001.user-request.md"));
+    assert!(
+        loaded
+            .source_docs
+            .iter()
+            .any(|value| value == "raw/doc.0001.user-request.md")
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -368,11 +386,9 @@ fn memory_room_repository_roundtrips_compressed_assets() {
         .write_asset(&room, &asset)
         .expect("memory room asset should be written");
     assert!(path.exists());
-    assert!(
-        path.to_string_lossy()
-            .replace('\\', "/")
-            .contains("memory/rooms/task/room.task.runtime-refactor.0001/compressed/min.0001.summary.md")
-    );
+    assert!(path.to_string_lossy().replace('\\', "/").contains(
+        "memory/rooms/task/room.task.runtime-refactor.0001/compressed/min.0001.summary.md"
+    ));
 
     let root_relative = path
         .strip_prefix(&root)
@@ -392,10 +408,12 @@ fn memory_room_repository_roundtrips_compressed_assets() {
     assert_eq!(loaded.memory_kind, MemoryKind::Decision);
     assert_eq!(loaded.summary, asset.summary);
     assert!(loaded.tags.iter().any(|value| value == "runtime"));
-    assert!(loaded
-        .owners
-        .iter()
-        .any(|owner| owner == &MemoryOwnerRef::task("task.runtime-refactor.0001")));
+    assert!(
+        loaded
+            .owners
+            .iter()
+            .any(|owner| owner == &MemoryOwnerRef::task("task.runtime-refactor.0001"))
+    );
 
     let compressed_assets = repository
         .read_compressed_assets(&room)

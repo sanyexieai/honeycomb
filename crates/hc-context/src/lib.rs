@@ -69,7 +69,6 @@ impl PromptPolicy {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptAsset {
     pub id: String,
@@ -210,7 +209,9 @@ pub fn self_model_from_persona_and_capabilities(
         };
         self_model = self_model.with_capability(SelfCapability::new(
             capability.name.clone(),
-            format!("{}{}", capability.description, domains).trim().to_owned(),
+            format!("{}{}", capability.description, domains)
+                .trim()
+                .to_owned(),
         ));
 
         for constraint in &capability.constraints {
@@ -657,13 +658,16 @@ where
         let memory_kind = self.kind_resolver.resolve_kind(input)?;
         let mut tags = input.tags.clone();
         for tag in self.tag_suggester.suggest_tags(input)? {
-            if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(&tag)) {
+            if !tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&tag))
+            {
                 tags.push(tag);
             }
         }
-        let promotions = self
-            .promotion_advisor
-            .suggest_promotions(input, &route, memory_kind.clone())?;
+        let promotions =
+            self.promotion_advisor
+                .suggest_promotions(input, &route, memory_kind.clone())?;
 
         Ok(MemoryOrganizationDecision {
             route,
@@ -688,7 +692,10 @@ impl WorkspaceMemoryRetriever {
         }
     }
 
-    pub fn discover_room_candidates(&self, query: &ContextMemoryQuery) -> Result<Vec<RoomCandidate>> {
+    pub fn discover_room_candidates(
+        &self,
+        query: &ContextMemoryQuery,
+    ) -> Result<Vec<RoomCandidate>> {
         discover_room_candidates(&self.root, &self.namespace, query)
     }
 }
@@ -696,7 +703,8 @@ impl WorkspaceMemoryRetriever {
 impl MemoryRetriever for WorkspaceMemoryRetriever {
     fn retrieve(&self, query: &ContextMemoryQuery) -> Result<Vec<RetrievedMemory>> {
         let store = WorkspaceStore::new(self.root.clone());
-        let repository = MemoryRepository::with_namespace(self.root.clone(), self.namespace.clone());
+        let repository =
+            MemoryRepository::with_namespace(self.root.clone(), self.namespace.clone());
         let room_repository =
             MemoryRoomRepository::with_namespace(self.root.clone(), self.namespace.clone());
         let _ = store.rebuild_markdown_index_in_namespace(&self.namespace)?;
@@ -751,7 +759,10 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             let asset = room_repository.read_asset(&entry.relative_path)?;
             let mut retrieved = RetrievedMemory::from(&asset);
             if let Some(boost) = room_candidate_boosts.get(&asset.room_id) {
-                retrieved.confidence_milli = retrieved.confidence_milli.saturating_add(*boost / 4).min(1000);
+                retrieved.confidence_milli = retrieved
+                    .confidence_milli
+                    .saturating_add(*boost / 4)
+                    .min(1000);
             }
             if room_asset_matches_query(query, &asset, &retrieved) {
                 seen_match_ids.insert(retrieved.id.clone());
@@ -766,7 +777,13 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
                     .iter()
                     .any(|reason| reason == "anchor-room" || reason == "anchor-related")
         }) {
-            let Some((room, _)) = read_room_by_id(&store, &room_repository, &self.namespace, &candidate.room_id)? else {
+            let Some((room, _)) = read_room_by_id(
+                &store,
+                &room_repository,
+                &self.namespace,
+                &candidate.room_id,
+            )?
+            else {
                 continue;
             };
             let assets = room_repository.read_compressed_assets(&room)?;
@@ -835,7 +852,8 @@ fn retrieved_memory_room_kind(memory: &RetrievedMemory) -> &'static str {
             "project"
         } else if room_id.starts_with("room.task.") || memory.tags.iter().any(|tag| tag == "task") {
             "task"
-        } else if room_id.starts_with("room.topic.") || memory.tags.iter().any(|tag| tag == "topic") {
+        } else if room_id.starts_with("room.topic.") || memory.tags.iter().any(|tag| tag == "topic")
+        {
             "topic"
         } else if room_id.starts_with("room.chat.") || memory.tags.iter().any(|tag| tag == "chat") {
             "chat"
@@ -895,29 +913,27 @@ pub fn discover_room_candidates(
     for entry in entries {
         let room = room_repository.read_room(&entry.relative_path)?;
         let modified_at = modified_time_for_relative_path(&store, namespace, &entry.relative_path);
-        collect_related_room_ids(
-            &room,
-            120,
-            "related-room",
-            &mut related_room_ids,
-        );
+        collect_related_room_ids(&room, 120, "related-room", &mut related_room_ids);
         seen_room_ids.insert(room.id.clone());
-        candidates.push(build_room_candidate(&room, query, modified_at, 0, Vec::new()));
+        candidates.push(build_room_candidate(
+            &room,
+            query,
+            modified_at,
+            0,
+            Vec::new(),
+        ));
     }
 
     for room_id in &query.room_anchor_ids {
         if seen_room_ids.contains(room_id) {
             continue;
         }
-        let Some((room, modified_at)) = read_room_by_id(&store, &room_repository, namespace, room_id)? else {
+        let Some((room, modified_at)) =
+            read_room_by_id(&store, &room_repository, namespace, room_id)?
+        else {
             continue;
         };
-        collect_related_room_ids(
-            &room,
-            220,
-            "anchor-related",
-            &mut related_room_ids,
-        );
+        collect_related_room_ids(&room, 220, "anchor-related", &mut related_room_ids);
         seen_room_ids.insert(room.id.clone());
         candidates.push(build_room_candidate(
             &room,
@@ -1068,8 +1084,8 @@ fn build_room_candidate(
 
     if let Some(text) = &query.memory_query.text {
         let lowered = text.to_ascii_lowercase();
-        let haystack = format!("{} {} {}", room.title, room.summary, room.tags.join(" "))
-            .to_ascii_lowercase();
+        let haystack =
+            format!("{} {} {}", room.title, room.summary, room.tags.join(" ")).to_ascii_lowercase();
         if haystack.contains(&lowered) {
             score += 260;
             reasons.push("text-match".to_owned());
@@ -1170,16 +1186,7 @@ fn room_kind_matches_query(kind: &str, lowered_query: &str) -> bool {
             "角色",
         ],
         "tool" => &[
-            "tool",
-            "api",
-            "git",
-            "cargo",
-            "minimax",
-            "openai",
-            "工具",
-            "命令",
-            "接口",
-            "sdk",
+            "tool", "api", "git", "cargo", "minimax", "openai", "工具", "命令", "接口", "sdk",
         ],
         "project" => &[
             "project",
@@ -1218,30 +1225,32 @@ fn room_kind_matches_query(kind: &str, lowered_query: &str) -> bool {
         _ => &[],
     };
 
-    keywords.iter().any(|keyword| lowered_query.contains(keyword))
+    keywords
+        .iter()
+        .any(|keyword| lowered_query.contains(keyword))
 }
 
 impl MemoryRoomRouter for RuleBasedMemoryRoomRouter {
     fn route_room(&self, input: &MemoryOrganizationInput) -> Result<MemoryRoomRoute> {
-        let (room_id, room_layer) =
-            if let (Some(room_id), Some(room_layer)) = (&input.room_id_hint, &input.room_layer_hint)
-            {
-                (room_id.clone(), room_layer.clone())
-            } else if let Some(owner) = &input.owner {
-                (
-                    default_room_id_for_owner(owner),
-                    default_layer_for_owner_kind(&owner.kind),
-                )
-            } else {
-                (
-                    format!(
-                        "room.global.{}.{}",
-                        slugify_for_memory(&input.namespace.tenant_id),
-                        slugify_for_memory(&input.namespace.user_id)
-                    ),
-                    MemoryLayer::Global,
-                )
-            };
+        let (room_id, room_layer) = if let (Some(room_id), Some(room_layer)) =
+            (&input.room_id_hint, &input.room_layer_hint)
+        {
+            (room_id.clone(), room_layer.clone())
+        } else if let Some(owner) = &input.owner {
+            (
+                default_room_id_for_owner(owner),
+                default_layer_for_owner_kind(&owner.kind),
+            )
+        } else {
+            (
+                format!(
+                    "room.global.{}.{}",
+                    slugify_for_memory(&input.namespace.tenant_id),
+                    slugify_for_memory(&input.namespace.user_id)
+                ),
+                MemoryLayer::Global,
+            )
+        };
 
         Ok(MemoryRoomRoute {
             title: input
@@ -1265,7 +1274,10 @@ impl MemoryKindResolver for RuleBasedMemoryKindResolver {
             MemoryKind::Preference
         } else if contains_any(&content, &["workflow", "process", "steps", "procedure"]) {
             MemoryKind::WorkflowMemory
-        } else if contains_any(&content, &["fact", "knowledge", "reference", "architecture"]) {
+        } else if contains_any(
+            &content,
+            &["fact", "knowledge", "reference", "architecture"],
+        ) {
             MemoryKind::Knowledge
         } else {
             MemoryKind::Summary
@@ -1347,13 +1359,7 @@ impl MemoryPromotionAdvisor for RuleBasedMemoryPromotionAdvisor {
         }
         if contains_any(
             &lowered,
-            &[
-                "????",
-                "????",
-                "????",
-                "be concise",
-                "shorter answers",
-            ],
+            &["????", "????", "????", "be concise", "shorter answers"],
         ) {
             promotions.push(MemoryPromotionSuggestion {
                 target_layer: MemoryLayer::Global,
@@ -1372,7 +1378,7 @@ impl PromptAssetSynthesizer for DefaultPromptAssetSynthesizer {
         for memory in memories {
             let is_global_preference = memory.kind == MemoryKind::Preference
                 && matches!(memory.layer, Some(MemoryLayer::Global))
-                    || (memory.kind == MemoryKind::Preference && memory.scope == MemoryScope::Global);
+                || (memory.kind == MemoryKind::Preference && memory.scope == MemoryScope::Global);
             if !is_global_preference {
                 continue;
             }
@@ -1448,7 +1454,9 @@ where
             Ok(assets) if !assets.is_empty() => Ok(assets),
             Ok(_) if self.fallback_on_error => self.fallback.synthesize(memories),
             Ok(assets) => Ok(assets),
-            Err(error) if self.fallback_on_error => self.fallback.synthesize(memories).or(Err(error)),
+            Err(error) if self.fallback_on_error => {
+                self.fallback.synthesize(memories).or(Err(error))
+            }
             Err(error) => Err(error),
         }
     }
@@ -1609,10 +1617,7 @@ impl ContextComposer for DefaultContextComposer {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            system_sections.push(format!(
-                "Relevant recalled memory:\n{}",
-                recalled
-            ));
+            system_sections.push(format!("Relevant recalled memory:\n{}", recalled));
         }
 
         if !system_sections.is_empty() {
@@ -1732,7 +1737,9 @@ pub fn generate_with_context_stream_using_synthesizer(
     })
 }
 
-pub fn workspace_namespace_from_memory_namespace(namespace: &MemoryNamespace) -> WorkspaceNamespace {
+pub fn workspace_namespace_from_memory_namespace(
+    namespace: &MemoryNamespace,
+) -> WorkspaceNamespace {
     WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone())
 }
 
@@ -1846,7 +1853,9 @@ pub fn prompt_asset_from_memory(
     asset
 }
 
-pub fn summarize_global_preference(input: &MemoryOrganizationInput) -> Option<(String, MemoryKind)> {
+pub fn summarize_global_preference(
+    input: &MemoryOrganizationInput,
+) -> Option<(String, MemoryKind)> {
     if let Some(name) = detect_assistant_name_preference(&input.content) {
         return Some((
             format!("User prefers the assistant to be called {}.", name),
@@ -1873,13 +1882,7 @@ pub fn summarize_global_preference(input: &MemoryOrganizationInput) -> Option<(S
 
     if contains_any(
         &lowered,
-        &[
-            "????",
-            "????",
-            "????",
-            "be concise",
-            "shorter answers",
-        ],
+        &["????", "????", "????", "be concise", "shorter answers"],
     ) {
         return Some((
             "User prefers concise responses.".to_owned(),
@@ -1950,11 +1953,9 @@ fn pseudo_record_for_room_asset(asset: &MemoryRoomAsset) -> MemoryRecord {
     let mut record = MemoryRecord::new(
         asset.id.clone(),
         memory_scope_for_layer(&asset.layer),
-        asset
-            .owners
-            .first()
-            .cloned()
-            .unwrap_or_else(|| MemoryOwnerRef::new(owner_kind_for_layer(&asset.layer), asset.room_id.clone())),
+        asset.owners.first().cloned().unwrap_or_else(|| {
+            MemoryOwnerRef::new(owner_kind_for_layer(&asset.layer), asset.room_id.clone())
+        }),
         asset.memory_kind.clone(),
         asset.title.clone(),
         asset.summary.clone(),
@@ -2110,18 +2111,29 @@ fn slugify_for_memory(value: &str) -> String {
 }
 
 fn contains_any(content: &str, candidates: &[&str]) -> bool {
-    candidates.iter().any(|candidate| content.contains(candidate))
+    candidates
+        .iter()
+        .any(|candidate| content.contains(candidate))
 }
 
 fn detect_assistant_name_preference(content: &str) -> Option<String> {
-    for marker in ["\u{4f60}\u{4ee5}\u{540e}\u{53eb}", "\u{4ee5}\u{540e}\u{53eb}\u{4f60}", "\u{4ee5}\u{540e}\u{4f60}\u{53eb}", "call you "] {
+    for marker in [
+        "\u{4f60}\u{4ee5}\u{540e}\u{53eb}",
+        "\u{4ee5}\u{540e}\u{53eb}\u{4f60}",
+        "\u{4ee5}\u{540e}\u{4f60}\u{53eb}",
+        "call you ",
+    ] {
         if let Some(rest) = content.split_once(marker).map(|(_, rest)| rest.trim()) {
             let candidate = rest
-                .trim_matches(|character: char| character.is_ascii_punctuation() || character.is_whitespace())
+                .trim_matches(|character: char| {
+                    character.is_ascii_punctuation() || character.is_whitespace()
+                })
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
-                .trim_matches(|character: char| character.is_ascii_punctuation() || character.is_whitespace());
+                .trim_matches(|character: char| {
+                    character.is_ascii_punctuation() || character.is_whitespace()
+                });
             if !candidate.is_empty() {
                 return Some(candidate.to_owned());
             }
@@ -2134,7 +2146,9 @@ fn infer_prompt_asset_kind_from_preference(memory: &RetrievedMemory) -> PromptAs
     let lowered = memory.summary.to_ascii_lowercase();
     if contains_any(
         &lowered,
-        &["concise", "style", "language", "中文", "markdown", "shorter"],
+        &[
+            "concise", "style", "language", "中文", "markdown", "shorter",
+        ],
     ) {
         PromptAssetKind::StyleGuide
     } else if contains_any(
@@ -2220,7 +2234,11 @@ fn prompt_asset_from_llm_item(
     }
     if let Some(memory) = memory {
         for tag in &memory.tags {
-            if !asset.tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+            if !asset
+                .tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(tag))
+            {
                 asset.tags.push(tag.clone());
             }
         }
@@ -2265,7 +2283,10 @@ fn memory_decision_from_llm_output(
     let memory_kind = output.memory_kind.unwrap_or(fallback.memory_kind);
     let mut tags = fallback.tags;
     for tag in output.tags {
-        if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(&tag)) {
+        if !tags
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&tag))
+        {
             tags.push(tag);
         }
     }
@@ -2329,8 +2350,8 @@ mod tests {
         ProviderRegistry,
     };
     use hc_memory::{
-        MemoryKind, MemoryLayer, MemoryOwnerRef, MemoryRoom, MemoryRoomAsset,
-        MemoryRoomAssetKind, MemoryRoomRepository, MemoryVisibility,
+        MemoryKind, MemoryLayer, MemoryOwnerRef, MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind,
+        MemoryRoomRepository, MemoryVisibility,
     };
     use hc_persona::{PersonaKind, PersonaLifecycle, PersonaNamespace, PersonaProfile};
     use std::fs;
@@ -2341,7 +2362,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("honeycomb-{}-{}-{}", name, std::process::id(), nanos))
+        std::env::temp_dir().join(format!(
+            "honeycomb-{}-{}-{}",
+            name,
+            std::process::id(),
+            nanos
+        ))
     }
 
     struct StaticProvider {
@@ -2368,7 +2394,10 @@ mod tests {
             }
         }
 
-        fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse, hc_llm::LlmError> {
+        fn generate(
+            &self,
+            request: &GenerateRequest,
+        ) -> Result<GenerateResponse, hc_llm::LlmError> {
             Ok(GenerateResponse {
                 model: request.model.clone(),
                 message: ChatMessage::new(MessageRole::Assistant, self.response_text.clone()),
@@ -2430,7 +2459,11 @@ mod tests {
         assert!(messages[0].content.contains("Prompt policies"));
         assert!(messages[0].content.contains("Be precise and concise."));
         assert!(messages[0].content.contains("Prompt assets"));
-        assert!(messages[0].content.contains("Prioritize risks and regressions."));
+        assert!(
+            messages[0]
+                .content
+                .contains("Prioritize risks and regressions.")
+        );
         assert!(messages[0].content.contains("Relevant recalled memory"));
         assert!(messages[0].content.contains("Task Summary"));
         assert!(messages[0].content.contains("source=memory_record"));
@@ -2483,7 +2516,8 @@ mod tests {
         let root = unique_temp_dir("context-room-retriever");
         let namespace = MemoryNamespace::new("tenant-a", "user-a");
         let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
-        let room_repository = MemoryRoomRepository::with_namespace(&root, workspace_namespace.clone());
+        let room_repository =
+            MemoryRoomRepository::with_namespace(&root, workspace_namespace.clone());
         let room = MemoryRoom::new(
             "room.task.runtime-refactor.0001",
             MemoryLayer::Task,
@@ -2543,7 +2577,10 @@ mod tests {
             .expect("memory retrieval should succeed");
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].id, "asset.room.task.runtime-refactor.0001.summary");
+        assert_eq!(
+            matches[0].id,
+            "asset.room.task.runtime-refactor.0001.summary"
+        );
         assert_eq!(matches[0].source_kind, "room_compressed");
         assert_eq!(matches[0].kind, MemoryKind::Decision);
 
@@ -2571,8 +2608,14 @@ mod tests {
             );
 
         assert_eq!(request.memory_query.limit, Some(3));
-        assert_eq!(request.system_prompt.as_deref(), Some("Use recalled context"));
-        assert_eq!(request.self_model.as_ref().map(|model| model.role.as_str()), Some("helper"));
+        assert_eq!(
+            request.system_prompt.as_deref(),
+            Some("Use recalled context")
+        );
+        assert_eq!(
+            request.self_model.as_ref().map(|model| model.role.as_str()),
+            Some("helper")
+        );
     }
 
     #[test]
@@ -2596,17 +2639,21 @@ mod tests {
         assert!(path.exists());
 
         let repository = MemoryRoomRepository::with_namespace(&root, namespace);
-        let relative = PathBuf::from("memory/rooms/task/room.task.runtime-refactor.0001/compressed/min.assignment.md");
+        let relative = PathBuf::from(
+            "memory/rooms/task/room.task.runtime-refactor.0001/compressed/min.assignment.md",
+        );
         let loaded = repository
             .read_asset(relative)
             .expect("room memory asset should roundtrip");
 
         assert_eq!(loaded.id, "asset.room.task.runtime-refactor.0001.decision");
         assert_eq!(loaded.memory_kind, MemoryKind::Decision);
-        assert!(loaded
-            .owners
-            .iter()
-            .any(|owner| owner == &MemoryOwnerRef::task("task.demo")));
+        assert!(
+            loaded
+                .owners
+                .iter()
+                .any(|owner| owner == &MemoryOwnerRef::task("task.demo"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2663,30 +2710,31 @@ mod tests {
         assert_eq!(request.room_layer, MemoryLayer::Project);
         assert_eq!(request.memory_kind, MemoryKind::Knowledge);
         assert_eq!(request.visibility, MemoryVisibility::TenantShared);
-        assert!(request
-            .owners
-            .iter()
-            .any(|owner| owner == &MemoryOwnerRef::project("project.honeycomb")));
+        assert!(
+            request
+                .owners
+                .iter()
+                .any(|owner| owner == &MemoryOwnerRef::project("project.honeycomb"))
+        );
         assert!(request.tags.iter().any(|tag| tag == "architecture"));
     }
 
     #[test]
     fn prompt_asset_can_be_derived_from_memory() {
-        let memory = RetrievedMemory::from(&MemoryRecord::new(
-            "memory.global.preference.0001",
-            MemoryScope::Global,
-            MemoryOwnerRef::global(),
-            MemoryKind::Preference,
-            "Writing Preference",
-            "Respond in concise Chinese with markdown when useful.",
-        )
-        .with_tag("style"));
-
-        let asset = prompt_asset_from_memory(
-            &memory,
-            PromptAssetKind::StyleGuide,
-            "User Writing Style",
+        let memory = RetrievedMemory::from(
+            &MemoryRecord::new(
+                "memory.global.preference.0001",
+                MemoryScope::Global,
+                MemoryOwnerRef::global(),
+                MemoryKind::Preference,
+                "Writing Preference",
+                "Respond in concise Chinese with markdown when useful.",
+            )
+            .with_tag("style"),
         );
+
+        let asset =
+            prompt_asset_from_memory(&memory, PromptAssetKind::StyleGuide, "User Writing Style");
 
         assert_eq!(asset.id, memory.id);
         assert_eq!(asset.kind, PromptAssetKind::StyleGuide);
@@ -2754,7 +2802,10 @@ mod tests {
     #[test]
     fn llm_prompt_asset_synthesizer_tolerates_missing_assets_field() {
         let mut registry = ProviderRegistry::new();
-        registry.register(StaticProvider::new("test", r#"{"note":"no prompt assets"}"#));
+        registry.register(StaticProvider::new(
+            "test",
+            r#"{"note":"no prompt assets"}"#,
+        ));
         let synthesizer = LlmPromptAssetSynthesizer::strict(
             &registry,
             ModelRef::new("test", "mock"),
@@ -2806,7 +2857,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert!(messages[0].content.contains("Prompt assets"));
-        assert!(messages[0].content.contains("User prefers responses in Chinese."));
+        assert!(
+            messages[0]
+                .content
+                .contains("User prefers responses in Chinese.")
+        );
     }
 
     #[test]
@@ -2837,18 +2892,24 @@ mod tests {
         assert_eq!(self_model.id, "persona.agent.reviewer");
         assert_eq!(self_model.role, "reviewer");
         assert_eq!(self_model.style.as_deref(), Some("critical and careful"));
-        assert!(self_model
-            .goals
-            .iter()
-            .any(|goal| goal == "Find regressions quickly"));
-        assert!(self_model
-            .capabilities
-            .iter()
-            .any(|capability| capability.name == "Code Review"));
-        assert!(self_model
-            .constraints
-            .iter()
-            .any(|constraint| constraint.description.contains("Avoid inventing behavior")));
+        assert!(
+            self_model
+                .goals
+                .iter()
+                .any(|goal| goal == "Find regressions quickly")
+        );
+        assert!(
+            self_model
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "Code Review")
+        );
+        assert!(
+            self_model
+                .constraints
+                .iter()
+                .any(|constraint| constraint.description.contains("Avoid inventing behavior"))
+        );
     }
 
     #[test]
@@ -2883,7 +2944,6 @@ mod tests {
         assert_eq!(summary.1, MemoryKind::Preference);
     }
 
-
     #[test]
     fn llm_memory_organizer_prefers_llm_output() {
         let mut registry = ProviderRegistry::new();
@@ -2898,12 +2958,10 @@ mod tests {
             RuleBasedMemoryPromotionAdvisor,
         );
         let organizer = LlmMemoryOrganizer::new(&registry, ModelRef::new("test", "mock"), fallback);
-        let input = MemoryOrganizationInput::new(
-            MemoryNamespace::new("local", "default"),
-            "??????",
-        )
-        .with_room_hint("room.chat.local.default.1", MemoryLayer::Chat)
-        .with_owner(MemoryOwnerRef::session("room.chat.local.default.1"));
+        let input =
+            MemoryOrganizationInput::new(MemoryNamespace::new("local", "default"), "??????")
+                .with_room_hint("room.chat.local.default.1", MemoryLayer::Chat)
+                .with_owner(MemoryOwnerRef::session("room.chat.local.default.1"));
 
         let decision = organizer
             .organize(&input)
@@ -2926,21 +2984,15 @@ mod tests {
             "test",
             r#"{"summary":"User prefers the assistant to be called 小八.","memory_kind":"preference"}"#,
         ));
-        let input = MemoryOrganizationInput::new(
-            MemoryNamespace::new("local", "default"),
-            "你以后叫小八",
-        );
+        let input =
+            MemoryOrganizationInput::new(MemoryNamespace::new("local", "default"), "你以后叫小八");
 
-        let summary = summarize_global_preference_with_llm(
-            &registry,
-            &ModelRef::new("test", "mock"),
-            &input,
-        )
-        .expect("llm summary should succeed")
-        .expect("summary should be present");
+        let summary =
+            summarize_global_preference_with_llm(&registry, &ModelRef::new("test", "mock"), &input)
+                .expect("llm summary should succeed")
+                .expect("summary should be present");
 
         assert_eq!(summary.1, MemoryKind::Preference);
         assert!(summary.0.contains("小八"));
     }
-
 }

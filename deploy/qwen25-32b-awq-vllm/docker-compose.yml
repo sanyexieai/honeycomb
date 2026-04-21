@@ -1,0 +1,42 @@
+# Qwen2.5-32B-Instruct (AWQ 4-bit) via vLLM OpenAI-compatible API
+# Prereq: NVIDIA driver + NVIDIA Container Toolkit; docker compose v2.
+#
+# Usage:
+#   cd deploy/qwen25-32b-awq-vllm
+#   docker compose up -d
+# API: http://127.0.0.1:8000/v1/chat/completions  (OpenAI-compatible)
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    ipc: host
+    shm_size: "4gb"
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      # Optional; HF hub accepts either name
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    gpus: all
+    command:
+      - --model
+      - Qwen/Qwen2.5-32B-Instruct-AWQ
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      # Lower if OOM (KV grows with length × concurrency). Try 32768 only if stable on your VRAM.
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-16384}"
+      - --gpu-memory-utilization
+      - "${GPU_MEMORY_UTILIZATION:-0.92}"
+      # Safer defaults on single 32GB GPU; tune after smoke tests.
+      - --max-num-seqs
+      - "${MAX_NUM_SEQS:-8}"
+
+volumes:
+  hf-cache:

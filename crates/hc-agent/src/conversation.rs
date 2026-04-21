@@ -66,10 +66,7 @@ pub struct ConversationParticipant {
 }
 
 impl ConversationParticipant {
-    pub fn user(
-        participant_ref: impl Into<String>,
-        display_name: impl Into<String>,
-    ) -> Self {
+    pub fn user(participant_ref: impl Into<String>, display_name: impl Into<String>) -> Self {
         Self {
             participant_ref: participant_ref.into(),
             kind: ConversationParticipantKind::User,
@@ -160,11 +157,7 @@ impl ChannelConversation {
         }
     }
 
-    pub fn open_turn(
-        &mut self,
-        message_id: impl Into<String>,
-        activity_at_ms: u64,
-    ) {
+    pub fn open_turn(&mut self, message_id: impl Into<String>, activity_at_ms: u64) {
         self.turn_state = ConversationTurnState::Open;
         let message_id = message_id.into();
         self.active_message_id = Some(message_id.clone());
@@ -227,7 +220,10 @@ mod tests {
 
         assert_eq!(conversation.status, ConversationStatus::Active);
         assert_eq!(conversation.turn_state, ConversationTurnState::Resolved);
-        assert_eq!(conversation.last_message_id.as_deref(), Some("message.0001"));
+        assert_eq!(
+            conversation.last_message_id.as_deref(),
+            Some("message.0001")
+        );
         assert!(conversation.active_message_id.is_none());
         assert_eq!(conversation.last_activity_at_ms, 140);
     }
