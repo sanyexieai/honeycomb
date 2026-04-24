@@ -1744,6 +1744,7 @@ dependencies = [
  "hc-persona",
  "hc-store",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 

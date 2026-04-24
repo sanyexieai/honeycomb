@@ -385,17 +385,27 @@ The key boundary is:
 - `hc-context` owns the organization policy plug points
 - callers such as `hc-context-cli` and `hc-agent` choose which strategy implementation to use
 
-## Prompt As Special Memory
+## Prompt As Compiled Memory
 
-Prompt material should not be treated as exactly the same thing as factual memory, but it should pass through the same context assembly stage.
+Prompt material should not be modeled as a foreign system outside memory.
+It is better treated as a later-stage, execution-oriented form of memory.
 
-Use three distinct inputs when composing a model request:
+Use three distinct runtime inputs when composing a model request:
 
-- `PromptPolicy`: hard or semi-hard runtime instructions
-- `PromptAsset`: reusable prompt fragments such as style guides, reviewer behavior templates, or output contracts
-- recalled memory: facts, decisions, preferences, workflow notes, and room summaries
+- hard runtime policy
+- compiled prompt assets
+- recalled memory
 
-This allows Honeycomb to treat some long-lived prompts as a special kind of memory asset without collapsing system policy and factual memory into one type.
+In storage and lifecycle terms, prompt assets should be derived from the same broader memory graph:
+
+- raw memory captures source material
+- extracted memory captures structure
+- generalized memory captures stable reuse
+- compiled memory captures directly injectable guidance
+
+This keeps prompt execution and memory provenance aligned without forcing runtime composition into one flattened blob.
+
+See also: `docs/memory-prompt-unification.md`
 
 ## Self Model Layer
 

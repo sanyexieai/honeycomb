@@ -1,15 +1,15 @@
 {
-  "generated_at_ms": 1776744420106,
+  "generated_at_ms": 1777012806132,
   "namespace": {
     "tenant_id": "local",
     "user_id": "default"
   },
   "documents": [
     {
-      "id": "asset.room.chat.local.default.1776698674836.turn.1.user",
+      "id": "asset.room.chat.local.default.1777012788269.turn.1.user",
       "doc_type": "memory_room_asset",
-      "title": "User Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776698674836/raw/turn.0001.user.md",
+      "title": "User Message 1",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777012788269/raw/0001.user-message.md",
       "tags": [
         "chat",
         "user"
@@ -21,15 +21,17 @@
       "created_at": null,
       "updated_at": null,
       "relations": [],
-      "owners": [],
+      "owners": [
+        "room.chat.local.default.1777012788269"
+      ],
       "capabilities": [],
-      "body_preview": "# User Turn 1 你好 ## Owners - Session: room.chat.local.default.1776698674836 ## Derived From - none ## Source Docs - none"
+      "body_preview": "你好"
     },
     {
-      "id": "room.chat.local.default.1776698674836",
+      "id": "room.chat.local.default.1777012788269",
       "doc_type": "memory_room",
       "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776698674836/room.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777012788269/room.md",
       "tags": [
         "chat",
         "interactive"
@@ -43,14 +45,16 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
+      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Manifest - room: room.chat.local.default.1777012788269 - layer: chat -..."
     },
     {
-      "id": "asset.room.chat.local.default.1776698953013.turn.1.user",
+      "id": "asset.room.chat.local.default.1777012788269.timeline",
       "doc_type": "memory_room_asset",
-      "title": "User Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776698953013/raw/turn.0001.user.md",
+      "title": "Chat Room | local / default Timeline",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777012788269/timeline.md",
       "tags": [
+        "timeline",
+        "event",
         "chat",
         "user"
       ],
@@ -63,471 +67,28 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "body_preview": "# User Turn 1 你好 ## Owners - Session: room.chat.local.default.1776698953013 ## Derived From - none ## Source Docs - none"
+      "body_preview": "### Created - event: event.asset.room.chat.local.default.1777012788269.turn.1.user.created.1777012806131 - artifact: asset.room.chat.local.default.1777012788269..."
     },
     {
-      "id": "room.chat.local.default.1776698953013",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776698953013/room.md",
+      "id": "prompt.organizer.memory",
+      "doc_type": "prompt_template",
+      "title": "Memory Organizer",
+      "relative_path": "prompts/organizer/memory-organizer.md",
       "tags": [
-        "chat",
-        "interactive"
-      ],
-      "status": "active",
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699148943.turn.1.assistant",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/compressed/turn.0001.assistant.md",
-      "tags": [
-        "chat",
-        "assistant"
+        "memory",
+        "organizer",
+        "routing"
       ],
       "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
       "created_at": null,
       "updated_at": null,
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "body_preview": "# Assistant Turn 1 <think>用户用中文说\"你好\"，意思是\"Hello\"或\"Hi\"。 从记忆来看，这似乎是一个新的对话开始。之前的记忆片段显示之前有人打过\"你好\"，但那可能是不同对话或同一对话的不同部分。 我应该用中文友好地回应，介绍自己，并询问有什么可以帮助的。</think> 你好！很高兴见到..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699148943.turn.2.assistant",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 2",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/compressed/turn.0002.assistant.md",
-      "tags": [
-        "chat",
-        "assistant"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 2 <think>The user is asking me to change my name from \"月光宝盒\" to \"小八\". I should acknowledge this and let them know I'll respond to that name goi..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699148943.turn.2.assistant.wenyan",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 2 Wenyan",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/literary/turn.0002.assistant.wenyan.md",
-      "tags": [
-        "chat",
-        "assistant",
-        "wenyan"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 2 Wenyan <think>The user is speaking in Chinese, asking to call them \"小八\" (Xiao Ba), and asking if there's anything they can help with. The ins..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699148943.turn.1.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/raw/turn.0001.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# User Turn 1 你好 ## Owners - Session: room.chat.local.default.1776699148943 ## Derived From - none ## Source Docs - none"
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699148943.turn.2.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Turn 2",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/raw/turn.0002.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# User Turn 2 你以后叫小八 ## Owners - Session: room.chat.local.default.1776699148943 ## Derived From - none ## Source Docs - none"
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699148943.turn.3.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Turn 3",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/raw/turn.0003.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# User Turn 3 你以后叫小八 ## Owners - Session: room.chat.local.default.1776699148943 ## Derived From - none ## Source Docs - none"
-    },
-    {
-      "id": "room.chat.local.default.1776699148943",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699148943/room.md",
-      "tags": [
-        "chat",
-        "interactive"
-      ],
-      "status": "active",
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699766796.turn.1.assistant",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699766796/compressed/turn.0001.assistant.md",
-      "tags": [
-        "chat",
-        "assistant"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 1 <think>The user is telling me that my name should be \"小八\" (Xiao Ba) from now on. This is a simple instruction to change my name. Looking at t..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699766796.turn.1.assistant.wenyan",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1 Wenyan",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699766796/literary/turn.0001.assistant.wenyan.md",
-      "tags": [
-        "chat",
-        "assistant",
-        "wenyan"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 1 Wenyan <think>The user is speaking in Chinese and is telling me that from now on, I should call them \"小八\" (Xiao Ba - Little Eight). They're a..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776699766796.turn.1.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699766796/raw/turn.0001.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# User Turn 1 你以后叫小八 ## Owners - Session: room.chat.local.default.1776699766796 ## Derived From - none ## Source Docs - none"
-    },
-    {
-      "id": "room.chat.local.default.1776699766796",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776699766796/room.md",
-      "tags": [
-        "chat",
-        "interactive"
-      ],
-      "status": "active",
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
-    },
-    {
-      "id": "room.chat.local.default.1776700242744",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700242744/room.md",
-      "tags": [
-        "chat",
-        "interactive"
-      ],
-      "status": "active",
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776700250517.turn.1.assistant",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700250517/compressed/turn.0001.assistant.md",
-      "tags": [
-        "chat",
-        "assistant"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 1 <think>The user is asking me what my name is in Chinese (\"你好 你叫什么\" = \"Hello, what is your name?\"). Based on the global preference I retrieved..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776700250517.turn.1.assistant.wenyan",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1 Wenyan",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700250517/literary/turn.0001.assistant.wenyan.md",
-      "tags": [
-        "chat",
-        "assistant",
-        "wenyan"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 1 Wenyan <think>The user is speaking Chinese and introducing themselves as \"小八\" (Xiao Ba) with a rabbit emoji. They're asking what they can hel..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776700250517.turn.1.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700250517/raw/turn.0001.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# User Turn 1 你好 你叫什么 ## Owners - Session: room.chat.local.default.1776700250517 ## Derived From - none ## Source Docs - none"
-    },
-    {
-      "id": "room.chat.local.default.1776700250517",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700250517/room.md",
-      "tags": [
-        "chat",
-        "interactive"
-      ],
-      "status": "active",
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776700677144.turn.1.assistant",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700677144/compressed/turn.0001.assistant.md",
-      "tags": [
-        "chat",
-        "assistant"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 1 <think>The user said \"你好\" which means \"Hello\" in Chinese. This is a simple greeting. I should respond in a friendly way in Chinese. Based on ..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776700677144.turn.1.assistant.wenyan",
-      "doc_type": "memory_room_asset",
-      "title": "Assistant Turn 1 Wenyan",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700677144/literary/turn.0001.assistant.wenyan.md",
-      "tags": [
-        "chat",
-        "assistant",
-        "wenyan"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Assistant Turn 1 Wenyan <think>The user is greeting me in Chinese with \"你好呀！😊 有什么我可以帮你的吗？\" which means \"Hello! 😊 Is there anything I can help you with?\" The s..."
-    },
-    {
-      "id": "asset.room.chat.local.default.1776700677144.turn.1.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Turn 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700677144/raw/turn.0001.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# User Turn 1 你好 ## Owners - Session: room.chat.local.default.1776700677144 ## Derived From - none ## Source Docs - none"
-    },
-    {
-      "id": "room.chat.local.default.1776700677144",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1776700677144/room.md",
-      "tags": [
-        "chat",
-        "interactive"
-      ],
-      "status": "active",
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Related Entities - none ## Relations - none ## Source Docs - none ## D..."
-    },
-    {
-      "id": "asset.room.global.local.default.chat",
-      "doc_type": "memory_room_asset",
-      "title": "Global Preference",
-      "relative_path": "memory/rooms/global/room.global.local.default/compressed/pref.chat.md",
-      "tags": [
-        "global",
-        "preference"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Global Preference chat ## Owners - Global: global ## Derived From - room.chat.local.default.1776700677144 ## Source Docs - none"
-    },
-    {
-      "id": "asset.room.global.local.default.the.user.prefers.to.address.the.assistant.as.xiao.ba",
-      "doc_type": "memory_room_asset",
-      "title": "Global Preference",
-      "relative_path": "memory/rooms/global/room.global.local.default/compressed/pref.the.user.prefers.to.address.the.assistant.as.xiao.ba.md",
-      "tags": [
-        "global",
-        "preference"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "body_preview": "# Global Preference The user prefers to address the assistant as 小八 (Xiao Ba) ## Owners - Global: global ## Derived From - room.chat.local.default.1776699766796..."
+      "body_preview": "Decide how to organize this memory write. Honor any explicit `room_id_hint`, `room_layer_hint`, `owner`, `visibility`, and existing `tags` when they are present..."
     }
   ]
 }

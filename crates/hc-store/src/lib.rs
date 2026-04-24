@@ -256,6 +256,24 @@ pub mod store {
             Ok(path)
         }
 
+        pub fn write_text_in_namespace(
+            &self,
+            namespace: &WorkspaceNamespace,
+            relative_path: impl AsRef<Path>,
+            body: &str,
+        ) -> Result<PathBuf> {
+            let path = self.resolve_in_namespace(namespace, relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent directory {}", parent.display())
+                })?;
+            }
+
+            fs::write(&path, body)
+                .with_context(|| format!("failed to write markdown file {}", path.display()))?;
+            Ok(path)
+        }
+
         pub fn read_markdown<T: DeserializeOwned>(
             &self,
             relative_path: impl AsRef<Path>,
@@ -312,13 +330,22 @@ pub mod store {
                 let path = namespace_root.join(&relative_path);
                 let content = fs::read_to_string(&path)
                     .with_context(|| format!("failed to read markdown file {}", path.display()))?;
-                let stored = parse_markdown_document::<Value>(&content)
-                    .with_context(|| format!("failed to parse markdown file {}", path.display()))?;
-                documents.push(build_index_entry(
-                    &relative_path,
-                    stored.frontmatter,
-                    &stored.body,
-                )?);
+                if content.starts_with("---\n") {
+                    let stored = parse_markdown_document::<Value>(&content).with_context(|| {
+                        format!("failed to parse markdown file {}", path.display())
+                    })?;
+                    documents.push(build_index_entry(
+                        &relative_path,
+                        stored.frontmatter,
+                        &stored.body,
+                    )?);
+                } else {
+                    documents.push(
+                        build_plain_index_entry(&path, &relative_path, &content).with_context(
+                            || format!("failed to index plain markdown file {}", path.display()),
+                        )?,
+                    );
+                }
             }
 
             let index = MarkdownIndex {
@@ -451,6 +478,103 @@ pub mod store {
             capabilities: string_list_field(mapping, "capabilities"),
             body_preview: preview_text(body, 160),
         })
+    }
+
+    fn build_plain_index_entry(
+        absolute_path: &Path,
+        relative_path: &Path,
+        body: &str,
+    ) -> Result<MarkdownIndexEntry> {
+        let normalized = normalized_path(relative_path);
+        let sidecar = read_plain_markdown_sidecar(absolute_path)?;
+        let id = required_json_string_field(&sidecar, "id")?;
+        let doc_type = required_json_string_field(&sidecar, "type")?;
+        let title = optional_json_string_field(&sidecar, "title")
+            .or_else(|| title_from_body(body))
+            .or_else(|| {
+                relative_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.replace(['-', '_', '.'], " "))
+            })
+            .unwrap_or_else(|| id.clone());
+
+        Ok(MarkdownIndexEntry {
+            id,
+            doc_type,
+            title,
+            relative_path: normalized,
+            tags: json_string_list_field(&sidecar, "tags").unwrap_or_default(),
+            status: optional_json_string_field(&sidecar, "status"),
+            visibility: optional_json_string_field(&sidecar, "visibility"),
+            tenant_id: optional_json_string_field(&sidecar, "tenant_id"),
+            user_id: optional_json_string_field(&sidecar, "user_id"),
+            created_at: None,
+            updated_at: None,
+            relations: Vec::new(),
+            owners: json_owner_list_field(&sidecar, "owners").unwrap_or_default(),
+            capabilities: Vec::new(),
+            body_preview: preview_text(body, 160),
+        })
+    }
+
+    fn read_plain_markdown_sidecar(absolute_path: &Path) -> Result<serde_json::Value> {
+        let file_name = absolute_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("plain markdown path is missing a valid file name"))?;
+        let sidecar_name = format!("{}.meta.json", file_name.trim_end_matches(".md"));
+        let sidecar_path = absolute_path.with_file_name(sidecar_name);
+        let content = fs::read_to_string(&sidecar_path).with_context(|| {
+            format!("failed to read sidecar metadata {}", sidecar_path.display())
+        })?;
+        serde_json::from_str(&content).with_context(|| {
+            format!("failed to parse sidecar metadata {}", sidecar_path.display())
+        })
+    }
+
+    fn optional_json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+        value.get(field).and_then(|value| match value {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            serde_json::Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+    }
+
+    fn required_json_string_field(value: &serde_json::Value, field: &str) -> Result<String> {
+        optional_json_string_field(value, field)
+            .ok_or_else(|| anyhow::anyhow!("plain markdown sidecar is missing required field `{field}`"))
+    }
+
+    fn json_string_list_field(value: &serde_json::Value, field: &str) -> Option<Vec<String>> {
+        Some(
+            value
+                .get(field)?
+                .as_array()?
+                .iter()
+                .filter_map(|entry| match entry {
+                    serde_json::Value::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    fn json_owner_list_field(value: &serde_json::Value, field: &str) -> Option<Vec<String>> {
+        Some(
+            value
+                .get(field)?
+                .as_array()?
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .collect(),
+        )
     }
 
     fn apply_query(

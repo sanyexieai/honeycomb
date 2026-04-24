@@ -1,8 +1,9 @@
 use hc_memory::{
-    MemoryCatalog, MemoryEntityKind, MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace,
-    MemoryOwnerRef, MemoryQuery, MemoryRecord, MemoryRelation, MemoryRelationKind,
-    MemoryRepository, MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository,
-    MemoryScope, MemoryVisibility,
+    ArtifactConsumer, ArtifactDraft, ArtifactEvolutionAction, ArtifactEvolutionEvent,
+    MaterializationKind, MemoryAssetForm, MemoryAssetStage, MemoryCatalog, MemoryEntityKind,
+    MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerRef, MemoryQuery,
+    MemoryRecord, MemoryRelation, MemoryRelationKind, MemoryRepository, MemoryRoom,
+    MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope, MemoryVisibility,
 };
 use hc_store::store::WorkspaceNamespace;
 use std::fs;
@@ -335,6 +336,12 @@ fn memory_room_repository_builds_expected_asset_paths() {
         "memory/rooms/topic/room.topic.streaming.0001/literary/wenyan.0001.md"
     );
     assert_eq!(
+        MemoryRoomRepository::prompt_doc_relative_path(&room, "prompt.style.md")
+            .to_string_lossy()
+            .replace('\\', "/"),
+        "memory/rooms/topic/room.topic.streaming.0001/prompt/prompt.style.md"
+    );
+    assert_eq!(
         MemoryRoomRepository::facts_relative_path(&room)
             .to_string_lossy()
             .replace('\\', "/"),
@@ -406,6 +413,8 @@ fn memory_room_repository_roundtrips_compressed_assets() {
     assert_eq!(loaded.room_id, asset.room_id);
     assert_eq!(loaded.kind, MemoryRoomAssetKind::Compressed);
     assert_eq!(loaded.memory_kind, MemoryKind::Decision);
+    assert_eq!(loaded.stage, MemoryAssetStage::Generalized);
+    assert_eq!(loaded.form, MemoryAssetForm::Summary);
     assert_eq!(loaded.summary, asset.summary);
     assert!(loaded.tags.iter().any(|value| value == "runtime"));
     assert!(
@@ -420,6 +429,357 @@ fn memory_room_repository_roundtrips_compressed_assets() {
         .expect("compressed assets should be listed");
     assert_eq!(compressed_assets.len(), 1);
     assert_eq!(compressed_assets[0].id, asset.id);
+
+    let indexed_room = repository
+        .read_room(MemoryRoomRepository::relative_path_for(&room))
+        .expect("room should be readable after writing asset");
+    assert!(
+        indexed_room
+            .derived_docs
+            .iter()
+            .any(|value| value == "compressed/min.0001.summary.md")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn memory_room_repository_indexes_raw_assets_as_sources() {
+    let root = unique_temp_dir("memory-room-source-index");
+    let repository = MemoryRoomRepository::with_namespace(
+        &root,
+        WorkspaceNamespace::new("tenant-demo", "user-demo"),
+    );
+    let room = MemoryRoom::new(
+        "room.chat.local.default.0001",
+        MemoryLayer::Chat,
+        "Chat Room",
+        "Interactive chat transcript and compressed reply memory.",
+    )
+    .with_namespace(MemoryNamespace::new("tenant-demo", "user-demo"));
+    repository
+        .write_room(&room)
+        .expect("memory room should be written");
+
+    let asset = MemoryRoomAsset::new(
+        "asset.room.chat.local.default.0001.turn.1.user",
+        room.id.clone(),
+        "0001.user-message.md",
+        MemoryLayer::Chat,
+        MemoryRoomAssetKind::Raw,
+        "User Message 1",
+        "Please summarize the runtime refactor tradeoffs.",
+    )
+    .with_namespace(MemoryNamespace::new("tenant-demo", "user-demo"))
+    .with_memory_kind(MemoryKind::Knowledge)
+    .with_owner(MemoryOwnerRef::session(room.id.clone()))
+    .with_tag("chat")
+    .with_tag("user");
+
+    repository
+        .write_asset(&room, &asset)
+        .expect("raw room asset should be written");
+
+    let indexed_room = repository
+        .read_room(MemoryRoomRepository::relative_path_for(&room))
+        .expect("room should be readable after writing raw asset");
+    assert!(
+        indexed_room
+            .source_docs
+            .iter()
+            .any(|value| value == "raw/0001.user-message.md")
+    );
+    assert_eq!(
+        indexed_room
+            .source_docs
+            .iter()
+            .filter(|value| *value == "raw/0001.user-message.md")
+            .count(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn memory_room_repository_writes_evolution_events_to_timeline() {
+    let root = unique_temp_dir("memory-room-timeline");
+    let repository = MemoryRoomRepository::with_namespace(
+        &root,
+        WorkspaceNamespace::new("tenant-demo", "user-demo"),
+    );
+    let room = MemoryRoom::new(
+        "room.tool.rg",
+        MemoryLayer::Project,
+        "RG Tool Room",
+        "Reusable rg search guidance.",
+    )
+    .with_namespace(MemoryNamespace::new("tenant-demo", "user-demo"))
+    .with_tag("tool")
+    .with_tag("rg");
+    repository
+        .write_room(&room)
+        .expect("memory room should be written");
+
+    let event = ArtifactEvolutionEvent::new(
+        "event.asset.room.tool.rg.recipe.promoted.1",
+        "asset.room.tool.rg.recipe",
+        room.id.clone(),
+        ArtifactEvolutionAction::Promoted,
+        "eligible for promotion to compiled guidance",
+    )
+    .with_input("execution_succeeded")
+    .with_output("promote_to:compiled")
+    .with_tag("tool")
+    .with_tag("rg")
+    .with_created_at_ms(1234);
+
+    let path = repository
+        .write_evolution_event(&room, &event)
+        .expect("timeline event should be written");
+    assert!(path.exists());
+    assert!(path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .ends_with("memory/rooms/project/room.tool.rg/timeline.md"));
+
+    let contents = fs::read_to_string(&path).expect("timeline contents should be readable");
+    assert!(contents.contains("event.asset.room.tool.rg.recipe.promoted.1"));
+    assert!(contents.contains("eligible for promotion to compiled guidance"));
+    assert!(contents.contains("promote_to:compiled"));
+
+    let indexed_room = repository
+        .read_room(MemoryRoomRepository::relative_path_for(&room))
+        .expect("room should be readable after writing timeline event");
+    assert!(
+        indexed_room
+            .derived_docs
+            .iter()
+            .any(|value| value == "timeline.md")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn memory_room_repository_materializes_evolution_events_with_metadata() {
+    let root = unique_temp_dir("memory-room-materialize-event");
+    let repository = MemoryRoomRepository::with_namespace(
+        &root,
+        WorkspaceNamespace::new("tenant-demo", "user-demo"),
+    );
+    let room = MemoryRoom::new(
+        "room.tool.cargo-test",
+        MemoryLayer::Project,
+        "Cargo Test Tool Room",
+        "Reusable cargo test guidance.",
+    )
+    .with_namespace(MemoryNamespace::new("tenant-demo", "user-demo"));
+    repository
+        .write_room(&room)
+        .expect("memory room should be written");
+
+    let event = ArtifactEvolutionEvent::new(
+        "event.asset.room.tool.cargo-test.recipe.promoted.1",
+        "asset.room.tool.cargo-test.recipe",
+        room.id.clone(),
+        ArtifactEvolutionAction::Promoted,
+        "eligible for promotion to compiled guidance",
+    );
+
+    let materialized = repository
+        .materialize_evolution_event(&room, &event)
+        .expect("evolution event should materialize");
+
+    assert_eq!(materialized.kind, MaterializationKind::EvolutionEvent);
+    assert_eq!(materialized.room_id, room.id);
+    assert_eq!(materialized.room_relative_path, "timeline.md");
+    assert!(materialized.path.exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn room_asset_preference_maps_to_policy_form() {
+    let asset = MemoryRoomAsset::new(
+        "asset.room.global.local.default.pref-language",
+        "room.global.local.default",
+        "pref.language.md",
+        MemoryLayer::Global,
+        MemoryRoomAssetKind::Compressed,
+        "Language Preference",
+        "User prefers responses in Chinese.",
+    )
+    .with_memory_kind(MemoryKind::Preference);
+
+    assert_eq!(asset.stage, MemoryAssetStage::Generalized);
+    assert_eq!(asset.form, MemoryAssetForm::Policy);
+}
+
+#[test]
+fn memory_room_asset_can_be_built_from_artifact_draft() {
+    let draft = ArtifactDraft::new(
+        "room.task.runtime-refactor.0001",
+        MemoryLayer::Task,
+        MemoryRoomAssetKind::Compressed,
+        "Runtime Refactor Policy",
+        "Prefer keeping runtime ownership boundaries explicit.",
+    )
+    .with_memory_kind(MemoryKind::Preference)
+    .with_stage(MemoryAssetStage::Compiled)
+    .with_form(MemoryAssetForm::Prompt)
+    .with_visibility(MemoryVisibility::TenantShared)
+    .with_tag("runtime")
+    .with_owner(MemoryOwnerRef::task("task.runtime-refactor.0001"))
+    .with_consumer(ArtifactConsumer::PromptComposer)
+    .with_derived_from("asset.room.task.runtime-refactor.0001.summary")
+    .with_source_doc("prompts/runtime-refactor.md")
+    .with_file_name("prompt.runtime-refactor.md");
+
+    let asset = MemoryRoomAsset::from_draft(
+        "asset.room.task.runtime-refactor.0001.prompt",
+        MemoryNamespace::new("tenant-demo", "user-demo"),
+        draft,
+    );
+
+    assert_eq!(asset.id, "asset.room.task.runtime-refactor.0001.prompt");
+    assert_eq!(asset.room_id, "room.task.runtime-refactor.0001");
+    assert_eq!(asset.file_name, "prompt.runtime-refactor.md");
+    assert_eq!(asset.memory_kind, MemoryKind::Preference);
+    assert_eq!(asset.stage, MemoryAssetStage::Compiled);
+    assert_eq!(asset.form, MemoryAssetForm::Prompt);
+    assert_eq!(asset.visibility, MemoryVisibility::TenantShared);
+    assert_eq!(asset.namespace, MemoryNamespace::new("tenant-demo", "user-demo"));
+    assert!(asset.tags.iter().any(|tag| tag == "runtime"));
+    assert!(
+        asset
+            .owners
+            .iter()
+            .any(|owner| owner == &MemoryOwnerRef::task("task.runtime-refactor.0001"))
+    );
+    assert!(
+        asset
+            .derived_from
+            .iter()
+            .any(|source| source == "asset.room.task.runtime-refactor.0001.summary")
+    );
+    assert!(
+        asset
+            .source_docs
+            .iter()
+            .any(|doc| doc == "prompts/runtime-refactor.md")
+    );
+}
+
+#[test]
+fn memory_room_repository_writes_artifact_drafts() {
+    let root = unique_temp_dir("memory-room-draft-repo");
+    let repository = MemoryRoomRepository::with_namespace(
+        &root,
+        WorkspaceNamespace::new("tenant-demo", "user-demo"),
+    );
+    let room = MemoryRoom::new(
+        "room.project.honeycomb",
+        MemoryLayer::Project,
+        "Honeycomb Project Room",
+        "Project-level architecture and conventions.",
+    )
+    .with_namespace(MemoryNamespace::new("tenant-demo", "user-demo"));
+    repository
+        .write_room(&room)
+        .expect("memory room should be written");
+
+    let draft = ArtifactDraft::new(
+        room.id.clone(),
+        MemoryLayer::Project,
+        MemoryRoomAssetKind::Compressed,
+        "Architecture Prompt Memory",
+        "Preserve layer boundaries when adding new runtime abstractions.",
+    )
+    .with_memory_kind(MemoryKind::WorkflowMemory)
+    .with_stage(MemoryAssetStage::Compiled)
+    .with_form(MemoryAssetForm::Prompt)
+    .with_tag("architecture")
+    .with_tag("project")
+    .with_consumer(ArtifactConsumer::PromptComposer)
+    .with_owner(MemoryOwnerRef::project(room.id.clone()))
+    .with_file_name("prompt.architecture.md");
+
+    let path = repository
+        .write_artifact_draft(
+            &room,
+            "asset.room.project.honeycomb.prompt.architecture",
+            draft,
+        )
+        .expect("artifact draft should be written");
+    assert!(path.exists());
+    assert!(path.to_string_lossy().replace('\\', "/").contains(
+        "memory/rooms/project/room.project.honeycomb/prompt/prompt.architecture.md"
+    ));
+
+    let root_relative = path
+        .strip_prefix(&root)
+        .expect("asset path should be under repo root")
+        .to_path_buf();
+    let relative = root_relative
+        .strip_prefix(repository.namespace().scoped_prefix())
+        .expect("asset path should be relative to namespace root")
+        .to_path_buf();
+    let loaded = repository
+        .read_asset(relative)
+        .expect("artifact draft should roundtrip through asset loading");
+
+    assert_eq!(loaded.id, "asset.room.project.honeycomb.prompt.architecture");
+    assert_eq!(loaded.file_name, "prompt.architecture.md");
+    assert_eq!(loaded.stage, MemoryAssetStage::Compiled);
+    assert_eq!(loaded.form, MemoryAssetForm::Prompt);
+    assert_eq!(loaded.memory_kind, MemoryKind::WorkflowMemory);
+    assert!(loaded.tags.iter().any(|tag| tag == "architecture"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn memory_room_repository_materializes_artifact_drafts_with_metadata() {
+    let root = unique_temp_dir("memory-room-materialize-draft");
+    let repository = MemoryRoomRepository::with_namespace(
+        &root,
+        WorkspaceNamespace::new("tenant-demo", "user-demo"),
+    );
+    let room = MemoryRoom::new(
+        "room.project.materialization",
+        MemoryLayer::Project,
+        "Materialization Room",
+        "Tracks artifact materialization.",
+    )
+    .with_namespace(MemoryNamespace::new("tenant-demo", "user-demo"));
+    repository
+        .write_room(&room)
+        .expect("memory room should be written");
+
+    let draft = ArtifactDraft::new(
+        room.id.clone(),
+        MemoryLayer::Project,
+        MemoryRoomAssetKind::Compressed,
+        "Prompt Contract",
+        "Return compact markdown sections.",
+    )
+    .with_stage(MemoryAssetStage::Compiled)
+    .with_form(MemoryAssetForm::Prompt)
+    .with_file_name("prompt.contract.md");
+
+    let materialized = repository
+        .materialize_artifact_draft(
+            &room,
+            "asset.room.project.materialization.prompt.contract",
+            draft,
+        )
+        .expect("artifact draft should materialize");
+
+    assert_eq!(materialized.kind, MaterializationKind::Draft);
+    assert_eq!(materialized.room_id, room.id);
+    assert_eq!(materialized.room_relative_path, "prompt/prompt.contract.md");
+    assert!(materialized.path.exists());
 
     let _ = fs::remove_dir_all(root);
 }

@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::mpsc,
     thread,
     time::{Duration, UNIX_EPOCH},
@@ -10,23 +11,34 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_context::{
+    DefaultToolExecutionBinder, EvaluationSignal, GeneralizationPolicy, PromotionRule,
+    RetirementRule, ToolExecutionOutcome, build_tool_execution_plan_from_assets,
     CompositeMemoryOrganizer, ContextMemoryQuery, ContextRequest, DefaultContextComposer,
     DefaultPromptAssetSynthesizer, KeywordMemoryTagSuggester, LlmMemoryOrganizer,
-    LlmPromptAssetSynthesizer, MemoryOrganizationInput, MemoryOrganizer, PromptAssetSynthesizer,
-    PromptPolicy, RuleBasedMemoryKindResolver, RuleBasedMemoryPromotionAdvisor,
-    RuleBasedMemoryRoomRouter, WorkspaceMemoryRetriever, default_workspace_root,
-    generate_with_context_stream_using_synthesizer, generate_with_context_using_synthesizer,
-    persist_room_memory, room_memory_write_request_from_response, summarize_global_preference,
+    LlmMemoryTagSuggester, LlmPromptAssetSynthesizer, MemoryOrganizationInput,
+    MemoryOrganizer, PromptAssetSynthesizer, PromptPolicy, RuleBasedMemoryKindResolver,
+    RuleBasedMemoryPromotionAdvisor, RuleBasedMemoryRoomRouter, WorkspaceMemoryRetriever,
+    default_workspace_root, evaluate_tool_execution,
+    generate_with_context_stream_using_synthesizer,
+    generate_with_context_using_synthesizer, load_assistant_wenyan_prompt,
+    load_tool_assets, persist_room_memory, persist_synthesized_prompt_assets,
+    persist_retired_tool_assets, persist_revised_tool_assets, persist_tool_evolution_events,
+    persist_compiled_tool_assets,
+    room_memory_write_requests_from_tool_evaluation,
+    room_memory_write_request_from_tool_outcome,
+    room_memory_write_request_from_response, summarize_global_preference,
     summarize_global_preference_with_llm, workspace_namespace_from_memory_namespace,
+    seed_tool_cargo_test, seed_tool_rg,
 };
 use hc_llm::{
     ChatMessage, GenerateRequest, MessageRole, ModelRef, OpenAiCompatibleProvider,
     ProviderRegistry, StreamChunk,
 };
 use hc_memory::{
-    MemoryEntityKind, MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind,
-    MemoryOwnerRef, MemoryRelation, MemoryRelationKind, MemoryRoom, MemoryRoomAsset,
-    MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope, MemoryVisibility,
+    ArtifactDraft, ArtifactEvolutionAction, ArtifactEvolutionEvent, MemoryEntityKind,
+    MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind, MemoryOwnerRef,
+    MemoryRelation, MemoryRelationKind, MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind,
+    MemoryRoomRepository, MemoryScope, MemoryVisibility,
 };
 use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
 
@@ -94,6 +106,9 @@ fn main() -> Result<()> {
 
     match args.first().map(String::as_str) {
         Some("generate") => handle_generate(&registry, &args[1..]),
+        Some("tool-plan") => handle_tool_plan(&registry, &args[1..]),
+        Some("tool-run") => handle_tool_run(&args[1..]),
+        Some("tool-seed") => handle_tool_seed(&args[1..]),
         Some("chat") => handle_chat(&registry, &args[1..]),
         Some("help") | Some("--help") | Some("-h") => print_help(),
         Some(other) => bail!("unknown command: {other}"),
@@ -393,8 +408,12 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         request.generation.model.provider.clone(),
         request.generation.model.model.clone(),
     );
-    let prompt_asset_synthesizer =
-        build_prompt_asset_synthesizer(registry, &prompt_asset_model, prompt_asset_mode);
+    let prompt_asset_synthesizer = build_prompt_asset_synthesizer(
+        registry,
+        &prompt_asset_model,
+        workspace_namespace_from_memory_namespace(&memory_namespace),
+        prompt_asset_mode,
+    );
 
     let response = match request_mode {
         RequestMode::Direct => {
@@ -547,7 +566,633 @@ fn print_help() -> Result<()> {
     println!(
         "hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]"
     );
+    println!("hc-context-cli tool-plan <rg|cargo-test> <goal...> [--json]");
+    println!("hc-context-cli tool-run rg <pattern> [--goal <text>] [--path <path>] [--json] [--persist-outcome] [--persist-evaluation] [--persist-promotions] [--persist-revisions] [--persist-retirements]");
+    println!("hc-context-cli tool-run cargo-test [<filter>] [--goal <text>] [--package <pkg>] [--json] [--persist-outcome] [--persist-evaluation] [--persist-promotions] [--persist-revisions] [--persist-retirements]");
+    println!("hc-context-cli tool-seed <rg|cargo-test>");
     Ok(())
+}
+
+fn handle_tool_plan(_registry: &ProviderRegistry, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: hc-context-cli tool-plan <rg|cargo-test> <goal...> [--json]");
+    }
+
+    let tool_name = args.first().cloned().unwrap_or_default();
+    let mut json = false;
+    let mut goal_parts = Vec::new();
+
+    for arg in &args[1..] {
+        if arg == "--json" {
+            json = true;
+        } else {
+            goal_parts.push(arg.clone());
+        }
+    }
+
+    if goal_parts.is_empty() {
+        bail!("missing goal for tool-plan");
+    }
+
+    let tool = match tool_name.as_str() {
+        "rg" => seed_tool_rg(),
+        "cargo-test" => seed_tool_cargo_test(),
+        other => bail!("unsupported tool for tool-plan: {other}"),
+    };
+
+    let memory_namespace = runtime_memory_namespace();
+    let retriever = WorkspaceMemoryRetriever::new(
+        default_workspace_root(),
+        workspace_namespace_from_memory_namespace(&memory_namespace),
+    );
+    let goal = goal_parts.join(" ");
+    let assets = load_tool_assets(&retriever, memory_namespace, &tool)?;
+    let plan = build_tool_execution_plan_from_assets(&DefaultToolExecutionBinder, goal, &tool, &assets)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).context("failed to serialize tool plan")?
+        );
+    } else {
+        println!("tool> {}", plan.tool_id);
+        println!("command> {}", plan.suggested_command.join(" "));
+        for line in &plan.guidance {
+            println!("guidance> {line}");
+        }
+        for line in &plan.validation_steps {
+            println!("validation> {line}");
+        }
+        for line in &plan.recovery_steps {
+            println!("recovery> {line}");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_tool_seed(args: &[String]) -> Result<()> {
+    let tool_name = args.first().context("usage: hc-context-cli tool-seed <rg|cargo-test>")?;
+    match tool_name.as_str() {
+        "rg" => seed_rg_tool_assets(),
+        "cargo-test" => seed_cargo_test_tool_assets(),
+        other => bail!("unsupported tool for tool-seed: {other}"),
+    }
+}
+
+fn handle_tool_run(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: hc-context-cli tool-run <rg|cargo-test> ...");
+    }
+
+    let tool_name = args.first().cloned().unwrap_or_default();
+    let mut pattern: Option<String> = None;
+    let mut goal: Option<String> = None;
+    let mut search_path: Option<String> = None;
+    let mut package: Option<String> = None;
+    let mut json = false;
+    let mut persist_outcome = false;
+    let mut persist_evaluation = false;
+    let mut persist_promotions = false;
+    let mut persist_revisions = false;
+    let mut persist_retirements = false;
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--goal" => {
+                goal = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --goal")?,
+                );
+                index += 2;
+            }
+            "--path" => {
+                search_path = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --path")?,
+                );
+                index += 2;
+            }
+            "--package" => {
+                package = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --package")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--persist-outcome" => {
+                persist_outcome = true;
+                index += 1;
+            }
+            "--persist-evaluation" => {
+                persist_evaluation = true;
+                index += 1;
+            }
+            "--persist-promotions" => {
+                persist_promotions = true;
+                index += 1;
+            }
+            "--persist-revisions" => {
+                persist_revisions = true;
+                index += 1;
+            }
+            "--persist-retirements" => {
+                persist_retirements = true;
+                index += 1;
+            }
+            value => {
+                if pattern.is_none() {
+                    pattern = Some(value.to_owned());
+                    index += 1;
+                } else {
+                    bail!("unexpected extra argument for tool-run: {value}");
+                }
+            }
+        }
+    }
+
+    let tool = match tool_name.as_str() {
+        "rg" => seed_tool_rg(),
+        "cargo-test" => seed_tool_cargo_test(),
+        other => bail!("unsupported tool for tool-run: {other}"),
+    };
+    let pattern = if tool_name == "rg" {
+        Some(pattern.context("missing search pattern for tool-run rg")?)
+    } else {
+        pattern
+    };
+    let goal = goal.unwrap_or_else(|| {
+        pattern
+            .clone()
+            .unwrap_or_else(|| "run cargo test".to_owned())
+    });
+
+    let memory_namespace = runtime_memory_namespace();
+    let retriever = WorkspaceMemoryRetriever::new(
+        default_workspace_root(),
+        workspace_namespace_from_memory_namespace(&memory_namespace),
+    );
+    let assets = load_tool_assets(&retriever, memory_namespace.clone(), &tool)?;
+    let plan =
+        build_tool_execution_plan_from_assets(&DefaultToolExecutionBinder, goal.clone(), &tool, &assets)?;
+    let outcome = match tool_name.as_str() {
+        "rg" => run_rg_with_plan(
+            &goal,
+            pattern.as_deref().expect("rg pattern should exist"),
+            search_path.as_deref(),
+            &plan,
+        )?,
+        "cargo-test" => run_cargo_test_with_plan(
+            &goal,
+            pattern.as_deref(),
+            package.as_deref(),
+            &plan,
+        )?,
+        _ => unreachable!("tool validated above"),
+    };
+    let evaluation = evaluate_tool_execution(
+        &tool,
+        &plan,
+        &outcome,
+        &assets,
+        &GeneralizationPolicy::default(),
+        &default_tool_promotion_rule(&tool),
+        &RetirementRule::default(),
+    );
+
+    let persisted_path = if persist_outcome {
+        let request = room_memory_write_request_from_tool_outcome(&tool, &outcome);
+        Some(persist_room_memory(
+            default_workspace_root(),
+            workspace_namespace_from_memory_namespace(&memory_namespace),
+            &request,
+        )?)
+    } else {
+        None
+    };
+    let persisted_evaluation_paths = if persist_evaluation {
+        let mut paths = room_memory_write_requests_from_tool_evaluation(&tool, &evaluation)
+            .into_iter()
+            .map(|request| {
+                persist_room_memory(
+                    default_workspace_root(),
+                    workspace_namespace_from_memory_namespace(&memory_namespace),
+                    &request,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        paths.extend(persist_tool_evolution_events(
+            default_workspace_root(),
+            workspace_namespace_from_memory_namespace(&memory_namespace),
+            &tool,
+            &evaluation,
+        )?);
+        paths
+    } else {
+        Vec::new()
+    };
+    let persisted_promotion_paths = if persist_promotions {
+        persist_compiled_tool_assets(
+            default_workspace_root(),
+            workspace_namespace_from_memory_namespace(&memory_namespace),
+            &tool,
+            &assets,
+            &evaluation,
+        )?
+    } else {
+        Vec::new()
+    };
+    let persisted_revision_paths = if persist_revisions {
+        persist_revised_tool_assets(
+            default_workspace_root(),
+            workspace_namespace_from_memory_namespace(&memory_namespace),
+            &tool,
+            &assets,
+            &evaluation,
+            &outcome,
+        )?
+    } else {
+        Vec::new()
+    };
+    let persisted_retirement_paths = if persist_retirements {
+        persist_retired_tool_assets(
+            default_workspace_root(),
+            workspace_namespace_from_memory_namespace(&memory_namespace),
+            &tool,
+            &assets,
+            &evaluation,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    if json {
+        let payload = serde_json::json!({
+            "plan": plan,
+            "outcome": outcome,
+            "evaluation": evaluation,
+            "persisted_path": persisted_path.as_ref().map(|path| path.display().to_string()),
+            "persisted_evaluation_paths": persisted_evaluation_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "persisted_promotion_paths": persisted_promotion_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "persisted_revision_paths": persisted_revision_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "persisted_retirement_paths": persisted_retirement_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).context("failed to serialize tool run")?
+        );
+    } else {
+        println!("tool> {}", plan.tool_id);
+        println!("command> {}", outcome.command.join(" "));
+        println!("success> {}", outcome.success);
+        println!("summary> {}", outcome.summary);
+        for line in &plan.guidance {
+            println!("guidance> {line}");
+        }
+        for line in &plan.validation_steps {
+            println!("validation> {line}");
+        }
+        for line in &plan.recovery_steps {
+            println!("recovery> {line}");
+        }
+        for observation in &outcome.observations {
+            println!("observation> {observation}");
+        }
+        for signal in &evaluation.signals {
+            println!("signal> {}", signal_label(signal));
+        }
+        if !evaluation.promote_candidate_ids.is_empty() {
+            println!(
+                "promote> {}",
+                evaluation.promote_candidate_ids.join(", ")
+            );
+        }
+        if !evaluation.retire_candidate_ids.is_empty() {
+            println!("retire> {}", evaluation.retire_candidate_ids.join(", "));
+        }
+        if let Some(path) = persisted_path {
+            println!("persisted tool outcome: {}", path.display());
+        }
+        for path in &persisted_evaluation_paths {
+            println!("persisted evaluation: {}", path.display());
+        }
+        for path in &persisted_promotion_paths {
+            println!("persisted promotion: {}", path.display());
+        }
+        for path in &persisted_revision_paths {
+            println!("persisted revision: {}", path.display());
+        }
+        for path in &persisted_retirement_paths {
+            println!("persisted retirement: {}", path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn seed_rg_tool_assets() -> Result<()> {
+    let namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+    let repository =
+        MemoryRoomRepository::with_namespace(default_workspace_root(), workspace_namespace);
+    let room = MemoryRoom::new(
+        "room.tool.rg",
+        MemoryLayer::Project,
+        "RG Tool Room",
+        "Reusable rg search guidance.",
+    )
+    .with_namespace(namespace.clone())
+    .with_visibility(MemoryVisibility::Private)
+    .with_tag("tool")
+    .with_tag("rg")
+    .with_tag("project");
+    repository.write_room(&room)?;
+
+    let assets = vec![
+        (
+            "asset.room.tool.rg.recipe.search-narrow-first",
+            "workflow.search-narrow-first.md",
+            MemoryKind::WorkflowMemory,
+            "RG Narrow Search First",
+            "Prefer narrowing search scope before broad content search.",
+            vec!["tool", "rg", "recipe"],
+        ),
+        (
+            "asset.room.tool.rg.validation.refine-broad-results",
+            "validation.refine-broad-results.md",
+            MemoryKind::Knowledge,
+            "RG Refine Broad Results",
+            "If results are too broad, refine by path, extension, or keyword before answering.",
+            vec!["tool", "rg", "validation"],
+        ),
+        (
+            "asset.room.tool.rg.recovery.retry-strategy",
+            "recovery.retry-strategy.md",
+            MemoryKind::Decision,
+            "RG Retry Strategy",
+            "If no matches are found, retry with alternate keywords or a narrower path guess.",
+            vec!["tool", "rg", "recovery"],
+        ),
+    ];
+
+    for (id, file_name, kind, title, summary, tags) in assets {
+        let mut asset = MemoryRoomAsset::new(
+            id,
+            room.id.clone(),
+            file_name,
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            title,
+            summary,
+        )
+        .with_namespace(namespace.clone())
+        .with_visibility(MemoryVisibility::Private)
+        .with_memory_kind(kind)
+        .with_owner(MemoryOwnerRef::project(room.id.clone()));
+        for tag in tags {
+            asset = asset.with_tag(tag);
+        }
+        repository.write_asset(&room, &asset)?;
+    }
+
+    println!("tool> seeded rg assets into {}", room.id);
+    Ok(())
+}
+
+fn seed_cargo_test_tool_assets() -> Result<()> {
+    let namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+    let repository =
+        MemoryRoomRepository::with_namespace(default_workspace_root(), workspace_namespace);
+    let room = MemoryRoom::new(
+        "room.tool.cargo-test",
+        MemoryLayer::Project,
+        "Cargo Test Tool Room",
+        "Reusable cargo test guidance.",
+    )
+    .with_namespace(namespace.clone())
+    .with_visibility(MemoryVisibility::Private)
+    .with_tag("tool")
+    .with_tag("cargo-test")
+    .with_tag("project");
+    repository.write_room(&room)?;
+
+    let assets = vec![
+        (
+            "asset.room.tool.cargo-test.recipe.targeted-first",
+            "workflow.targeted-first.md",
+            MemoryKind::WorkflowMemory,
+            "Cargo Test Targeted First",
+            "Start with a targeted test filter before wider test runs.",
+            vec!["tool", "cargo-test", "recipe"],
+        ),
+        (
+            "asset.room.tool.cargo-test.validation.check-ran-tests",
+            "validation.check-ran-tests.md",
+            MemoryKind::Knowledge,
+            "Cargo Test Check Ran Tests",
+            "Check whether the intended tests actually ran before trusting the result.",
+            vec!["tool", "cargo-test", "validation"],
+        ),
+        (
+            "asset.room.tool.cargo-test.recovery.retry-broader",
+            "recovery.retry-broader.md",
+            MemoryKind::Decision,
+            "Cargo Test Retry Broader",
+            "If no tests matched the filter, retry with a broader filter or no filter.",
+            vec!["tool", "cargo-test", "recovery"],
+        ),
+    ];
+
+    for (id, file_name, kind, title, summary, tags) in assets {
+        let mut asset = MemoryRoomAsset::new(
+            id,
+            room.id.clone(),
+            file_name,
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            title,
+            summary,
+        )
+        .with_namespace(namespace.clone())
+        .with_visibility(MemoryVisibility::Private)
+        .with_memory_kind(kind)
+        .with_owner(MemoryOwnerRef::project(room.id.clone()));
+        for tag in tags {
+            asset = asset.with_tag(tag);
+        }
+        repository.write_asset(&room, &asset)?;
+    }
+
+    println!("tool> seeded cargo-test assets into {}", room.id);
+    Ok(())
+}
+
+fn run_rg_with_plan(
+    goal: &str,
+    pattern: &str,
+    search_path: Option<&str>,
+    plan: &hc_context::ToolExecutionPlan,
+) -> Result<ToolExecutionOutcome> {
+    let scope = search_path.unwrap_or(".");
+    let mut command = plan.suggested_command.clone();
+    let output = if plan
+        .suggested_command
+        .iter()
+        .any(|arg| arg == "--files")
+    {
+        if scope != "." {
+            command.push(scope.to_owned());
+        }
+        let output = Command::new(&command[0])
+            .args(&command[1..])
+            .output()
+            .with_context(|| format!("failed to run {}", command.join(" ")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let matched = stdout
+            .lines()
+            .filter(|line| line.contains(pattern))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let success = output.status.success() && !matched.is_empty();
+        ToolExecutionOutcome {
+            tool_id: plan.tool_id.clone(),
+            goal: goal.to_owned(),
+            command,
+            success,
+            summary: if success {
+                format!("Filtered {} matching file candidates for pattern `{pattern}`.", matched.len())
+            } else {
+                format!("No file candidates matched pattern `{pattern}`.")
+            },
+            observations: matched.into_iter().take(10).collect(),
+        }
+    } else {
+        command.push(pattern.to_owned());
+        command.push(scope.to_owned());
+        let output = Command::new(&command[0])
+            .args(&command[1..])
+            .output()
+            .with_context(|| format!("failed to run {}", command.join(" ")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let matches = stdout.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+        let success = output.status.success() && !matches.is_empty();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let mut observations = matches.into_iter().take(10).collect::<Vec<_>>();
+        if !stderr.is_empty() {
+            observations.push(format!("stderr: {stderr}"));
+        }
+        ToolExecutionOutcome {
+            tool_id: plan.tool_id.clone(),
+            goal: goal.to_owned(),
+            command,
+            success,
+            summary: if success {
+                format!("Found {} rg match lines for pattern `{pattern}`.", observations.len())
+            } else {
+                format!("No rg matches found for pattern `{pattern}`.")
+            },
+            observations,
+        }
+    };
+
+    Ok(output)
+}
+
+fn run_cargo_test_with_plan(
+    goal: &str,
+    filter: Option<&str>,
+    package: Option<&str>,
+    plan: &hc_context::ToolExecutionPlan,
+) -> Result<ToolExecutionOutcome> {
+    let mut command = plan.suggested_command.clone();
+    if let Some(package) = package {
+        command.push("-p".to_owned());
+        command.push(package.to_owned());
+    }
+    if let Some(filter) = filter
+        && !filter.trim().is_empty()
+    {
+        command.push(filter.to_owned());
+    }
+
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .with_context(|| format!("failed to run {}", command.join(" ")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let observations = combined
+        .lines()
+        .filter(|line| {
+            line.contains("test result")
+                || line.contains("running ")
+                || line.contains("FAILED")
+                || line.contains("ok")
+                || line.contains("error:")
+                || line.contains("0 tests")
+        })
+        .map(ToOwned::to_owned)
+        .take(12)
+        .collect::<Vec<_>>();
+    let success = output.status.success();
+    let summary = if success {
+        format!("cargo test succeeded for goal `{goal}`.")
+    } else {
+        format!("cargo test failed for goal `{goal}`.")
+    };
+
+    Ok(ToolExecutionOutcome {
+        tool_id: plan.tool_id.clone(),
+        goal: goal.to_owned(),
+        command,
+        success,
+        summary,
+        observations,
+    })
+}
+
+fn default_tool_promotion_rule(tool: &hc_context::ToolSpec) -> PromotionRule {
+    PromotionRule {
+        from_stage: hc_memory::MemoryAssetStage::Generalized,
+        to_stage: hc_memory::MemoryAssetStage::Compiled,
+        min_confidence_milli: 800,
+        required_tags: vec!["tool".to_owned(), tool.id.trim_start_matches("tool.").to_owned()],
+        required_consumers: vec![hc_context::AssetConsumer::Executor],
+    }
+}
+
+fn signal_label(signal: &EvaluationSignal) -> &'static str {
+    match signal {
+        EvaluationSignal::HumanConfirmed => "human_confirmed",
+        EvaluationSignal::HumanRejected => "human_rejected",
+        EvaluationSignal::ExecutionSucceeded => "execution_succeeded",
+        EvaluationSignal::ExecutionFailed => "execution_failed",
+        EvaluationSignal::ValidationPassed => "validation_passed",
+        EvaluationSignal::ValidationFailed => "validation_failed",
+        EvaluationSignal::RepeatedReuse => "repeated_reuse",
+        EvaluationSignal::SupersededByNewerAsset => "superseded_by_newer_asset",
+    }
 }
 
 fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
@@ -805,17 +1450,19 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     let retriever =
         WorkspaceMemoryRetriever::new(default_workspace_root(), workspace_namespace.clone());
     let composer = DefaultContextComposer;
-    let rule_organizer = CompositeMemoryOrganizer::new(
-        RuleBasedMemoryRoomRouter,
-        RuleBasedMemoryKindResolver,
-        KeywordMemoryTagSuggester,
-        RuleBasedMemoryPromotionAdvisor,
-    );
     let organizer_model = ModelRef::new(provider.clone(), model.clone());
-    let organizer =
-        build_memory_organizer(registry, &organizer_model, organizer_mode, rule_organizer);
-    let prompt_asset_synthesizer =
-        build_prompt_asset_synthesizer(registry, &organizer_model, prompt_asset_mode);
+    let organizer = build_memory_organizer(
+        registry,
+        &organizer_model,
+        workspace_namespace.clone(),
+        organizer_mode,
+    );
+    let prompt_asset_synthesizer = build_prompt_asset_synthesizer(
+        registry,
+        &organizer_model,
+        workspace_namespace.clone(),
+        prompt_asset_mode,
+    );
     let mut history = Vec::new();
     let mut chat_room = if persist_chat_memory {
         let room = resolve_chat_room(
@@ -891,6 +1538,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             "/help" => {
                 println!("/help");
                 println!("/clear");
+                println!("/prompts [filter]");
                 println!("/promote");
                 println!("/wenyan");
                 println!("/system <text>");
@@ -900,6 +1548,18 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             "/clear" => {
                 history.clear();
                 println!("history cleared");
+                continue;
+            }
+            _ if trimmed.starts_with("/prompts") => {
+                let filter = trimmed
+                    .strip_prefix("/prompts")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                print_managed_prompt_history(
+                    default_workspace_root(),
+                    &workspace_namespace,
+                    filter,
+                )?;
                 continue;
             }
             "/promote" => {
@@ -1093,6 +1753,18 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         };
         println!();
         history.push(response.response.message.clone());
+
+        let persisted_prompt_assets = persist_synthesized_prompt_assets(
+            default_workspace_root(),
+            workspace_namespace.clone(),
+            &response,
+        )?;
+        if !persisted_prompt_assets.is_empty() {
+            println!(
+                "prompt> persisted {} compiled prompt asset(s)",
+                persisted_prompt_assets.len()
+            );
+        }
 
         if let Some(room) = &chat_room {
             persist_chat_turn_assistant_reply(
@@ -1346,6 +2018,86 @@ fn print_recalled_memories_for_chat(memories: &[hc_context::RetrievedMemory]) {
             println!("memory> summary={summary}");
         }
     }
+}
+
+fn print_managed_prompt_history(
+    root: impl AsRef<Path>,
+    workspace_namespace: &WorkspaceNamespace,
+    filter: Option<&str>,
+) -> Result<()> {
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace.clone());
+    let prompt_dir = repository
+        .root()
+        .join(workspace_namespace.scoped_prefix())
+        .join("memory/rooms/project/room.project.prompt-library/prompt");
+
+    if !prompt_dir.exists() {
+        println!("prompt> none");
+        return Ok(());
+    }
+
+    let lowered_filter = filter.map(|value| value.to_ascii_lowercase());
+    let mut assets = Vec::new();
+    for entry in fs::read_dir(&prompt_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(repository.root().join(workspace_namespace.scoped_prefix()))
+            .expect("prompt asset should live under workspace namespace")
+            .to_path_buf();
+        let asset = repository.read_asset(relative)?;
+        if let Some(filter) = &lowered_filter
+            && !managed_prompt_asset_matches_filter(&asset, filter)
+        {
+            continue;
+        }
+        assets.push(asset);
+    }
+
+    assets.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+
+    if assets.is_empty() {
+        println!("prompt> none");
+        return Ok(());
+    }
+
+    for asset in assets {
+        let status = if asset.tags.iter().any(|tag| tag == "revision") {
+            "revision"
+        } else {
+            "current"
+        };
+        let summary = truncate_debug_text(&asset.summary, 88);
+        let lineage = if asset.derived_from.is_empty() {
+            String::new()
+        } else {
+            format!(" | derived_from={}", asset.derived_from.join(","))
+        };
+        println!(
+            "prompt> {} | {} | {}{}",
+            asset.file_name, status, asset.title, lineage
+        );
+        if !summary.is_empty() {
+            println!("prompt> summary={summary}");
+        }
+    }
+
+    Ok(())
+}
+
+fn managed_prompt_asset_matches_filter(asset: &MemoryRoomAsset, lowered_filter: &str) -> bool {
+    asset.file_name.to_ascii_lowercase().contains(lowered_filter)
+        || asset.title.to_ascii_lowercase().contains(lowered_filter)
+        || asset.summary.to_ascii_lowercase().contains(lowered_filter)
+        || asset
+            .tags
+            .iter()
+            .any(|tag| tag.to_ascii_lowercase().contains(lowered_filter))
 }
 
 fn summarize_room_kind(candidate: &hc_context::RoomCandidate) -> &'static str {
@@ -2487,16 +3239,18 @@ fn persist_chat_turn_user_message(
     turn_index: usize,
     content: &str,
 ) -> Result<()> {
+    let persisted = content.trim();
     let repository =
         MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let asset_id = format!("asset.{}.turn.{}.user", room.id, turn_index);
     let asset = MemoryRoomAsset::new(
-        format!("asset.{}.turn.{}.user", room.id, turn_index),
+        asset_id.clone(),
         room.id.clone(),
-        format!("turn.{:04}.user.md", turn_index),
+        format!("{:04}.user-message.md", turn_index),
         MemoryLayer::Chat,
         MemoryRoomAssetKind::Raw,
-        format!("User Turn {}", turn_index),
-        content.trim(),
+        format!("User Message {}", turn_index),
+        persisted,
     )
     .with_namespace(MemoryNamespace::new(
         namespace.tenant_id.clone(),
@@ -2507,7 +3261,20 @@ fn persist_chat_turn_user_message(
     .with_owner(MemoryOwnerRef::session(room.id.clone()))
     .with_tag("chat")
     .with_tag("user");
-    repository.write_asset(room, &asset)?;
+    let _materialized = repository.materialize_asset(room, &asset)?;
+    persist_chat_evolution_event(
+        &repository,
+        room,
+        chat_event(
+            &asset_id,
+            &room.id,
+            ArtifactEvolutionAction::Created,
+            "persisted user message into chat room",
+            vec!["chat", "user"],
+            Vec::new(),
+            Vec::new(),
+        ),
+    )?;
     Ok(())
 }
 
@@ -2518,27 +3285,41 @@ fn persist_chat_turn_assistant_reply(
     turn_index: usize,
     content: &str,
 ) -> Result<()> {
+    let persisted = strip_think_blocks(content).trim().to_owned();
+    if persisted.is_empty() {
+        return Ok(());
+    }
+
     let repository =
         MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
-    let asset = MemoryRoomAsset::new(
-        format!("asset.{}.turn.{}.assistant", room.id, turn_index),
+    let asset_id = format!("asset.{}.turn.{}.assistant", room.id, turn_index);
+    let draft = ArtifactDraft::new(
         room.id.clone(),
-        format!("turn.{:04}.assistant.md", turn_index),
         MemoryLayer::Chat,
         MemoryRoomAssetKind::Compressed,
-        format!("Assistant Turn {}", turn_index),
-        content.trim(),
+        format!("Assistant Reply {}", turn_index),
+        persisted,
     )
-    .with_namespace(MemoryNamespace::new(
-        namespace.tenant_id.clone(),
-        namespace.user_id.clone(),
-    ))
     .with_visibility(MemoryVisibility::Private)
     .with_memory_kind(MemoryKind::Summary)
     .with_owner(MemoryOwnerRef::session(room.id.clone()))
     .with_tag("chat")
-    .with_tag("assistant");
-    repository.write_asset(room, &asset)?;
+    .with_tag("assistant")
+    .with_file_name(format!("{:04}.assistant-reply.md", turn_index));
+    let _materialized = repository.materialize_artifact_draft(room, asset_id.clone(), draft)?;
+    persist_chat_evolution_event(
+        &repository,
+        room,
+        chat_event(
+            &asset_id,
+            &room.id,
+            ArtifactEvolutionAction::Created,
+            "persisted assistant reply into chat room",
+            vec!["chat", "assistant"],
+            Vec::new(),
+            Vec::new(),
+        ),
+    )?;
     Ok(())
 }
 
@@ -2561,7 +3342,7 @@ fn persist_chat_turn_assistant_wenyan(
         vec![
             ChatMessage::new(
                 MessageRole::System,
-                "Translate the assistant answer into concise classical Chinese. Return only the classical Chinese text, with no explanation.",
+                load_assistant_wenyan_prompt(namespace)?,
             ),
             ChatMessage::new(MessageRole::User, source),
         ],
@@ -2569,35 +3350,93 @@ fn persist_chat_turn_assistant_wenyan(
     let response = registry
         .generate(&generation)
         .map_err(anyhow::Error::from)?;
-    let wenyan = response.message.content.trim();
+    let wenyan = strip_think_blocks(&response.message.content).trim().to_owned();
     if wenyan.is_empty() {
         return Ok(None);
     }
 
     let repository =
         MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
-    let asset = MemoryRoomAsset::new(
-        format!("asset.{}.turn.{}.assistant.wenyan", room.id, turn_index),
+    let asset_id = format!("asset.{}.turn.{}.assistant.wenyan", room.id, turn_index);
+    let draft = ArtifactDraft::new(
         room.id.clone(),
-        format!("turn.{:04}.assistant.wenyan.md", turn_index),
         MemoryLayer::Chat,
         MemoryRoomAssetKind::Literary,
-        format!("Assistant Turn {} Wenyan", turn_index),
+        format!("Assistant Wenyan {}", turn_index),
         wenyan,
     )
-    .with_namespace(MemoryNamespace::new(
-        namespace.tenant_id.clone(),
-        namespace.user_id.clone(),
-    ))
     .with_visibility(MemoryVisibility::Private)
     .with_memory_kind(MemoryKind::Summary)
     .with_owner(MemoryOwnerRef::session(room.id.clone()))
     .with_derived_from(format!("asset.{}.turn.{}.assistant", room.id, turn_index))
     .with_tag("chat")
     .with_tag("assistant")
-    .with_tag("wenyan");
+    .with_tag("wenyan")
+    .with_file_name(format!("{:04}.assistant-wenyan.md", turn_index));
 
-    Ok(Some(repository.write_asset(room, &asset)?))
+    let materialized = repository.materialize_artifact_draft(room, asset_id.clone(), draft)?;
+    persist_chat_evolution_event(
+        &repository,
+        room,
+        chat_event(
+            &asset_id,
+            &room.id,
+            ArtifactEvolutionAction::Derived,
+            "derived wenyan rewrite from assistant reply",
+            vec!["chat", "assistant", "wenyan"],
+            vec![format!("turn:{turn_index}")],
+            vec!["rewrite:wenyan".to_owned(), materialized.room_relative_path.clone()],
+        ),
+    )?;
+
+    Ok(Some(materialized.path))
+}
+
+fn persist_chat_evolution_event(
+    repository: &MemoryRoomRepository,
+    room: &MemoryRoom,
+    event: ArtifactEvolutionEvent,
+) -> Result<()> {
+    repository.materialize_evolution_event(room, &event)?;
+    Ok(())
+}
+
+fn chat_event(
+    asset_id: &str,
+    room_id: &str,
+    action: ArtifactEvolutionAction,
+    reason: &str,
+    tags: Vec<&str>,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+) -> ArtifactEvolutionEvent {
+    let event = ArtifactEvolutionEvent::new(
+        format!("event.{asset_id}.{}.{}", action_label(&action), current_timestamp_ms()),
+        asset_id.to_owned(),
+        room_id.to_owned(),
+        action,
+        reason.to_owned(),
+    )
+    .with_created_at_ms(current_timestamp_ms());
+    let event = tags.into_iter().fold(event, |event, tag| event.with_tag(tag));
+    let event = inputs
+        .into_iter()
+        .fold(event, |event, input| event.with_input(input));
+    outputs
+        .into_iter()
+        .fold(event, |event, output| event.with_output(output))
+}
+
+fn action_label(action: &ArtifactEvolutionAction) -> &'static str {
+    match action {
+        ArtifactEvolutionAction::Created => "created",
+        ArtifactEvolutionAction::Derived => "derived",
+        ArtifactEvolutionAction::Evaluated => "evaluated",
+        ArtifactEvolutionAction::Promoted => "promoted",
+        ArtifactEvolutionAction::Revised => "revised",
+        ArtifactEvolutionAction::Retired => "retired",
+        ArtifactEvolutionAction::Superseded => "superseded",
+    }
 }
 
 fn strip_think_blocks(content: &str) -> String {
@@ -2784,13 +3623,8 @@ fn start_background_memory_worker(
                     let organizer = build_memory_organizer(
                         &registry,
                         &organizer_model,
+                        workspace_namespace.clone(),
                         organizer_mode,
-                        CompositeMemoryOrganizer::new(
-                            RuleBasedMemoryRoomRouter,
-                            RuleBasedMemoryKindResolver,
-                            KeywordMemoryTagSuggester,
-                            RuleBasedMemoryPromotionAdvisor,
-                        ),
                     );
                     if let Err(error) = persist_global_promotions_for_chat_input(
                         organizer.as_ref(),
@@ -2903,32 +3737,63 @@ fn default_global_room_id(memory_namespace: &MemoryNamespace) -> String {
 fn build_memory_organizer<'a>(
     registry: &'a ProviderRegistry,
     model: &'a ModelRef,
+    workspace_namespace: WorkspaceNamespace,
     mode: StrategyMode,
-    rule_organizer: CompositeMemoryOrganizer<
-        RuleBasedMemoryRoomRouter,
-        RuleBasedMemoryKindResolver,
-        KeywordMemoryTagSuggester,
-        RuleBasedMemoryPromotionAdvisor,
-    >,
 ) -> Box<dyn MemoryOrganizer + 'a> {
     match mode {
-        StrategyMode::Rule => Box::new(rule_organizer),
-        StrategyMode::Auto => Box::new(LlmMemoryOrganizer::new(
-            registry,
-            model.clone(),
-            rule_organizer,
+        StrategyMode::Rule => Box::new(CompositeMemoryOrganizer::new(
+            RuleBasedMemoryRoomRouter,
+            RuleBasedMemoryKindResolver,
+            KeywordMemoryTagSuggester,
+            RuleBasedMemoryPromotionAdvisor,
         )),
-        StrategyMode::Llm => Box::new(LlmMemoryOrganizer::strict(
-            registry,
-            model.clone(),
-            rule_organizer,
-        )),
+        StrategyMode::Auto => {
+            let tag_suggester = LlmMemoryTagSuggester::new(
+                registry,
+                model.clone(),
+                workspace_namespace.clone(),
+                KeywordMemoryTagSuggester,
+            );
+            let rule_organizer = CompositeMemoryOrganizer::new(
+                RuleBasedMemoryRoomRouter,
+                RuleBasedMemoryKindResolver,
+                tag_suggester,
+                RuleBasedMemoryPromotionAdvisor,
+            );
+            Box::new(LlmMemoryOrganizer::new(
+                registry,
+                model.clone(),
+                workspace_namespace,
+                rule_organizer,
+            ))
+        }
+        StrategyMode::Llm => {
+            let tag_suggester = LlmMemoryTagSuggester::strict(
+                registry,
+                model.clone(),
+                workspace_namespace.clone(),
+                KeywordMemoryTagSuggester,
+            );
+            let rule_organizer = CompositeMemoryOrganizer::new(
+                RuleBasedMemoryRoomRouter,
+                RuleBasedMemoryKindResolver,
+                tag_suggester,
+                RuleBasedMemoryPromotionAdvisor,
+            );
+            Box::new(LlmMemoryOrganizer::strict(
+                registry,
+                model.clone(),
+                workspace_namespace,
+                rule_organizer,
+            ))
+        }
     }
 }
 
 fn build_prompt_asset_synthesizer<'a>(
     registry: &'a ProviderRegistry,
     model: &'a ModelRef,
+    workspace_namespace: WorkspaceNamespace,
     mode: StrategyMode,
 ) -> Box<dyn PromptAssetSynthesizer + 'a> {
     match mode {
@@ -2936,11 +3801,13 @@ fn build_prompt_asset_synthesizer<'a>(
         StrategyMode::Auto => Box::new(LlmPromptAssetSynthesizer::new(
             registry,
             model.clone(),
+            workspace_namespace.clone(),
             DefaultPromptAssetSynthesizer,
         )),
         StrategyMode::Llm => Box::new(LlmPromptAssetSynthesizer::strict(
             registry,
             model.clone(),
+            workspace_namespace,
             DefaultPromptAssetSynthesizer,
         )),
     }
@@ -3047,4 +3914,29 @@ fn read_env_map(path: &Path) -> Result<BTreeMap<String, String>> {
         vars.insert(key.trim().to_owned(), value.trim().to_owned());
     }
     Ok(vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_prompt_asset_filter_matches_title_tags_and_summary() {
+        let asset = MemoryRoomAsset::new(
+            "prompt.extract.semantic-tags",
+            "room.project.prompt-library",
+            "semantic-tags.md",
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            "Semantic Tag Suggester",
+            "Infer semantic tags for reviewer and rg.",
+        )
+        .with_tag("managed_prompt")
+        .with_tag("extract");
+
+        assert!(managed_prompt_asset_matches_filter(&asset, "semantic"));
+        assert!(managed_prompt_asset_matches_filter(&asset, "reviewer"));
+        assert!(managed_prompt_asset_matches_filter(&asset, "extract"));
+        assert!(!managed_prompt_asset_matches_filter(&asset, "wenyan"));
+    }
 }

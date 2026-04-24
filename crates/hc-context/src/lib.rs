@@ -7,14 +7,16 @@ use hc_llm::{
     StreamChunk,
 };
 use hc_memory::{
-    MemoryCatalog, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind, MemoryOwnerRef,
-    MemoryQuery, MemoryRecord, MemoryRepository, MemoryRoomAsset, MemoryRoomAssetKind,
-    MemoryRoomRepository, MemoryScope,
+    ArtifactDraft, ArtifactEvolutionAction, ArtifactEvolutionEvent, MemoryAssetForm,
+    MemoryAssetStage, MemoryCatalog, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind,
+    MemoryOwnerRef, MemoryQuery, MemoryRecord, MemoryRepository, MemoryRoom, MemoryRoomAsset,
+    MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope,
 };
 use hc_persona::PersonaProfile;
 use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +32,215 @@ pub struct RetrievedMemory {
     pub source_kind: String,
     pub confidence_milli: u16,
     pub tags: Vec<String>,
+    pub derived_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetTarget {
+    Tool,
+    Workflow,
+    Agent,
+    Capability,
+    Project,
+    Task,
+    Topic,
+    Global,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetConsumer {
+    Llm,
+    Executor,
+    Planner,
+    Human,
+    Evaluator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetStatus {
+    Draft,
+    Active,
+    Deprecated,
+    Retired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetView {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub content: String,
+    pub kind: MemoryKind,
+    pub stage: MemoryAssetStage,
+    pub form: MemoryAssetForm,
+    pub target: AssetTarget,
+    pub target_ref: Option<String>,
+    pub consumers: Vec<AssetConsumer>,
+    pub status: AssetStatus,
+    pub visibility: hc_memory::MemoryVisibility,
+    pub tags: Vec<String>,
+    pub owners: Vec<MemoryOwnerRef>,
+    pub derived_from: Vec<String>,
+    pub source_docs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionKind {
+    Script,
+    Workflow,
+    Cli,
+    Service,
+    Builtin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStability {
+    Experimental,
+    Managed,
+    Stable,
+    Foundational,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub execution_kind: ToolExecutionKind,
+    pub stability: ToolStability,
+    pub model_dependence: hc_capability::ModelDependence,
+    pub default_command: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionPlan {
+    pub tool_id: String,
+    pub suggested_command: Vec<String>,
+    pub guidance: Vec<String>,
+    pub validation_steps: Vec<String>,
+    pub recovery_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionOutcome {
+    pub tool_id: String,
+    pub goal: String,
+    pub command: Vec<String>,
+    pub success: bool,
+    pub summary: String,
+    pub observations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionEvaluation {
+    pub tool_id: String,
+    pub matched_asset_ids: Vec<String>,
+    pub signals: Vec<EvaluationSignal>,
+    pub supporting_events: usize,
+    pub generalize_candidate_ids: Vec<String>,
+    pub promote_candidate_ids: Vec<String>,
+    pub revise_candidate_ids: Vec<String>,
+    pub retire_candidate_ids: Vec<String>,
+    pub events: Vec<AssetEvolutionEvent>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DefaultToolExecutionBinder;
+
+pub trait ToolExecutionBinder {
+    fn bind(&self, goal: &str, tool: &ToolSpec, assets: &[AssetView]) -> Result<ToolExecutionPlan>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetEvolutionEvent {
+    pub id: String,
+    pub asset_id: String,
+    pub action: EvolutionAction,
+    pub reason: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub confidence_milli: u16,
+    pub created_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionAction {
+    Captured,
+    Extracted,
+    Generalized,
+    Compiled,
+    Bound,
+    Evaluated,
+    Promoted,
+    Revised,
+    Deprecated,
+    Retired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneralizationPolicy {
+    pub min_confidence_milli: u16,
+    pub min_supporting_events: usize,
+    pub require_repeated_pattern: bool,
+    pub allow_human_confirmation_override: bool,
+}
+
+impl Default for GeneralizationPolicy {
+    fn default() -> Self {
+        Self {
+            min_confidence_milli: 700,
+            min_supporting_events: 2,
+            require_repeated_pattern: true,
+            allow_human_confirmation_override: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromotionRule {
+    pub from_stage: MemoryAssetStage,
+    pub to_stage: MemoryAssetStage,
+    pub min_confidence_milli: u16,
+    pub required_tags: Vec<String>,
+    pub required_consumers: Vec<AssetConsumer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetirementRule {
+    pub max_failed_evaluations: usize,
+    pub retire_on_explicit_human_rejection: bool,
+    pub allow_replacement_by_newer_asset: bool,
+}
+
+impl Default for RetirementRule {
+    fn default() -> Self {
+        Self {
+            max_failed_evaluations: 3,
+            retire_on_explicit_human_rejection: true,
+            allow_replacement_by_newer_asset: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationSignal {
+    HumanConfirmed,
+    HumanRejected,
+    ExecutionSucceeded,
+    ExecutionFailed,
+    ValidationPassed,
+    ValidationFailed,
+    RepeatedReuse,
+    SupersededByNewerAsset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,7 +266,17 @@ pub enum PromptAssetKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPolicyKind {
+    HardRuntime,
+    CompiledMemory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptPolicy {
+    pub kind: PromptPolicyKind,
+    pub stage: MemoryAssetStage,
+    pub form: MemoryAssetForm,
     pub title: String,
     pub content: String,
 }
@@ -63,6 +284,19 @@ pub struct PromptPolicy {
 impl PromptPolicy {
     pub fn new(title: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            kind: PromptPolicyKind::HardRuntime,
+            stage: MemoryAssetStage::Compiled,
+            form: MemoryAssetForm::Policy,
+            title: title.into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn compiled_memory(title: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            kind: PromptPolicyKind::CompiledMemory,
+            stage: MemoryAssetStage::Compiled,
+            form: MemoryAssetForm::Policy,
             title: title.into(),
             content: content.into(),
         }
@@ -73,6 +307,8 @@ impl PromptPolicy {
 pub struct PromptAsset {
     pub id: String,
     pub kind: PromptAssetKind,
+    pub stage: MemoryAssetStage,
+    pub form: MemoryAssetForm,
     pub title: String,
     pub content: String,
     pub tags: Vec<String>,
@@ -87,6 +323,8 @@ impl PromptAsset {
     ) -> Self {
         Self {
             id: id.into(),
+            stage: prompt_asset_stage_for_kind(&kind),
+            form: prompt_asset_form_for_kind(&kind),
             kind,
             title: title.into(),
             content: content.into(),
@@ -238,6 +476,7 @@ impl From<&MemoryRecord> for RetrievedMemory {
             source_kind: "memory_record".to_owned(),
             confidence_milli: record.confidence_milli,
             tags: record.tags.clone(),
+            derived_from: record.derived_from.clone(),
         }
     }
 }
@@ -255,6 +494,7 @@ impl From<&MemoryRoomAsset> for RetrievedMemory {
             source_kind: format!("room_{:?}", asset.kind).to_ascii_lowercase(),
             confidence_milli: confidence_for_room_asset_kind(&asset.kind),
             tags: asset.tags.clone(),
+            derived_from: asset.derived_from.clone(),
         }
     }
 }
@@ -353,6 +593,7 @@ impl ContextRequest {
 pub struct ContextResponse {
     pub response: GenerateResponse,
     pub recalled_memories: Vec<RetrievedMemory>,
+    pub synthesized_prompt_assets: Vec<PromptAsset>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -571,6 +812,16 @@ pub struct DefaultPromptAssetSynthesizer;
 pub struct LlmPromptAssetSynthesizer<'a, F> {
     registry: &'a ProviderRegistry,
     model: hc_llm::ModelRef,
+    workspace_namespace: WorkspaceNamespace,
+    fallback: F,
+    fallback_on_error: bool,
+}
+
+#[derive(Clone)]
+pub struct LlmMemoryTagSuggester<'a, F> {
+    registry: &'a ProviderRegistry,
+    model: hc_llm::ModelRef,
+    workspace_namespace: WorkspaceNamespace,
     fallback: F,
     fallback_on_error: bool,
 }
@@ -579,8 +830,27 @@ pub struct LlmPromptAssetSynthesizer<'a, F> {
 pub struct LlmMemoryOrganizer<'a, F> {
     registry: &'a ProviderRegistry,
     model: hc_llm::ModelRef,
+    workspace_namespace: WorkspaceNamespace,
     fallback: F,
     fallback_on_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedPromptMetadata {
+    id: String,
+    r#type: String,
+    title: String,
+    kind: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedPromptKind {
+    MemoryOrganizer,
+    PromptAssetSynthesizer,
+    SemanticTagSuggester,
+    GlobalPreferenceSummary,
+    AssistantWenyanRewrite,
 }
 
 #[derive(Debug, Clone)]
@@ -603,19 +873,63 @@ impl<R, K, T, P> CompositeMemoryOrganizer<R, K, T, P> {
 }
 
 impl<'a, F> LlmPromptAssetSynthesizer<'a, F> {
-    pub fn new(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+    pub fn new(
+        registry: &'a ProviderRegistry,
+        model: hc_llm::ModelRef,
+        workspace_namespace: WorkspaceNamespace,
+        fallback: F,
+    ) -> Self {
         Self {
             registry,
             model,
+            workspace_namespace,
             fallback,
             fallback_on_error: true,
         }
     }
 
-    pub fn strict(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+    pub fn strict(
+        registry: &'a ProviderRegistry,
+        model: hc_llm::ModelRef,
+        workspace_namespace: WorkspaceNamespace,
+        fallback: F,
+    ) -> Self {
         Self {
             registry,
             model,
+            workspace_namespace,
+            fallback,
+            fallback_on_error: false,
+        }
+    }
+}
+
+impl<'a, F> LlmMemoryTagSuggester<'a, F> {
+    pub fn new(
+        registry: &'a ProviderRegistry,
+        model: hc_llm::ModelRef,
+        workspace_namespace: WorkspaceNamespace,
+        fallback: F,
+    ) -> Self {
+        Self {
+            registry,
+            model,
+            workspace_namespace,
+            fallback,
+            fallback_on_error: true,
+        }
+    }
+
+    pub fn strict(
+        registry: &'a ProviderRegistry,
+        model: hc_llm::ModelRef,
+        workspace_namespace: WorkspaceNamespace,
+        fallback: F,
+    ) -> Self {
+        Self {
+            registry,
+            model,
+            workspace_namespace,
             fallback,
             fallback_on_error: false,
         }
@@ -623,19 +937,31 @@ impl<'a, F> LlmPromptAssetSynthesizer<'a, F> {
 }
 
 impl<'a, F> LlmMemoryOrganizer<'a, F> {
-    pub fn new(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+    pub fn new(
+        registry: &'a ProviderRegistry,
+        model: hc_llm::ModelRef,
+        workspace_namespace: WorkspaceNamespace,
+        fallback: F,
+    ) -> Self {
         Self {
             registry,
             model,
+            workspace_namespace,
             fallback,
             fallback_on_error: true,
         }
     }
 
-    pub fn strict(registry: &'a ProviderRegistry, model: hc_llm::ModelRef, fallback: F) -> Self {
+    pub fn strict(
+        registry: &'a ProviderRegistry,
+        model: hc_llm::ModelRef,
+        workspace_namespace: WorkspaceNamespace,
+        fallback: F,
+    ) -> Self {
         Self {
             registry,
             model,
+            workspace_namespace,
             fallback,
             fallback_on_error: false,
         }
@@ -1289,7 +1615,7 @@ impl MemoryKindResolver for RuleBasedMemoryKindResolver {
 impl MemoryTagSuggester for KeywordMemoryTagSuggester {
     fn suggest_tags(&self, input: &MemoryOrganizationInput) -> Result<Vec<String>> {
         let content = input.content.to_ascii_lowercase();
-        let mut tags = Vec::new();
+        let mut tags = BTreeSet::new();
         for (keyword, tag) in [
             ("runtime", "runtime"),
             ("assignment", "assignment"),
@@ -1299,11 +1625,209 @@ impl MemoryTagSuggester for KeywordMemoryTagSuggester {
             ("review", "review"),
             ("trace", "trace"),
         ] {
-            if content.contains(keyword) && !tags.iter().any(|value| value == tag) {
-                tags.push(tag.to_owned());
+            if content.contains(keyword) {
+                tags.insert(tag.to_owned());
             }
         }
-        Ok(tags)
+
+        for tag in infer_semantic_tags(input) {
+            tags.insert(tag);
+        }
+
+        Ok(tags.into_iter().collect())
+    }
+}
+
+fn infer_semantic_tags(input: &MemoryOrganizationInput) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    let title = input.title_hint.as_deref().unwrap_or_default();
+    let combined = format!("{title}\n{}", input.content);
+    let lowered = combined.to_ascii_lowercase();
+
+    if let Some(owner) = &input.owner {
+        match owner.kind {
+            MemoryOwnerKind::Task => {
+                tags.insert("task".to_owned());
+                let slug = slugify_for_memory(&owner.id);
+                if !slug.is_empty() {
+                    tags.insert(slug);
+                }
+            }
+            MemoryOwnerKind::Project => {
+                tags.insert("project".to_owned());
+                let slug = slugify_for_memory(&owner.id);
+                if !slug.is_empty() {
+                    tags.insert(slug);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(agent_slug) = infer_agent_slug(&lowered, title) {
+        tags.insert("agent".to_owned());
+        tags.insert(agent_slug);
+    }
+
+    if let Some(tool_slug) = infer_tool_slug(&lowered, title) {
+        tags.insert("tool".to_owned());
+        tags.insert(tool_slug);
+    }
+
+    if let Some(project_slug) = infer_project_slug(&lowered, title, input.owner.as_ref()) {
+        tags.insert("project".to_owned());
+        tags.insert(project_slug);
+    }
+
+    if let Some(task_slug) = infer_task_slug(&lowered, title, input.owner.as_ref()) {
+        tags.insert("task".to_owned());
+        tags.insert(task_slug);
+    }
+
+    if let Some(topic_slug) = infer_topic_slug(&lowered, title) {
+        tags.insert("topic".to_owned());
+        tags.insert(topic_slug);
+    }
+
+    tags.into_iter().collect()
+}
+
+fn infer_agent_slug(lowered: &str, title: &str) -> Option<String> {
+    for keyword in ["reviewer", "planner", "coder", "assistant"] {
+        if lowered.contains(keyword) {
+            return Some(keyword.to_owned());
+        }
+    }
+
+    if !contains_any(
+        lowered,
+        &["agent", "persona", "助手", "智能体", "角色", "人格"],
+    ) {
+        return None;
+    }
+
+    semantic_slug_from_title(title, &["agent", "persona", "assistant", "habit", "style"])
+}
+
+fn infer_tool_slug(lowered: &str, title: &str) -> Option<String> {
+    for (keyword, slug) in [
+        ("ripgrep", "rg"),
+        (" rg ", "rg"),
+        ("cargo", "cargo"),
+        ("git", "git"),
+        ("minimax", "minimax"),
+        ("openai", "openai"),
+        ("bash", "bash"),
+    ] {
+        if lowered.contains(keyword) {
+            return Some(slug.to_owned());
+        }
+    }
+
+    if !contains_any(lowered, &["tool", "工具", "命令", "api", "sdk"]) {
+        return None;
+    }
+
+    semantic_slug_from_title(title, &["tool", "workflow", "guide", "style"])
+}
+
+fn infer_project_slug(
+    lowered: &str,
+    title: &str,
+    owner: Option<&MemoryOwnerRef>,
+) -> Option<String> {
+    if let Some(owner) = owner
+        && owner.kind == MemoryOwnerKind::Project
+    {
+        let slug = slugify_for_memory(&owner.id);
+        if !slug.is_empty() {
+            return Some(slug);
+        }
+    }
+
+    if !contains_any(
+        lowered,
+        &["project", "repo", "repository", "workspace", "项目", "仓库"],
+    ) {
+        return None;
+    }
+
+    semantic_slug_from_title(title, &["project", "repo", "style", "guide", "architecture"])
+}
+
+fn infer_task_slug(
+    lowered: &str,
+    title: &str,
+    owner: Option<&MemoryOwnerRef>,
+) -> Option<String> {
+    if let Some(owner) = owner
+        && owner.kind == MemoryOwnerKind::Task
+    {
+        let slug = slugify_for_memory(&owner.id);
+        if !slug.is_empty() {
+            return Some(slug);
+        }
+    }
+
+    if !contains_any(
+        lowered,
+        &[
+            "task",
+            "implement",
+            "fix",
+            "debug",
+            "refactor",
+            "review",
+            "任务",
+            "实现",
+            "修复",
+            "重构",
+        ],
+    ) {
+        return None;
+    }
+
+    semantic_slug_from_title(
+        title,
+        &["task", "guide", "rule", "workflow", "habit", "decision"],
+    )
+}
+
+fn infer_topic_slug(lowered: &str, title: &str) -> Option<String> {
+    if !contains_any(
+        lowered,
+        &["topic", "concept", "knowledge", "reference", "theme", "主题", "话题", "知识"],
+    ) {
+        return None;
+    }
+
+    semantic_slug_from_title(
+        title,
+        &["topic", "concept", "knowledge", "reference", "guide", "style"],
+    )
+}
+
+fn semantic_slug_from_title(title: &str, stopwords: &[&str]) -> Option<String> {
+    let mut tokens = Vec::new();
+
+    for raw in title.split(|character: char| !character.is_ascii_alphanumeric()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let lowered = raw.to_ascii_lowercase();
+        if stopwords.iter().any(|stopword| *stopword == lowered) {
+            continue;
+        }
+        tokens.push(lowered);
+        if tokens.len() >= 2 {
+            break;
+        }
+    }
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join("."))
     }
 }
 
@@ -1374,6 +1898,14 @@ impl MemoryPromotionAdvisor for RuleBasedMemoryPromotionAdvisor {
 
 impl PromptAssetSynthesizer for DefaultPromptAssetSynthesizer {
     fn synthesize(&self, memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>> {
+        let compiled_assets = memories
+            .iter()
+            .filter_map(prompt_asset_from_compiled_memory)
+            .collect::<Vec<_>>();
+        if !compiled_assets.is_empty() {
+            return Ok(compiled_assets);
+        }
+
         let mut assets = Vec::new();
         for memory in memories {
             let is_global_preference = memory.kind == MemoryKind::Preference
@@ -1441,6 +1973,12 @@ struct LlmGlobalPreferenceSummaryOutput {
     memory_kind: MemoryKind,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LlmSemanticTagOutput {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
 impl<'a, F> PromptAssetSynthesizer for LlmPromptAssetSynthesizer<'a, F>
 where
     F: PromptAssetSynthesizer,
@@ -1462,11 +2000,31 @@ where
     }
 }
 
+impl<'a, F> MemoryTagSuggester for LlmMemoryTagSuggester<'a, F>
+where
+    F: MemoryTagSuggester,
+{
+    fn suggest_tags(&self, input: &MemoryOrganizationInput) -> Result<Vec<String>> {
+        match self.try_suggest_tags(input) {
+            Ok(tags) if !tags.is_empty() => Ok(tags),
+            Ok(_) if self.fallback_on_error => self.fallback.suggest_tags(input),
+            Ok(tags) => Ok(tags),
+            Err(error) if self.fallback_on_error => self.fallback.suggest_tags(input).or(Err(error)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl<'a, F> LlmPromptAssetSynthesizer<'a, F>
 where
     F: PromptAssetSynthesizer,
 {
     fn try_synthesize(&self, memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>> {
+        let instructions = load_managed_prompt_body(
+            default_workspace_root(),
+            &self.workspace_namespace,
+            ManagedPromptKind::PromptAssetSynthesizer,
+        )?;
         let response = self
             .registry
             .generate(&GenerateRequest {
@@ -1474,13 +2032,13 @@ where
                 messages: vec![
                     ChatMessage::new(
                         MessageRole::System,
-                        "You convert durable recalled memories into prompt assets. Return JSON only.",
+                        managed_json_system_prompt(),
                     ),
                     ChatMessage::new(
                         MessageRole::User,
                         format!(
                             "{}\n\nMemories JSON:\n{}",
-                            llm_prompt_asset_synthesizer_instructions(),
+                            instructions,
                             serde_json::to_string_pretty(memories)?
                         ),
                     ),
@@ -1498,6 +2056,51 @@ where
             .filter(|(_, asset)| !asset.content.trim().is_empty())
             .map(|(index, asset)| prompt_asset_from_llm_item(memories, index, asset))
             .collect())
+    }
+}
+
+impl<'a, F> LlmMemoryTagSuggester<'a, F>
+where
+    F: MemoryTagSuggester,
+{
+    fn try_suggest_tags(&self, input: &MemoryOrganizationInput) -> Result<Vec<String>> {
+        let instructions = load_managed_prompt_body(
+            default_workspace_root(),
+            &self.workspace_namespace,
+            ManagedPromptKind::SemanticTagSuggester,
+        )?;
+        let response = self
+            .registry
+            .generate(&GenerateRequest {
+                model: self.model.clone(),
+                messages: vec![
+                    ChatMessage::new(
+                        MessageRole::System,
+                        managed_json_system_prompt(),
+                    ),
+                    ChatMessage::new(
+                        MessageRole::User,
+                        format!(
+                            "{}\n\nInput JSON:\n{}",
+                            instructions,
+                            serde_json::to_string_pretty(input)?
+                        ),
+                    ),
+                ],
+                temperature: Some(0.1),
+                max_output_tokens: Some(300),
+                metadata: Default::default(),
+            })
+            .map_err(anyhow::Error::from)?;
+        let parsed: LlmSemanticTagOutput = parse_json_payload(&response.message.content)?;
+        let mut tags = BTreeSet::new();
+        for tag in parsed.tags {
+            let slug = slugify_for_memory(&tag);
+            if !slug.is_empty() {
+                tags.insert(slug);
+            }
+        }
+        Ok(tags.into_iter().collect())
     }
 }
 
@@ -1519,6 +2122,11 @@ where
     F: MemoryOrganizer,
 {
     fn try_organize(&self, input: &MemoryOrganizationInput) -> Result<MemoryOrganizationDecision> {
+        let instructions = load_managed_prompt_body(
+            default_workspace_root(),
+            &self.workspace_namespace,
+            ManagedPromptKind::MemoryOrganizer,
+        )?;
         let response = self
             .registry
             .generate(&GenerateRequest {
@@ -1526,13 +2134,13 @@ where
                 messages: vec![
                     ChatMessage::new(
                         MessageRole::System,
-                        "You organize memory writes into rooms and promotions. Return JSON only.",
+                        managed_json_system_prompt(),
                     ),
                     ChatMessage::new(
                         MessageRole::User,
                         format!(
                             "{}\n\nInput JSON:\n{}",
-                            llm_memory_organizer_instructions(),
+                            instructions,
                             serde_json::to_string_pretty(input)?
                         ),
                     ),
@@ -1644,9 +2252,17 @@ pub fn generate_with_context(
     composer: &impl ContextComposer,
     request: &ContextRequest,
 ) -> Result<ContextResponse> {
+    let workspace_namespace = request
+        .memory_query
+        .memory_query
+        .namespace
+        .as_ref()
+        .map(workspace_namespace_from_memory_namespace)
+        .unwrap_or_else(WorkspaceNamespace::local_default);
     let synthesizer = LlmPromptAssetSynthesizer::new(
         registry,
         request.generation.model.clone(),
+        workspace_namespace,
         DefaultPromptAssetSynthesizer,
     );
     generate_with_context_using_synthesizer(registry, retriever, composer, &synthesizer, request)
@@ -1660,8 +2276,13 @@ pub fn generate_with_context_using_synthesizer(
     request: &ContextRequest,
 ) -> Result<ContextResponse> {
     let memories = retriever.retrieve(&request.memory_query)?;
+    let recalled_assets = asset_views_from_retrieved_memories(&memories);
+    let compiled_prompt_assets = compiled_prompt_assets_from_asset_views(&recalled_assets);
     let synthesized_prompt_assets = synthesizer.synthesize(&memories)?;
-    let prompt_assets = merged_prompt_assets(&request.prompt_assets, &synthesized_prompt_assets);
+    let prompt_assets = merged_prompt_assets(
+        &merged_prompt_assets(&request.prompt_assets, &compiled_prompt_assets),
+        &synthesized_prompt_assets,
+    );
     let messages = composer.compose_messages(
         request.system_prompt.as_deref(),
         request.self_model.as_ref(),
@@ -1680,6 +2301,7 @@ pub fn generate_with_context_using_synthesizer(
     Ok(ContextResponse {
         response,
         recalled_memories: memories,
+        synthesized_prompt_assets,
     })
 }
 
@@ -1690,9 +2312,17 @@ pub fn generate_with_context_stream(
     request: &ContextRequest,
     on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
 ) -> Result<ContextResponse> {
+    let workspace_namespace = request
+        .memory_query
+        .memory_query
+        .namespace
+        .as_ref()
+        .map(workspace_namespace_from_memory_namespace)
+        .unwrap_or_else(WorkspaceNamespace::local_default);
     let synthesizer = LlmPromptAssetSynthesizer::new(
         registry,
         request.generation.model.clone(),
+        workspace_namespace,
         DefaultPromptAssetSynthesizer,
     );
     generate_with_context_stream_using_synthesizer(
@@ -1714,8 +2344,13 @@ pub fn generate_with_context_stream_using_synthesizer(
     on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
 ) -> Result<ContextResponse> {
     let memories = retriever.retrieve(&request.memory_query)?;
+    let recalled_assets = asset_views_from_retrieved_memories(&memories);
+    let compiled_prompt_assets = compiled_prompt_assets_from_asset_views(&recalled_assets);
     let synthesized_prompt_assets = synthesizer.synthesize(&memories)?;
-    let prompt_assets = merged_prompt_assets(&request.prompt_assets, &synthesized_prompt_assets);
+    let prompt_assets = merged_prompt_assets(
+        &merged_prompt_assets(&request.prompt_assets, &compiled_prompt_assets),
+        &synthesized_prompt_assets,
+    );
     let messages = composer.compose_messages(
         request.system_prompt.as_deref(),
         request.self_model.as_ref(),
@@ -1734,6 +2369,7 @@ pub fn generate_with_context_stream_using_synthesizer(
     Ok(ContextResponse {
         response,
         recalled_memories: memories,
+        synthesized_prompt_assets,
     })
 }
 
@@ -1745,6 +2381,14 @@ pub fn workspace_namespace_from_memory_namespace(
 
 pub fn default_workspace_root() -> &'static Path {
     Path::new("workspace")
+}
+
+pub fn load_assistant_wenyan_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::AssistantWenyanRewrite,
+    )
 }
 
 pub fn persist_room_memory(
@@ -1769,33 +2413,111 @@ pub fn persist_room_memory(
         .file_name
         .clone()
         .unwrap_or_else(|| default_room_asset_file_name(request));
-    let mut asset = MemoryRoomAsset::new(
-        asset_id,
+    let mut draft = ArtifactDraft::new(
         request.room_id.clone(),
-        file_name,
         request.room_layer.clone(),
         MemoryRoomAssetKind::Compressed,
         request.title.clone(),
         request.summary.clone(),
     )
-    .with_namespace(MemoryNamespace::new(namespace.tenant_id, namespace.user_id))
     .with_visibility(request.visibility.clone())
-    .with_memory_kind(request.memory_kind.clone());
+    .with_memory_kind(request.memory_kind.clone())
+    .with_file_name(file_name);
 
     for owner in &request.owners {
-        asset = asset.with_owner(owner.clone());
+        draft = draft.with_owner(owner.clone());
     }
     for tag in &request.tags {
-        asset = asset.with_tag(tag.clone());
+        draft = draft.with_tag(tag.clone());
     }
     for source in &request.derived_from {
-        asset = asset.with_derived_from(source.clone());
+        draft = draft.with_derived_from(source.clone());
     }
     for source_doc in &request.source_docs {
-        asset = asset.with_source_doc(source_doc.clone());
+        draft = draft.with_source_doc(source_doc.clone());
     }
 
-    repository.write_asset(&room, &asset)
+    repository.write_artifact_draft(&room, asset_id, draft)
+}
+
+pub fn persist_synthesized_prompt_assets(
+    root: impl Into<PathBuf>,
+    namespace: WorkspaceNamespace,
+    response: &ContextResponse,
+) -> Result<Vec<PathBuf>> {
+    let root = root.into();
+    let repository = MemoryRoomRepository::with_namespace(root.clone(), namespace.clone());
+    let mut paths = Vec::new();
+
+    for prompt_asset in &response.synthesized_prompt_assets {
+        let Some(source_memory) = response
+            .recalled_memories
+            .iter()
+            .find(|memory| memory.id == prompt_asset.id)
+        else {
+            continue;
+        };
+        let Some((room_id, room_layer)) = prompt_asset_target_room(
+            source_memory,
+            &MemoryNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()),
+        ) else {
+            continue;
+        };
+
+        let slug = slugify_for_memory(&prompt_asset.title);
+        let asset_id = format!("asset.{room_id}.prompt.{slug}");
+        let mut draft = ArtifactDraft::new(
+            room_id.clone(),
+            room_layer.clone(),
+            MemoryRoomAssetKind::Compressed,
+            prompt_asset.title.clone(),
+            prompt_asset.content.clone(),
+        )
+        .with_visibility(hc_memory::MemoryVisibility::Private)
+        .with_memory_kind(source_memory.kind.clone())
+        .with_stage(prompt_asset.stage.clone())
+        .with_form(prompt_asset.form.clone())
+        .with_tag("prompt")
+        .with_tag(format!("{:?}", prompt_asset.kind).to_ascii_lowercase())
+        .with_file_name(format!("prompt.{slug}.md"));
+
+        if let Some(source_room_id) = &source_memory.room_id {
+            draft = draft.with_owner(MemoryOwnerRef::new(
+                owner_kind_for_layer(&room_layer),
+                source_room_id.clone(),
+            ));
+        }
+        draft = draft.with_derived_from(source_memory.id.clone());
+
+        for tag in &prompt_asset.tags {
+            draft = draft.with_tag(tag.clone());
+        }
+
+        let room = MemoryRoom::new(
+            room_id.clone(),
+            room_layer,
+            format!("Prompt Memory | {}", prompt_asset.title),
+            prompt_asset.content.clone(),
+        );
+        let materialized = repository.materialize_artifact_draft(&room, asset_id.clone(), draft)?;
+        persist_room_evolution_event(
+            &repository,
+            &room,
+            ArtifactEvolutionEvent::new(
+                format!("event.{asset_id}.compiled.{}", current_unix_timestamp_ms()),
+                asset_id,
+                room_id.clone(),
+                ArtifactEvolutionAction::Promoted,
+                "compiled recalled memory into prompt asset",
+            ),
+            vec!["prompt".to_owned(), format!("{:?}", prompt_asset.kind).to_ascii_lowercase()],
+            vec![source_memory.id.clone()],
+            vec![materialized.room_relative_path.clone()],
+        )?;
+        paths.push(materialized.path);
+    }
+
+    Ok(paths)
 }
 
 pub fn room_memory_write_request_from_response(
@@ -1853,6 +2575,714 @@ pub fn prompt_asset_from_memory(
     asset
 }
 
+pub fn prompt_asset_from_compiled_memory(memory: &RetrievedMemory) -> Option<PromptAsset> {
+    if !memory.tags.iter().any(|tag| tag == "prompt") {
+        return None;
+    }
+
+    let kind = infer_prompt_asset_kind_from_compiled_memory(memory)?;
+    let mut asset = PromptAsset::new(memory.id.clone(), kind, memory.title.clone(), memory.summary.clone());
+    for tag in &memory.tags {
+        asset = asset.with_tag(tag.clone());
+    }
+    Some(asset)
+}
+
+pub fn prompt_asset_from_asset_view(asset: &AssetView) -> Option<PromptAsset> {
+    if asset.status == AssetStatus::Retired
+        || !asset.consumers.iter().any(|consumer| consumer == &AssetConsumer::Llm)
+        || asset.form != MemoryAssetForm::Prompt
+    {
+        return None;
+    }
+
+    let kind = infer_prompt_asset_kind_from_asset_view(asset)?;
+    let mut prompt_asset =
+        PromptAsset::new(asset.id.clone(), kind, asset.title.clone(), asset.content.clone());
+    for tag in &asset.tags {
+        prompt_asset = prompt_asset.with_tag(tag.clone());
+    }
+    Some(prompt_asset)
+}
+
+pub fn compiled_prompt_assets_from_asset_views(assets: &[AssetView]) -> Vec<PromptAsset> {
+    assets
+        .iter()
+        .filter_map(prompt_asset_from_asset_view)
+        .collect()
+}
+
+pub fn asset_view_from_memory_record(record: &MemoryRecord) -> AssetView {
+    let form = default_asset_form_for_memory_kind(&record.kind);
+    AssetView {
+        id: record.id.clone(),
+        title: record.title.clone(),
+        summary: record.summary.clone(),
+        content: record.summary.clone(),
+        kind: record.kind.clone(),
+        stage: MemoryAssetStage::Extracted,
+        form: form.clone(),
+        target: infer_asset_target_from_memory_record(record),
+        target_ref: infer_asset_target_ref_from_memory_record(record),
+        consumers: infer_asset_consumers(form, &record.tags),
+        status: infer_asset_status(&record.tags),
+        visibility: record.visibility.clone(),
+        tags: record.tags.clone(),
+        owners: vec![record.owner.clone()],
+        derived_from: record.derived_from.clone(),
+        source_docs: Vec::new(),
+    }
+}
+
+pub fn asset_view_from_room_asset(asset: &MemoryRoomAsset) -> AssetView {
+    let form = if asset.tags.iter().any(|tag| tag == "validation") {
+        MemoryAssetForm::Policy
+    } else {
+        asset.form.clone()
+    };
+    AssetView {
+        id: asset.id.clone(),
+        title: asset.title.clone(),
+        summary: asset.summary.clone(),
+        content: asset.summary.clone(),
+        kind: asset.memory_kind.clone(),
+        stage: asset.stage.clone(),
+        form: form.clone(),
+        target: infer_asset_target_from_room_asset(asset),
+        target_ref: infer_asset_target_ref_from_room_asset(asset),
+        consumers: infer_asset_consumers(form, &asset.tags),
+        status: infer_asset_status(&asset.tags),
+        visibility: asset.visibility.clone(),
+        tags: asset.tags.clone(),
+        owners: asset.owners.clone(),
+        derived_from: asset.derived_from.clone(),
+        source_docs: asset.source_docs.clone(),
+    }
+}
+
+pub fn asset_view_from_retrieved_memory(memory: &RetrievedMemory) -> AssetView {
+    let form = if memory.tags.iter().any(|tag| tag == "prompt") {
+        MemoryAssetForm::Prompt
+    } else if memory.tags.iter().any(|tag| tag == "validation") {
+        MemoryAssetForm::Policy
+    } else {
+        default_asset_form_for_memory_kind(&memory.kind)
+    };
+    AssetView {
+        id: memory.id.clone(),
+        title: memory.title.clone(),
+        summary: memory.summary.clone(),
+        content: memory.summary.clone(),
+        kind: memory.kind.clone(),
+        stage: inferred_stage_from_retrieved_memory(memory),
+        form: form.clone(),
+        target: infer_asset_target_from_retrieved_memory(memory),
+        target_ref: memory.room_id.clone(),
+        consumers: infer_asset_consumers(form, &memory.tags),
+        status: infer_asset_status(&memory.tags),
+        visibility: hc_memory::MemoryVisibility::Private,
+        tags: memory.tags.clone(),
+        owners: memory
+            .room_id
+            .as_ref()
+            .zip(memory.layer.as_ref())
+            .map(|(room_id, layer)| {
+                vec![MemoryOwnerRef::new(owner_kind_for_layer(layer), room_id.clone())]
+            })
+            .unwrap_or_default(),
+        derived_from: memory.derived_from.clone(),
+        source_docs: Vec::new(),
+    }
+}
+
+pub fn asset_views_from_retrieved_memories(memories: &[RetrievedMemory]) -> Vec<AssetView> {
+    memories
+        .iter()
+        .map(asset_view_from_retrieved_memory)
+        .collect()
+}
+
+pub fn tool_memory_query(
+    namespace: MemoryNamespace,
+    tool: &ToolSpec,
+    _goal: impl Into<String>,
+) -> ContextMemoryQuery {
+    let tool_slug = tool.id.trim_start_matches("tool.");
+    ContextMemoryQuery::default()
+        .for_namespace(namespace)
+        .with_room_anchor(tool_room_id(tool))
+        .with_limit(12)
+        .with_tag(tool_slug)
+}
+
+pub fn load_tool_assets(
+    retriever: &impl MemoryRetriever,
+    namespace: MemoryNamespace,
+    tool: &ToolSpec,
+) -> Result<Vec<AssetView>> {
+    let query = tool_memory_query(namespace, tool, tool.name.clone());
+    let mut memories = retriever.retrieve(&query)?;
+    let room_memories = read_tool_room_memories(default_workspace_root(), &query, tool)?;
+    merge_retrieved_memories(&mut memories, room_memories);
+    let mut assets = asset_views_from_retrieved_memories(&memories);
+    let superseded = superseded_tool_asset_ids(&assets);
+    assets.retain(|asset| {
+        !superseded.contains(&asset.id)
+            || asset.tags.iter().any(|tag| {
+                matches!(tag.as_str(), "compiled" | "promotion" | "revision" | "retired")
+            })
+    });
+    assets.sort_by_key(tool_asset_priority);
+    assets.reverse();
+    Ok(assets)
+}
+
+pub fn build_tool_execution_plan_from_assets(
+    binder: &impl ToolExecutionBinder,
+    goal: impl Into<String>,
+    tool: &ToolSpec,
+    assets: &[AssetView],
+) -> Result<ToolExecutionPlan> {
+    binder.bind(&goal.into(), tool, assets)
+}
+
+pub fn build_tool_execution_plan(
+    retriever: &impl MemoryRetriever,
+    binder: &impl ToolExecutionBinder,
+    namespace: MemoryNamespace,
+    goal: impl Into<String>,
+    tool: &ToolSpec,
+) -> Result<ToolExecutionPlan> {
+    let goal = goal.into();
+    let assets = load_tool_assets(retriever, namespace, tool)?;
+    build_tool_execution_plan_from_assets(binder, goal, tool, &assets)
+}
+
+pub fn evaluate_tool_execution(
+    tool: &ToolSpec,
+    plan: &ToolExecutionPlan,
+    outcome: &ToolExecutionOutcome,
+    assets: &[AssetView],
+    generalization_policy: &GeneralizationPolicy,
+    promotion_rule: &PromotionRule,
+    retirement_rule: &RetirementRule,
+) -> ToolExecutionEvaluation {
+    let matched_assets = assets
+        .iter()
+        .filter(|asset| asset_matches_tool(asset, tool))
+        .filter(|asset| {
+            asset.consumers.iter().any(|consumer| {
+                matches!(
+                    consumer,
+                    AssetConsumer::Executor | AssetConsumer::Evaluator | AssetConsumer::Planner
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let signals = infer_tool_execution_signals(plan, outcome);
+    let supporting_events = matched_assets.len();
+    let human_confirmed = signals
+        .iter()
+        .any(|signal| matches!(signal, EvaluationSignal::HumanConfirmed));
+    let revision_triggered = should_revise(&signals);
+
+    let mut generalize_candidate_ids = Vec::new();
+    let mut promote_candidate_ids = Vec::new();
+    let mut revise_candidate_ids = Vec::new();
+    let mut retire_candidate_ids = Vec::new();
+    let mut events = Vec::new();
+    let signal_labels = signals
+        .iter()
+        .map(|signal| format!("{signal:?}"))
+        .collect::<Vec<_>>();
+    let signal_reason = if signal_labels.is_empty() {
+        "no evaluation signals".to_owned()
+    } else {
+        format!("signals: {}", signal_labels.join(", "))
+    };
+
+    for asset in &matched_assets {
+        if should_generalize(
+            asset,
+            supporting_events,
+            human_confirmed,
+            generalization_policy,
+        ) {
+            generalize_candidate_ids.push(asset.id.clone());
+        }
+        let failed_evaluations = failed_tool_evaluation_count(&asset.id, assets)
+            + usize::from(revision_triggered);
+        if should_retire(failed_evaluations, &signals, retirement_rule) {
+            retire_candidate_ids.push(asset.id.clone());
+        } else {
+            if can_promote(asset, promotion_rule) && !revision_triggered {
+                promote_candidate_ids.push(asset.id.clone());
+            }
+            if revision_triggered {
+            revise_candidate_ids.push(asset.id.clone());
+            }
+        }
+
+        events.push(AssetEvolutionEvent {
+            id: format!(
+                "event.{}.evaluated.{}",
+                asset.id,
+                current_unix_timestamp_ms()
+            ),
+            asset_id: asset.id.clone(),
+            action: EvolutionAction::Evaluated,
+            reason: signal_reason.clone(),
+            inputs: plan.suggested_command.clone(),
+            outputs: outcome.observations.clone(),
+            confidence_milli: asset_confidence(asset),
+            created_at_ms: current_unix_timestamp_ms(),
+        });
+    }
+
+    for asset_id in &promote_candidate_ids {
+        events.push(AssetEvolutionEvent {
+            id: format!("event.{asset_id}.promoted.{}", current_unix_timestamp_ms()),
+            asset_id: asset_id.clone(),
+            action: EvolutionAction::Promoted,
+            reason: format!(
+                "eligible for promotion from {:?} to {:?}",
+                promotion_rule.from_stage, promotion_rule.to_stage
+            ),
+            inputs: signal_labels.clone(),
+            outputs: vec![format!("promote_to:{:?}", promotion_rule.to_stage)],
+            confidence_milli: promotion_rule.min_confidence_milli,
+            created_at_ms: current_unix_timestamp_ms(),
+        });
+    }
+
+    for asset_id in &revise_candidate_ids {
+        events.push(AssetEvolutionEvent {
+            id: format!("event.{asset_id}.revised.{}", current_unix_timestamp_ms()),
+            asset_id: asset_id.clone(),
+            action: EvolutionAction::Revised,
+            reason: "revision rule triggered".to_owned(),
+            inputs: signal_labels.clone(),
+            outputs: vec!["status:revision-draft".to_owned()],
+            confidence_milli: 0,
+            created_at_ms: current_unix_timestamp_ms(),
+        });
+    }
+
+    for asset_id in &retire_candidate_ids {
+        events.push(AssetEvolutionEvent {
+            id: format!("event.{asset_id}.retired.{}", current_unix_timestamp_ms()),
+            asset_id: asset_id.clone(),
+            action: EvolutionAction::Retired,
+            reason: "retirement rule triggered".to_owned(),
+            inputs: signal_labels.clone(),
+            outputs: vec!["status:retired".to_owned()],
+            confidence_milli: 0,
+            created_at_ms: current_unix_timestamp_ms(),
+        });
+    }
+
+    ToolExecutionEvaluation {
+        tool_id: tool.id.clone(),
+        matched_asset_ids: matched_assets.iter().map(|asset| asset.id.clone()).collect(),
+        signals,
+        supporting_events,
+        generalize_candidate_ids,
+        promote_candidate_ids,
+        revise_candidate_ids,
+        retire_candidate_ids,
+        events,
+    }
+}
+
+pub fn room_memory_write_request_from_tool_outcome(
+    tool: &ToolSpec,
+    outcome: &ToolExecutionOutcome,
+) -> RoomMemoryWriteRequest {
+    let tool_slug = tool.id.trim_start_matches("tool.");
+    let mut summary = outcome.summary.clone();
+    if !outcome.observations.is_empty() {
+        summary.push_str("\n\nObservations:\n");
+        for observation in &outcome.observations {
+            summary.push_str("- ");
+            summary.push_str(observation);
+            summary.push('\n');
+        }
+        summary = summary.trim_end().to_owned();
+    }
+
+    RoomMemoryWriteRequest::new(
+        tool_room_id(tool),
+        MemoryLayer::Project,
+        format!("{} Execution Outcome", tool.name),
+        summary,
+        MemoryKind::Summary,
+    )
+    .with_owner(MemoryOwnerRef::project(tool_room_id(tool)))
+    .with_tag("tool")
+    .with_tag(tool_slug)
+    .with_tag("execution")
+    .with_tag(if outcome.success { "success" } else { "failure" })
+}
+
+pub fn room_memory_write_requests_from_tool_evaluation(
+    tool: &ToolSpec,
+    evaluation: &ToolExecutionEvaluation,
+) -> Vec<RoomMemoryWriteRequest> {
+    let tool_slug = tool.id.trim_start_matches("tool.");
+    let room_id = tool_room_id(tool);
+    let signal_labels = evaluation
+        .signals
+        .iter()
+        .map(|signal| format!("{signal:?}"))
+        .collect::<Vec<_>>();
+    let summary_asset_id = format!(
+        "asset.room.{}.evaluation-summary.{}",
+        room_id,
+        current_unix_timestamp_ms()
+    );
+    let mut requests = vec![
+        RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            MemoryLayer::Project,
+            format!("{} Evaluation Summary", tool.name),
+            format!(
+                "Signals: {}\n\nMatched assets: {}\nPromote candidates: {}\nRetire candidates: {}",
+                if signal_labels.is_empty() {
+                    "none".to_owned()
+                } else {
+                    signal_labels.join(", ")
+                },
+                if evaluation.matched_asset_ids.is_empty() {
+                    "none".to_owned()
+                } else {
+                    evaluation.matched_asset_ids.join(", ")
+                },
+                if evaluation.promote_candidate_ids.is_empty() {
+                    "none".to_owned()
+                } else {
+                    evaluation.promote_candidate_ids.join(", ")
+                },
+                if evaluation.retire_candidate_ids.is_empty() {
+                    "none".to_owned()
+                } else {
+                    evaluation.retire_candidate_ids.join(", ")
+                },
+            ),
+            MemoryKind::Summary,
+        )
+        .with_owner(MemoryOwnerRef::project(room_id.clone()))
+        .with_tag("tool")
+        .with_tag(tool_slug)
+        .with_tag("evaluation")
+        .with_file_name(format!("evaluation-summary.{}.md", summary_asset_id))
+        .with_asset_id(summary_asset_id),
+    ];
+
+    for event in &evaluation.events {
+        let mut request = RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            MemoryLayer::Project,
+            format!("{} {:?}", tool.name, event.action),
+            format!(
+                "Asset: {}\nReason: {}\nInputs: {}\nOutputs: {}",
+                event.asset_id,
+                event.reason,
+                if event.inputs.is_empty() {
+                    "none".to_owned()
+                } else {
+                    event.inputs.join(", ")
+                },
+                if event.outputs.is_empty() {
+                    "none".to_owned()
+                } else {
+                    event.outputs.join(", ")
+                },
+            ),
+            MemoryKind::Summary,
+        )
+        .with_owner(MemoryOwnerRef::project(room_id.clone()))
+        .with_tag("tool")
+        .with_tag(tool_slug)
+        .with_tag("evaluation-event")
+        .with_tag(format!("{:?}", event.action).to_ascii_lowercase())
+        .with_derived_from(event.asset_id.clone())
+        .with_file_name(format!(
+            "evaluation-event.{}.{}.md",
+            format!("{:?}", event.action).to_ascii_lowercase(),
+            event.id
+        ))
+        .with_asset_id(format!("asset.room.{}.{}", room_id, event.id));
+        for signal in &evaluation.signals {
+            request = request.with_tag(signal_tag(signal));
+        }
+        requests.push(request);
+    }
+
+    requests
+}
+
+pub fn persist_tool_evolution_events(
+    root: impl Into<PathBuf>,
+    namespace: WorkspaceNamespace,
+    tool: &ToolSpec,
+    evaluation: &ToolExecutionEvaluation,
+) -> Result<Vec<PathBuf>> {
+    let root = root.into();
+    let repository = MemoryRoomRepository::with_namespace(root, namespace.clone());
+    let room_id = tool_room_id(tool);
+    let room = MemoryRoom::new(
+        room_id.clone(),
+        MemoryLayer::Project,
+        format!("{} Tool Room", tool.name),
+        tool.description.clone(),
+    );
+    let mut paths = Vec::new();
+
+    for event in &evaluation.events {
+        let event_tags = vec!["tool".to_owned(), tool.id.trim_start_matches("tool.").to_owned()];
+        let memory_event = ArtifactEvolutionEvent::new(
+            event.id.clone(),
+            event.asset_id.clone(),
+            room_id.clone(),
+            artifact_evolution_action_for_tool_event(&event.action),
+            event.reason.clone(),
+        )
+        .with_created_at_ms(event.created_at_ms);
+        paths.push(persist_room_evolution_event(
+            &repository,
+            &room,
+            memory_event,
+            event_tags,
+            event.inputs.clone(),
+            event.outputs.clone(),
+        )?);
+    }
+
+    Ok(paths)
+}
+
+fn artifact_evolution_action_for_tool_event(action: &EvolutionAction) -> ArtifactEvolutionAction {
+    match action {
+        EvolutionAction::Captured => ArtifactEvolutionAction::Created,
+        EvolutionAction::Extracted => ArtifactEvolutionAction::Derived,
+        EvolutionAction::Generalized => ArtifactEvolutionAction::Derived,
+        EvolutionAction::Compiled => ArtifactEvolutionAction::Promoted,
+        EvolutionAction::Bound => ArtifactEvolutionAction::Derived,
+        EvolutionAction::Evaluated => ArtifactEvolutionAction::Evaluated,
+        EvolutionAction::Promoted => ArtifactEvolutionAction::Promoted,
+        EvolutionAction::Revised => ArtifactEvolutionAction::Revised,
+        EvolutionAction::Deprecated => ArtifactEvolutionAction::Superseded,
+        EvolutionAction::Retired => ArtifactEvolutionAction::Retired,
+    }
+}
+
+fn persist_room_evolution_event(
+    repository: &MemoryRoomRepository,
+    room: &MemoryRoom,
+    event: ArtifactEvolutionEvent,
+    tags: Vec<String>,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+) -> Result<PathBuf> {
+    let event = tags.into_iter().fold(event, |event, tag| event.with_tag(tag));
+    let event = inputs
+        .into_iter()
+        .fold(event, |event, input| event.with_input(input));
+    let created_at_ms = if event.created_at_ms == 0 {
+        current_unix_timestamp_ms()
+    } else {
+        event.created_at_ms
+    };
+    let event = outputs
+        .into_iter()
+        .fold(event, |event, output| event.with_output(output))
+        .with_created_at_ms(created_at_ms);
+    Ok(repository.materialize_evolution_event(room, &event)?.path)
+}
+
+pub fn persist_compiled_tool_assets(
+    root: impl Into<PathBuf>,
+    namespace: WorkspaceNamespace,
+    tool: &ToolSpec,
+    assets: &[AssetView],
+    evaluation: &ToolExecutionEvaluation,
+) -> Result<Vec<PathBuf>> {
+    let root = root.into();
+    let repository = MemoryRoomRepository::with_namespace(root, namespace.clone());
+    let room_id = tool_room_id(tool);
+    let room = MemoryRoom::new(
+        room_id.clone(),
+        MemoryLayer::Project,
+        format!("{} Compiled Tool Assets", tool.name),
+        format!("Compiled guidance derived from {}.", tool.name),
+    );
+    let mut paths = Vec::new();
+
+    for asset in assets.iter().filter(|asset| {
+        evaluation
+            .promote_candidate_ids
+            .iter()
+            .any(|candidate| candidate == &asset.id)
+    }) {
+        let slug = slugify_for_memory(&asset.title);
+        let compiled_form = compiled_tool_asset_form(asset);
+        let compiled_title = asset.title.clone();
+        let compiled_content = compiled_tool_asset_content(asset);
+        let compiled_asset_id = format!("asset.{room_id}.compiled.{slug}");
+        let mut draft = ArtifactDraft::new(
+            room_id.clone(),
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            compiled_title,
+            compiled_content,
+        )
+        .with_visibility(hc_memory::MemoryVisibility::Private)
+        .with_memory_kind(asset.kind.clone())
+        .with_stage(MemoryAssetStage::Compiled)
+        .with_form(compiled_form)
+        .with_owner(MemoryOwnerRef::project(room_id.clone()))
+        .with_tag("tool")
+        .with_tag(tool.id.trim_start_matches("tool."))
+        .with_tag("compiled")
+        .with_tag("promotion")
+        .with_derived_from(asset.id.clone())
+        .with_file_name(format!("compiled.{slug}.md"));
+
+        for tag in &asset.tags {
+            draft = draft.with_tag(tag.clone());
+        }
+
+        paths.push(
+            repository
+                .materialize_artifact_draft(&room, compiled_asset_id, draft)?
+                .path,
+        );
+    }
+
+    Ok(paths)
+}
+
+pub fn persist_revised_tool_assets(
+    root: impl Into<PathBuf>,
+    namespace: WorkspaceNamespace,
+    tool: &ToolSpec,
+    assets: &[AssetView],
+    evaluation: &ToolExecutionEvaluation,
+    outcome: &ToolExecutionOutcome,
+) -> Result<Vec<PathBuf>> {
+    let root = root.into();
+    let repository = MemoryRoomRepository::with_namespace(root, namespace.clone());
+    let room_id = tool_room_id(tool);
+    let room = MemoryRoom::new(
+        room_id.clone(),
+        MemoryLayer::Project,
+        format!("{} Revised Tool Assets", tool.name),
+        format!("Revision drafts derived from {}.", tool.name),
+    );
+    let mut paths = Vec::new();
+    let revision_stamp = current_unix_timestamp_ms();
+
+    for asset in assets.iter().filter(|asset| {
+        evaluation
+            .revise_candidate_ids
+            .iter()
+            .any(|candidate| candidate == &asset.id)
+    }) {
+        let slug = slugify_for_memory(&asset.title);
+        let revised_asset_id = format!("asset.{room_id}.revision.{slug}.{revision_stamp}");
+        let mut draft = ArtifactDraft::new(
+            room_id.clone(),
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            format!("{} Revision {}", asset.title, revision_stamp),
+            revised_tool_asset_content(asset, outcome),
+        )
+        .with_visibility(hc_memory::MemoryVisibility::Private)
+        .with_memory_kind(asset.kind.clone())
+        .with_stage(asset.stage.clone())
+        .with_form(asset.form.clone())
+        .with_owner(MemoryOwnerRef::project(room_id.clone()))
+        .with_tag("tool")
+        .with_tag(tool.id.trim_start_matches("tool."))
+        .with_tag("revision")
+        .with_tag("draft")
+        .with_derived_from(asset.id.clone())
+        .with_file_name(format!("revision.{slug}.{revision_stamp}.md"));
+
+        for tag in &asset.tags {
+            draft = draft.with_tag(tag.clone());
+        }
+
+        paths.push(
+            repository
+                .materialize_artifact_draft(&room, revised_asset_id, draft)?
+                .path,
+        );
+    }
+
+    Ok(paths)
+}
+
+pub fn persist_retired_tool_assets(
+    root: impl Into<PathBuf>,
+    namespace: WorkspaceNamespace,
+    tool: &ToolSpec,
+    assets: &[AssetView],
+    evaluation: &ToolExecutionEvaluation,
+) -> Result<Vec<PathBuf>> {
+    let root = root.into();
+    let repository = MemoryRoomRepository::with_namespace(root, namespace.clone());
+    let room_id = tool_room_id(tool);
+    let room = MemoryRoom::new(
+        room_id.clone(),
+        MemoryLayer::Project,
+        format!("{} Retired Tool Assets", tool.name),
+        format!("Retirement markers for {}.", tool.name),
+    );
+    let mut paths = Vec::new();
+    let retirement_stamp = current_unix_timestamp_ms();
+
+    for asset in assets.iter().filter(|asset| {
+        evaluation
+            .retire_candidate_ids
+            .iter()
+            .any(|candidate| candidate == &asset.id)
+    }) {
+        let slug = slugify_for_memory(&asset.title);
+        let retired_asset_id = format!("asset.{room_id}.retired.{slug}.{retirement_stamp}");
+        let mut draft = ArtifactDraft::new(
+            room_id.clone(),
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            format!("{} Retired {}", asset.title, retirement_stamp),
+            retired_tool_asset_content(asset, &evaluation.signals),
+        )
+        .with_visibility(hc_memory::MemoryVisibility::Private)
+        .with_memory_kind(asset.kind.clone())
+        .with_stage(asset.stage.clone())
+        .with_form(asset.form.clone())
+        .with_owner(MemoryOwnerRef::project(room_id.clone()))
+        .with_tag("tool")
+        .with_tag(tool.id.trim_start_matches("tool."))
+        .with_tag("retired")
+        .with_tag("retirement")
+        .with_derived_from(asset.id.clone())
+        .with_file_name(format!("retired.{slug}.{retirement_stamp}.md"));
+
+        for tag in &asset.tags {
+            draft = draft.with_tag(tag.clone());
+        }
+
+        paths.push(
+            repository
+                .materialize_artifact_draft(&room, retired_asset_id, draft)?
+                .path,
+        );
+    }
+
+    Ok(paths)
+}
+
 pub fn summarize_global_preference(
     input: &MemoryOrganizationInput,
 ) -> Option<(String, MemoryKind)> {
@@ -1898,23 +3328,28 @@ pub fn summarize_global_preference_with_llm(
     model: &hc_llm::ModelRef,
     input: &MemoryOrganizationInput,
 ) -> Result<Option<(String, MemoryKind)>> {
+    let instructions = load_managed_prompt_body(
+        default_workspace_root(),
+        &workspace_namespace_from_memory_namespace(&input.namespace),
+        ManagedPromptKind::GlobalPreferenceSummary,
+    )?;
     let response = registry
         .generate(&GenerateRequest {
             model: model.clone(),
             messages: vec![
                 ChatMessage::new(
                     MessageRole::System,
-                    "You summarize durable user preferences into compact memory entries. Return JSON only.",
+                    managed_json_system_prompt(),
                 ),
-                ChatMessage::new(
-                    MessageRole::User,
-                    format!(
-                        "{}\n\nInput JSON:\n{}",
-                        llm_global_preference_summary_instructions(),
-                        serde_json::to_string_pretty(input)?
+                    ChatMessage::new(
+                        MessageRole::User,
+                        format!(
+                            "{}\n\nInput JSON:\n{}",
+                            instructions,
+                            serde_json::to_string_pretty(input)?
+                        ),
                     ),
-                ),
-            ],
+                ],
             temperature: Some(0.1),
             max_output_tokens: Some(300),
             metadata: Default::default(),
@@ -1949,6 +3384,597 @@ fn confidence_for_room_asset_kind(kind: &MemoryRoomAssetKind) -> u16 {
     }
 }
 
+fn inferred_stage_from_retrieved_memory(memory: &RetrievedMemory) -> MemoryAssetStage {
+    if memory
+        .tags
+        .iter()
+        .any(|tag| tag == "prompt" || tag == "compiled")
+    {
+        MemoryAssetStage::Compiled
+    } else if memory.source_kind == "room_compressed" {
+        MemoryAssetStage::Generalized
+    } else {
+        MemoryAssetStage::Extracted
+    }
+}
+
+fn infer_asset_target_from_room_asset(asset: &MemoryRoomAsset) -> AssetTarget {
+    infer_asset_target_from_room_id_and_tags(Some(&asset.room_id), &asset.tags)
+}
+
+fn infer_asset_target_from_memory_record(record: &MemoryRecord) -> AssetTarget {
+    infer_asset_target_from_owner_scope_and_tags(Some(&record.owner), Some(&record.scope), &record.tags)
+}
+
+fn infer_asset_target_ref_from_memory_record(record: &MemoryRecord) -> Option<String> {
+    let owner_id = &record.owner.id;
+    if owner_id.trim().is_empty() {
+        None
+    } else {
+        Some(owner_id.clone())
+    }
+}
+
+fn infer_asset_target_from_retrieved_memory(memory: &RetrievedMemory) -> AssetTarget {
+    if let Some(room_id) = &memory.room_id {
+        infer_asset_target_from_room_id_and_tags(Some(room_id), &memory.tags)
+    } else if matches!(memory.scope, MemoryScope::Global) || memory.tags.iter().any(|tag| tag == "global") {
+        AssetTarget::Global
+    } else {
+        infer_asset_target_from_room_id_and_tags(None, &memory.tags)
+    }
+}
+
+fn infer_asset_target_ref_from_room_asset(asset: &MemoryRoomAsset) -> Option<String> {
+    let target = infer_asset_target_from_room_asset(asset);
+    if matches!(target, AssetTarget::Other) {
+        None
+    } else {
+        Some(asset.room_id.clone())
+    }
+}
+
+fn infer_asset_target_from_room_id_and_tags(room_id: Option<&str>, tags: &[String]) -> AssetTarget {
+    if room_id.is_some_and(|room_id| room_id.starts_with("room.tool."))
+        || tags.iter().any(|tag| tag == "tool")
+    {
+        AssetTarget::Tool
+    } else if room_id.is_some_and(|room_id| room_id.starts_with("room.agent."))
+        || tags.iter().any(|tag| tag == "agent")
+    {
+        AssetTarget::Agent
+    } else if room_id.is_some_and(|room_id| room_id.starts_with("room.project."))
+        || tags.iter().any(|tag| tag == "project")
+    {
+        AssetTarget::Project
+    } else if room_id.is_some_and(|room_id| room_id.starts_with("room.task."))
+        || tags.iter().any(|tag| tag == "task")
+    {
+        AssetTarget::Task
+    } else if room_id.is_some_and(|room_id| room_id.starts_with("room.topic."))
+        || tags.iter().any(|tag| tag == "topic")
+    {
+        AssetTarget::Topic
+    } else if room_id.is_some_and(|room_id| room_id.starts_with("room.global."))
+        || tags.iter().any(|tag| tag == "global")
+    {
+        AssetTarget::Global
+    } else {
+        AssetTarget::Other
+    }
+}
+
+fn infer_asset_target_from_owner_scope_and_tags(
+    owner: Option<&MemoryOwnerRef>,
+    scope: Option<&MemoryScope>,
+    tags: &[String],
+) -> AssetTarget {
+    if owner.is_some_and(|owner| owner.id.starts_with("tool.")) || tags.iter().any(|tag| tag == "tool")
+    {
+        AssetTarget::Tool
+    } else if owner.is_some_and(|owner| {
+        owner.id.starts_with("agent.") || owner.id.starts_with("persona.")
+    }) || tags.iter().any(|tag| tag == "agent")
+    {
+        AssetTarget::Agent
+    } else if owner.is_some_and(|owner| owner.id.starts_with("project."))
+        || tags.iter().any(|tag| tag == "project")
+    {
+        AssetTarget::Project
+    } else if owner.is_some_and(|owner| owner.id.starts_with("task."))
+        || tags.iter().any(|tag| tag == "task")
+    {
+        AssetTarget::Task
+    } else if owner.is_some_and(|owner| owner.id.starts_with("topic."))
+        || tags.iter().any(|tag| tag == "topic")
+    {
+        AssetTarget::Topic
+    } else if scope.is_some_and(|scope| matches!(scope, MemoryScope::Global))
+        || tags.iter().any(|tag| tag == "global")
+    {
+        AssetTarget::Global
+    } else {
+        AssetTarget::Other
+    }
+}
+
+fn infer_asset_consumers(form: MemoryAssetForm, tags: &[String]) -> Vec<AssetConsumer> {
+    let mut consumers = BTreeSet::new();
+
+    match form {
+        MemoryAssetForm::Prompt => {
+            consumers.insert(AssetConsumer::Llm);
+        }
+        MemoryAssetForm::Workflow => {
+            consumers.insert(AssetConsumer::Planner);
+            consumers.insert(AssetConsumer::Human);
+        }
+        MemoryAssetForm::Policy => {
+            consumers.insert(AssetConsumer::Planner);
+            consumers.insert(AssetConsumer::Executor);
+        }
+        MemoryAssetForm::Summary => {
+            consumers.insert(AssetConsumer::Human);
+            consumers.insert(AssetConsumer::Planner);
+        }
+        MemoryAssetForm::Rewrite => {
+            consumers.insert(AssetConsumer::Llm);
+            consumers.insert(AssetConsumer::Human);
+        }
+        _ => {
+            consumers.insert(AssetConsumer::Human);
+        }
+    }
+
+    if tags.iter().any(|tag| tag == "validation") {
+        consumers.insert(AssetConsumer::Executor);
+        consumers.insert(AssetConsumer::Evaluator);
+    }
+    if tags.iter().any(|tag| tag == "recipe" || tag == "recovery") {
+        consumers.insert(AssetConsumer::Executor);
+    }
+
+    consumers.into_iter().collect()
+}
+
+fn infer_asset_status(tags: &[String]) -> AssetStatus {
+    if tags.iter().any(|tag| tag == "retired") {
+        AssetStatus::Retired
+    } else if tags.iter().any(|tag| tag == "deprecated") {
+        AssetStatus::Deprecated
+    } else if tags.iter().any(|tag| tag == "draft") {
+        AssetStatus::Draft
+    } else {
+        AssetStatus::Active
+    }
+}
+
+fn default_asset_form_for_memory_kind(kind: &MemoryKind) -> MemoryAssetForm {
+    match kind {
+        MemoryKind::Preference => MemoryAssetForm::Policy,
+        MemoryKind::WorkflowMemory => MemoryAssetForm::Workflow,
+        MemoryKind::Summary => MemoryAssetForm::Summary,
+        MemoryKind::Knowledge => MemoryAssetForm::Fact,
+        MemoryKind::Decision => MemoryAssetForm::Policy,
+    }
+}
+
+fn infer_prompt_asset_kind_from_asset_view(asset: &AssetView) -> Option<PromptAssetKind> {
+    if asset.tags.iter().any(|tag| tag == "styleguide") {
+        Some(PromptAssetKind::StyleGuide)
+    } else if asset.tags.iter().any(|tag| tag == "behaviortemplate") {
+        Some(PromptAssetKind::BehaviorTemplate)
+    } else if asset.tags.iter().any(|tag| tag == "outputcontract") {
+        Some(PromptAssetKind::OutputContract)
+    } else if asset.tags.iter().any(|tag| tag == "systempolicy") {
+        Some(PromptAssetKind::SystemPolicy)
+    } else if asset.tags.iter().any(|tag| tag == "promptmemory" || tag == "prompt") {
+        Some(PromptAssetKind::PromptMemory)
+    } else {
+        None
+    }
+}
+
+pub fn seed_tool_rg() -> ToolSpec {
+    ToolSpec {
+        id: "tool.rg".to_owned(),
+        name: "ripgrep".to_owned(),
+        description: "Fast recursive workspace search.".to_owned(),
+        execution_kind: ToolExecutionKind::Cli,
+        stability: ToolStability::Stable,
+        model_dependence: hc_capability::ModelDependence::Optional,
+        default_command: vec!["rg".to_owned()],
+        tags: vec![
+            "tool".to_owned(),
+            "rg".to_owned(),
+            "search".to_owned(),
+            "workspace".to_owned(),
+        ],
+    }
+}
+
+pub fn seed_tool_cargo_test() -> ToolSpec {
+    ToolSpec {
+        id: "tool.cargo-test".to_owned(),
+        name: "cargo test".to_owned(),
+        description: "Run Rust test targets with optional filtering.".to_owned(),
+        execution_kind: ToolExecutionKind::Cli,
+        stability: ToolStability::Stable,
+        model_dependence: hc_capability::ModelDependence::Optional,
+        default_command: vec!["cargo".to_owned(), "test".to_owned()],
+        tags: vec![
+            "tool".to_owned(),
+            "cargo-test".to_owned(),
+            "testing".to_owned(),
+            "workspace".to_owned(),
+        ],
+    }
+}
+
+fn default_tool_command(tool: &ToolSpec, goal: &str) -> Vec<String> {
+    match tool.id.as_str() {
+        "tool.rg" => default_rg_command(goal),
+        "tool.cargo-test" => default_cargo_test_command(goal),
+        _ => tool.default_command.clone(),
+    }
+}
+
+pub fn tool_room_id(tool: &ToolSpec) -> String {
+    format!("room.tool.{}", tool.id.trim_start_matches("tool."))
+}
+
+fn read_tool_room_memories(
+    root: impl AsRef<Path>,
+    query: &ContextMemoryQuery,
+    tool: &ToolSpec,
+) -> Result<Vec<RetrievedMemory>> {
+    let Some(namespace) = query.memory_query.namespace.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let workspace_namespace = workspace_namespace_from_memory_namespace(namespace);
+    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace);
+    let room = MemoryRoom::new(
+        tool_room_id(tool),
+        MemoryLayer::Project,
+        tool.name.clone(),
+        tool.description.clone(),
+    );
+    let assets = repository.read_compressed_assets(&room).unwrap_or_default();
+    Ok(assets.into_iter().map(|asset| RetrievedMemory::from(&asset)).collect())
+}
+
+fn merge_retrieved_memories(existing: &mut Vec<RetrievedMemory>, extras: Vec<RetrievedMemory>) {
+    let mut seen = existing
+        .iter()
+        .map(|memory| memory.id.clone())
+        .collect::<BTreeSet<_>>();
+    for memory in extras {
+        if seen.insert(memory.id.clone()) {
+            existing.push(memory);
+        }
+    }
+}
+
+fn default_rg_command(goal: &str) -> Vec<String> {
+    let lowered = goal.to_ascii_lowercase();
+    if contains_any(&lowered, &["file", "path", "which file", "哪个文件", "在哪"]) {
+        vec!["rg".to_owned(), "--files".to_owned()]
+    } else {
+        vec!["rg".to_owned(), "-n".to_owned()]
+    }
+}
+
+fn default_cargo_test_command(_goal: &str) -> Vec<String> {
+    vec!["cargo".to_owned(), "test".to_owned()]
+}
+
+fn tool_slug_from_asset(asset: &AssetView) -> Option<String> {
+    if let Some(target_ref) = &asset.target_ref
+        && let Some(rest) = target_ref.strip_prefix("room.tool.")
+    {
+        return Some(rest.to_owned());
+    }
+
+    asset.tags
+        .iter()
+        .find(|tag| !matches!(tag.as_str(), "tool" | "recipe" | "validation" | "recovery" | "prompt"))
+        .cloned()
+}
+
+fn asset_matches_tool(asset: &AssetView, tool: &ToolSpec) -> bool {
+    if asset.target != AssetTarget::Tool
+        || matches!(asset.status, AssetStatus::Retired | AssetStatus::Draft)
+        || !asset
+            .consumers
+            .iter()
+            .any(|consumer| consumer == &AssetConsumer::Executor)
+    {
+        return false;
+    }
+
+    let tool_slug = tool.id.trim_start_matches("tool.");
+    tool_slug_from_asset(asset).is_some_and(|slug| slug == tool_slug)
+}
+
+impl ToolExecutionBinder for DefaultToolExecutionBinder {
+    fn bind(&self, goal: &str, tool: &ToolSpec, assets: &[AssetView]) -> Result<ToolExecutionPlan> {
+        let mut compiled_guidance = Vec::new();
+        let mut guidance = Vec::new();
+        let mut compiled_validation_steps = Vec::new();
+        let mut validation_steps = Vec::new();
+        let mut compiled_recovery_steps = Vec::new();
+        let mut recovery_steps = Vec::new();
+
+        for asset in assets.iter().filter(|asset| asset_matches_tool(asset, tool)) {
+            if asset.tags.iter().any(|tag| tag == "recipe") {
+                if asset.stage == MemoryAssetStage::Compiled
+                    || asset.tags.iter().any(|tag| tag == "compiled")
+                {
+                    push_unique(&mut compiled_guidance, asset.content.clone());
+                } else {
+                    push_unique(&mut guidance, asset.content.clone());
+                }
+            } else if asset.tags.iter().any(|tag| tag == "validation") {
+                if asset.stage == MemoryAssetStage::Compiled
+                    || asset.tags.iter().any(|tag| tag == "compiled")
+                {
+                    push_unique(&mut compiled_validation_steps, asset.content.clone());
+                } else {
+                    push_unique(&mut validation_steps, asset.content.clone());
+                }
+            } else if asset.tags.iter().any(|tag| tag == "recovery") {
+                if asset.stage == MemoryAssetStage::Compiled
+                    || asset.tags.iter().any(|tag| tag == "compiled")
+                {
+                    push_unique(&mut compiled_recovery_steps, asset.content.clone());
+                } else {
+                    push_unique(&mut recovery_steps, asset.content.clone());
+                }
+            }
+        }
+
+        Ok(ToolExecutionPlan {
+            tool_id: tool.id.clone(),
+            suggested_command: default_tool_command(tool, goal),
+            guidance: if compiled_guidance.is_empty() {
+                guidance
+            } else {
+                compiled_guidance
+            },
+            validation_steps: if compiled_validation_steps.is_empty() {
+                validation_steps
+            } else {
+                compiled_validation_steps
+            },
+            recovery_steps: if compiled_recovery_steps.is_empty() {
+                recovery_steps
+            } else {
+                compiled_recovery_steps
+            },
+        })
+    }
+}
+
+pub fn should_generalize(
+    asset: &AssetView,
+    supporting_events: usize,
+    human_confirmed: bool,
+    policy: &GeneralizationPolicy,
+) -> bool {
+    if human_confirmed && policy.allow_human_confirmation_override {
+        return asset.status != AssetStatus::Retired;
+    }
+
+    if asset.status == AssetStatus::Retired || asset.status == AssetStatus::Draft {
+        return false;
+    }
+
+    asset_confidence(asset) >= policy.min_confidence_milli
+        && supporting_events >= policy.min_supporting_events
+        && (!policy.require_repeated_pattern || supporting_events > 1)
+}
+
+pub fn can_promote(asset: &AssetView, rule: &PromotionRule) -> bool {
+    asset.stage == rule.from_stage
+        && asset_confidence(asset) >= rule.min_confidence_milli
+        && rule
+            .required_tags
+            .iter()
+            .all(|tag| asset.tags.iter().any(|candidate| candidate == tag))
+        && rule
+            .required_consumers
+            .iter()
+            .all(|consumer| asset.consumers.iter().any(|candidate| candidate == consumer))
+}
+
+pub fn should_retire(
+    failed_evaluations: usize,
+    signals: &[EvaluationSignal],
+    rule: &RetirementRule,
+) -> bool {
+    (rule.retire_on_explicit_human_rejection
+        && signals
+            .iter()
+            .any(|signal| matches!(signal, EvaluationSignal::HumanRejected)))
+        || failed_evaluations >= rule.max_failed_evaluations
+        || (rule.allow_replacement_by_newer_asset
+            && signals
+                .iter()
+                .any(|signal| matches!(signal, EvaluationSignal::SupersededByNewerAsset)))
+}
+
+pub fn should_revise(signals: &[EvaluationSignal]) -> bool {
+    signals.iter().any(|signal| {
+        matches!(
+            signal,
+            EvaluationSignal::ExecutionFailed | EvaluationSignal::ValidationFailed
+        )
+    })
+}
+
+pub fn infer_tool_execution_signals(
+    plan: &ToolExecutionPlan,
+    outcome: &ToolExecutionOutcome,
+) -> Vec<EvaluationSignal> {
+    let mut signals = Vec::new();
+    if outcome.success {
+        signals.push(EvaluationSignal::ExecutionSucceeded);
+    } else {
+        signals.push(EvaluationSignal::ExecutionFailed);
+    }
+
+    if !plan.validation_steps.is_empty() {
+        let combined = format!("{}\n{}", outcome.summary, outcome.observations.join("\n"));
+        let lowered = combined.to_ascii_lowercase();
+        let validation_failed = !outcome.success
+            || lowered.contains("0 tests")
+            || lowered.contains("no rg matches")
+            || lowered.contains("no file candidates")
+            || lowered.contains("no matches found");
+        signals.push(if validation_failed {
+            EvaluationSignal::ValidationFailed
+        } else {
+            EvaluationSignal::ValidationPassed
+        });
+    }
+
+    if outcome.success && outcome.observations.len() >= 2 {
+        signals.push(EvaluationSignal::RepeatedReuse);
+    }
+
+    signals
+}
+
+fn asset_confidence(asset: &AssetView) -> u16 {
+    if asset.tags.iter().any(|tag| tag == "high-confidence") {
+        950
+    } else if asset.status == AssetStatus::Draft {
+        500
+    } else {
+        800
+    }
+}
+
+fn current_unix_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn compiled_tool_asset_form(asset: &AssetView) -> MemoryAssetForm {
+    if asset.tags.iter().any(|tag| tag == "recipe") {
+        MemoryAssetForm::Workflow
+    } else if asset.tags.iter().any(|tag| tag == "validation") {
+        MemoryAssetForm::Policy
+    } else if asset.tags.iter().any(|tag| tag == "recovery") {
+        MemoryAssetForm::Policy
+    } else {
+        MemoryAssetForm::Policy
+    }
+}
+
+fn compiled_tool_asset_content(asset: &AssetView) -> String {
+    asset.content.trim().to_owned()
+}
+
+fn revised_tool_asset_content(asset: &AssetView, outcome: &ToolExecutionOutcome) -> String {
+    format!(
+        "Revision draft for asset `{}`.\n\nFailure summary: {}\n\nOriginal guidance:\n{}",
+        asset.id,
+        outcome.summary,
+        asset.content.trim()
+    )
+}
+
+fn retired_tool_asset_content(asset: &AssetView, signals: &[EvaluationSignal]) -> String {
+    let signal_summary = if signals.is_empty() {
+        "none".to_owned()
+    } else {
+        signals
+            .iter()
+            .map(|signal| format!("{signal:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Retirement marker for asset `{}`.\n\nSignals: {}\n\nPrevious guidance:\n{}",
+        asset.id,
+        signal_summary,
+        asset.content.trim()
+    )
+}
+
+fn tool_asset_priority(asset: &AssetView) -> u8 {
+    let mut score = 0u8;
+    if asset.stage == MemoryAssetStage::Compiled || asset.tags.iter().any(|tag| tag == "compiled")
+    {
+        score += 4;
+    }
+    if asset.tags.iter().any(|tag| tag == "promotion") {
+        score += 2;
+    }
+    if asset.tags.iter().any(|tag| tag == "recipe") {
+        score += 1;
+    }
+    score
+}
+
+fn push_unique(values: &mut Vec<String>, candidate: String) {
+    if !values.iter().any(|value| value == &candidate) {
+        values.push(candidate);
+    }
+}
+
+fn superseded_tool_asset_ids(assets: &[AssetView]) -> BTreeSet<String> {
+    let mut superseded = BTreeSet::new();
+    for asset in assets {
+        if asset.tags.iter().any(|tag| {
+            matches!(
+                tag.as_str(),
+                "compiled" | "promotion" | "retired" | "deprecated"
+            )
+        }) {
+            for source in &asset.derived_from {
+                superseded.insert(source.clone());
+            }
+        }
+    }
+    superseded
+}
+
+fn failed_tool_evaluation_count(asset_id: &str, assets: &[AssetView]) -> usize {
+    assets
+        .iter()
+        .filter(|asset| asset.tags.iter().any(|tag| tag == "evaluation-event"))
+        .filter(|asset| asset.derived_from.iter().any(|source| source == asset_id))
+        .filter(|asset| {
+            asset.tags.iter().any(|tag| {
+                matches!(
+                    tag.as_str(),
+                    "execution_failed"
+                        | "validation_failed"
+                        | "executionfailed"
+                        | "validationfailed"
+                )
+            })
+        })
+        .count()
+}
+
+fn signal_tag(signal: &EvaluationSignal) -> &'static str {
+    match signal {
+        EvaluationSignal::HumanConfirmed => "human_confirmed",
+        EvaluationSignal::HumanRejected => "human_rejected",
+        EvaluationSignal::ExecutionSucceeded => "execution_succeeded",
+        EvaluationSignal::ExecutionFailed => "execution_failed",
+        EvaluationSignal::ValidationPassed => "validation_passed",
+        EvaluationSignal::ValidationFailed => "validation_failed",
+        EvaluationSignal::RepeatedReuse => "repeated_reuse",
+        EvaluationSignal::SupersededByNewerAsset => "superseded_by_newer_asset",
+    }
+}
+
 fn pseudo_record_for_room_asset(asset: &MemoryRoomAsset) -> MemoryRecord {
     let mut record = MemoryRecord::new(
         asset.id.clone(),
@@ -1972,6 +3998,91 @@ fn pseudo_record_for_room_asset(asset: &MemoryRoomAsset) -> MemoryRecord {
     }
 
     record
+}
+
+fn prompt_asset_target_room(
+    source_memory: &RetrievedMemory,
+    namespace: &MemoryNamespace,
+) -> Option<(String, MemoryLayer)> {
+    if let (Some(room_id), Some(layer)) = (&source_memory.room_id, &source_memory.layer)
+        && *layer != MemoryLayer::Chat
+    {
+        return Some((room_id.clone(), layer.clone()));
+    }
+
+    if source_memory.tags.iter().any(|tag| tag == "agent") {
+        return Some((
+            format!("room.agent.{}", prompt_room_slug(source_memory)),
+            MemoryLayer::Global,
+        ));
+    }
+
+    if source_memory.tags.iter().any(|tag| tag == "tool") {
+        return Some((
+            format!("room.tool.{}", prompt_room_slug(source_memory)),
+            MemoryLayer::Project,
+        ));
+    }
+
+    if source_memory.tags.iter().any(|tag| tag == "topic") {
+        return Some((
+            format!("room.topic.{}", prompt_room_slug(source_memory)),
+            MemoryLayer::Topic,
+        ));
+    }
+
+    if source_memory.tags.iter().any(|tag| tag == "project") {
+        return Some((
+            format!("room.project.{}", prompt_room_slug(source_memory)),
+            MemoryLayer::Project,
+        ));
+    }
+
+    if source_memory.tags.iter().any(|tag| tag == "task") {
+        return Some((
+            format!("room.task.{}", prompt_room_slug(source_memory)),
+            MemoryLayer::Task,
+        ));
+    }
+
+    match source_memory.scope {
+        MemoryScope::Global => Some((
+            format!(
+                "room.global.{}.{}",
+                slugify_for_memory(&namespace.tenant_id),
+                slugify_for_memory(&namespace.user_id)
+            ),
+            MemoryLayer::Global,
+        )),
+        _ => None,
+    }
+}
+
+fn prompt_room_slug(source_memory: &RetrievedMemory) -> String {
+    for tag in &source_memory.tags {
+        if matches!(
+            tag.as_str(),
+            "prompt"
+                | "global"
+                | "preference"
+                | "styleguide"
+                | "behaviortemplate"
+                | "promptmemory"
+                | "topic"
+                | "agent"
+                | "tool"
+                | "project"
+                | "task"
+        ) {
+            continue;
+        }
+        let slug = slugify_for_memory(tag);
+        if !slug.is_empty() {
+            return slug;
+        }
+    }
+
+    slugify_for_memory(&source_memory.title)
 }
 
 fn owner_kind_for_layer(layer: &MemoryLayer) -> MemoryOwnerKind {
@@ -2161,28 +4272,328 @@ fn infer_prompt_asset_kind_from_preference(memory: &RetrievedMemory) -> PromptAs
     }
 }
 
-fn llm_prompt_asset_synthesizer_instructions() -> &'static str {
-    "Turn the recalled memories into prompt assets that should shape future model behavior.\n\
-Only produce assets for durable instruction-like memories such as user preferences, naming, language, style, output constraints, or other long-lived behavior guidance.\n\
-Prefer zero assets over low-confidence assets.\n\
-Return strict JSON with this schema:\n\
-{\"assets\":[{\"source_memory_id\":\"optional memory id\",\"kind\":\"system_policy|behavior_template|style_guide|output_contract|prompt_memory\",\"title\":\"short title\",\"content\":\"instruction text for the model\",\"tags\":[\"tag\"]}]}"
+fn infer_prompt_asset_kind_from_compiled_memory(memory: &RetrievedMemory) -> Option<PromptAssetKind> {
+    if memory.tags.iter().any(|tag| tag == "styleguide") {
+        Some(PromptAssetKind::StyleGuide)
+    } else if memory.tags.iter().any(|tag| tag == "behaviortemplate") {
+        Some(PromptAssetKind::BehaviorTemplate)
+    } else if memory.tags.iter().any(|tag| tag == "outputcontract") {
+        Some(PromptAssetKind::OutputContract)
+    } else if memory.tags.iter().any(|tag| tag == "systempolicy") {
+        Some(PromptAssetKind::SystemPolicy)
+    } else if memory.tags.iter().any(|tag| tag == "promptmemory") {
+        Some(PromptAssetKind::PromptMemory)
+    } else {
+        None
+    }
 }
 
-fn llm_memory_organizer_instructions() -> &'static str {
-    "Decide how to organize this memory write.\n\
-Honor any explicit room_id_hint, room_layer_hint, owner, visibility, and tags when they are present.\n\
-Only suggest promotions when the content should persist beyond the current room, especially global user preferences.\n\
-Return strict JSON with this schema:\n\
-{\"room_layer\":\"chat|topic|task|project|global|null\",\"room_id\":\"optional room id\",\"title\":\"optional title\",\"memory_kind\":\"summary|decision|preference|workflow_memory|knowledge|null\",\"tags\":[\"tag\"],\"promotions\":[{\"target_layer\":\"chat|topic|task|project|global\",\"target_room_id\":\"optional room id\",\"reason\":\"why\"}]}"
+fn managed_json_system_prompt() -> &'static str {
+    "Follow the provided local prompt asset. Return JSON only."
 }
 
-fn llm_global_preference_summary_instructions() -> &'static str {
-    "Read the input and decide whether it contains a durable user preference that should be stored as global memory.\n\
-If it does, return a short factual summary in third person, suitable for future recall.\n\
-The memory_kind should usually be \"preference\".\n\
-Return strict JSON with this schema:\n\
-{\"summary\":\"short durable preference summary\",\"memory_kind\":\"preference|summary|knowledge|workflow_memory|decision\"}"
+fn load_managed_prompt_body(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    kind: ManagedPromptKind,
+) -> Result<String> {
+    let store = WorkspaceStore::new(root.as_ref().to_path_buf());
+    let relative_path = managed_prompt_relative_path(kind);
+    ensure_managed_prompt(root.as_ref(), namespace, kind)?;
+    let prompt_path = store.resolve_in_namespace(namespace, &relative_path);
+    fs::read_to_string(&prompt_path)
+        .map(|content| content.trim().to_owned())
+        .map_err(anyhow::Error::from)
+}
+
+fn ensure_managed_prompt(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    kind: ManagedPromptKind,
+) -> Result<()> {
+    let store = WorkspaceStore::new(root.as_ref().to_path_buf());
+    let relative_path = managed_prompt_relative_path(kind);
+    let prompt_path = store.resolve_in_namespace(namespace, &relative_path);
+    let default_content = managed_prompt_default_body(kind);
+    if !prompt_path.exists() {
+        store.write_text_in_namespace(namespace, &relative_path, default_content)?;
+    }
+
+    let sidecar_path = store.resolve_in_namespace(namespace, managed_prompt_sidecar_relative_path(kind));
+    if !sidecar_path.exists() {
+        if let Some(parent) = sidecar_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&sidecar_path, serde_json::to_string_pretty(&managed_prompt_metadata(kind))?)?;
+    }
+
+    let prompt_body = fs::read_to_string(&prompt_path)?;
+    sync_managed_prompt_room_asset(root, namespace, kind, prompt_body.trim())?;
+    Ok(())
+}
+
+fn sync_managed_prompt_room_asset(
+    root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    kind: ManagedPromptKind,
+    content: &str,
+) -> Result<PathBuf> {
+    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let room = managed_prompt_room(namespace);
+    repository.write_room(&room)?;
+
+    let metadata = managed_prompt_metadata(kind);
+    let file_name = managed_prompt_relative_path(kind)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("prompt.md")
+        .to_owned();
+    let current_relative = MemoryRoomRepository::prompt_doc_relative_path(&room, &file_name);
+
+    let previous_asset = repository.read_asset(&current_relative).ok();
+    let mut derived_from = Vec::new();
+    let mut source_docs = vec![managed_prompt_relative_path(kind).display().to_string()];
+
+    if let Some(previous) = previous_asset
+        && previous.summary.trim() != content.trim()
+    {
+        let revision_asset = archive_managed_prompt_revision(
+            &repository,
+            &room,
+            &metadata,
+            kind,
+            &previous,
+        )?;
+        derived_from.push(revision_asset.id.clone());
+        let revision_relative = MemoryRoomRepository::prompt_doc_relative_path(&room, &revision_asset.file_name);
+        source_docs.push(revision_relative.display().to_string());
+        persist_room_evolution_event(
+            &repository,
+            &room,
+            ArtifactEvolutionEvent::new(
+                format!(
+                    "event.{}.revised.{}",
+                    metadata.id,
+                    current_unix_timestamp_ms()
+                ),
+                revision_asset.id.clone(),
+                room.id.clone(),
+                ArtifactEvolutionAction::Revised,
+                "archived previous managed prompt revision before syncing current body",
+            ),
+            vec![
+                "managed_prompt".to_owned(),
+                "revision".to_owned(),
+                metadata.kind.clone(),
+            ],
+            vec![metadata.id.clone()],
+            vec![revision_asset.file_name.clone()],
+        )?;
+    }
+
+    let mut asset = MemoryRoomAsset::new(
+        metadata.id.clone(),
+        room.id.clone(),
+        file_name,
+        room.layer.clone(),
+        MemoryRoomAssetKind::Compressed,
+        metadata.title.clone(),
+        content.trim().to_owned(),
+    )
+    .with_namespace(MemoryNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    ))
+    .with_visibility(hc_memory::MemoryVisibility::Private)
+    .with_memory_kind(MemoryKind::Preference)
+    .with_stage(MemoryAssetStage::Compiled)
+    .with_form(MemoryAssetForm::Prompt)
+    .with_tag("managed_prompt")
+    .with_tag("current")
+    .with_tag(metadata.kind.clone());
+
+    for tag in metadata.tags {
+        asset = asset.with_tag(tag);
+    }
+    for source in derived_from {
+        asset = asset.with_derived_from(source);
+    }
+    for source_doc in source_docs {
+        asset = asset.with_source_doc(source_doc);
+    }
+
+    let materialized = repository.materialize_asset(&room, &asset)?;
+    persist_room_evolution_event(
+        &repository,
+        &room,
+        ArtifactEvolutionEvent::new(
+            format!("event.{}.compiled.{}", metadata.id, current_unix_timestamp_ms()),
+            metadata.id.clone(),
+            room.id.clone(),
+            ArtifactEvolutionAction::Promoted,
+            "synced managed prompt body into prompt library room",
+        ),
+        vec![
+            "managed_prompt".to_owned(),
+            "current".to_owned(),
+            metadata.kind.clone(),
+        ],
+        vec![managed_prompt_relative_path(kind).display().to_string()],
+        vec![materialized.room_relative_path.clone()],
+    )?;
+    Ok(materialized.path)
+}
+
+fn archive_managed_prompt_revision(
+    repository: &MemoryRoomRepository,
+    room: &MemoryRoom,
+    metadata: &ManagedPromptMetadata,
+    kind: ManagedPromptKind,
+    previous: &MemoryRoomAsset,
+) -> Result<MemoryRoomAsset> {
+    let revision_stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis();
+    let managed_path = managed_prompt_relative_path(kind);
+    let base_name = managed_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("prompt");
+    let revision_file_name = format!("rev.{revision_stamp}.{base_name}.md");
+    let revision_id = format!("{}.rev.{revision_stamp}", metadata.id);
+
+    let mut revision_asset = MemoryRoomAsset::new(
+        revision_id,
+        room.id.clone(),
+        revision_file_name,
+        room.layer.clone(),
+        MemoryRoomAssetKind::Compressed,
+        format!("{} Revision {}", metadata.title, revision_stamp),
+        previous.summary.clone(),
+    )
+    .with_namespace(previous.namespace.clone())
+    .with_visibility(previous.visibility.clone())
+    .with_memory_kind(previous.memory_kind.clone())
+    .with_stage(MemoryAssetStage::Compiled)
+    .with_form(MemoryAssetForm::Prompt)
+    .with_tag("managed_prompt")
+    .with_tag("revision")
+    .with_tag(metadata.kind.clone());
+
+    for tag in &metadata.tags {
+        revision_asset = revision_asset.with_tag(tag.clone());
+    }
+    for source in &previous.derived_from {
+        revision_asset = revision_asset.with_derived_from(source.clone());
+    }
+    for source_doc in &previous.source_docs {
+        revision_asset = revision_asset.with_source_doc(source_doc.clone());
+    }
+
+    let _materialized = repository.materialize_asset(room, &revision_asset)?;
+    Ok(revision_asset)
+}
+
+fn managed_prompt_room(namespace: &WorkspaceNamespace) -> MemoryRoom {
+    MemoryRoom::new(
+        "room.project.prompt-library",
+        MemoryLayer::Project,
+        "Managed Prompt Library",
+        format!(
+            "Managed prompt templates for {}.{}.",
+            namespace.tenant_id, namespace.user_id
+        ),
+    )
+    .with_namespace(MemoryNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    ))
+    .with_visibility(hc_memory::MemoryVisibility::Private)
+    .with_tag("prompt-library")
+    .with_tag("managed-prompt")
+    .with_tag("project")
+}
+
+fn managed_prompt_relative_path(kind: ManagedPromptKind) -> PathBuf {
+    let (group, file_name) = match kind {
+        ManagedPromptKind::MemoryOrganizer => ("organizer", "memory-organizer.md"),
+        ManagedPromptKind::PromptAssetSynthesizer => {
+            ("synthesis", "prompt-asset-synthesizer.md")
+        }
+        ManagedPromptKind::SemanticTagSuggester => ("extract", "semantic-tags.md"),
+        ManagedPromptKind::GlobalPreferenceSummary => {
+            ("summarize", "global-preference-summary.md")
+        }
+        ManagedPromptKind::AssistantWenyanRewrite => ("rewrite", "assistant-wenyan.md"),
+    };
+    PathBuf::from("prompts").join(group).join(file_name)
+}
+
+fn managed_prompt_sidecar_relative_path(kind: ManagedPromptKind) -> PathBuf {
+    let path = managed_prompt_relative_path(kind);
+    let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("prompt.md");
+    path.with_file_name(format!("{}.meta.json", file_name.trim_end_matches(".md")))
+}
+
+fn managed_prompt_metadata(kind: ManagedPromptKind) -> ManagedPromptMetadata {
+    match kind {
+        ManagedPromptKind::MemoryOrganizer => ManagedPromptMetadata {
+            id: "prompt.organizer.memory".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Memory Organizer".to_owned(),
+            kind: "organizer".to_owned(),
+            tags: vec!["memory".to_owned(), "organizer".to_owned(), "routing".to_owned()],
+        },
+        ManagedPromptKind::PromptAssetSynthesizer => ManagedPromptMetadata {
+            id: "prompt.synthesis.prompt-assets".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Prompt Asset Synthesizer".to_owned(),
+            kind: "synthesis".to_owned(),
+            tags: vec!["prompt".to_owned(), "synthesis".to_owned(), "behavior".to_owned()],
+        },
+        ManagedPromptKind::SemanticTagSuggester => ManagedPromptMetadata {
+            id: "prompt.extract.semantic-tags".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Semantic Tag Suggester".to_owned(),
+            kind: "extract".to_owned(),
+            tags: vec!["memory".to_owned(), "extract".to_owned(), "tags".to_owned()],
+        },
+        ManagedPromptKind::GlobalPreferenceSummary => ManagedPromptMetadata {
+            id: "prompt.summarize.global-preference".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Global Preference Summary".to_owned(),
+            kind: "summary".to_owned(),
+            tags: vec!["memory".to_owned(), "global".to_owned(), "preference".to_owned()],
+        },
+        ManagedPromptKind::AssistantWenyanRewrite => ManagedPromptMetadata {
+            id: "prompt.rewrite.assistant-wenyan".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Assistant Wenyan Rewrite".to_owned(),
+            kind: "rewrite".to_owned(),
+            tags: vec!["rewrite".to_owned(), "wenyan".to_owned(), "assistant".to_owned()],
+        },
+    }
+}
+
+fn managed_prompt_default_body(kind: ManagedPromptKind) -> &'static str {
+    match kind {
+        ManagedPromptKind::MemoryOrganizer => {
+            include_str!("../prompt-templates/organizer/memory-organizer.md")
+        }
+        ManagedPromptKind::PromptAssetSynthesizer => {
+            include_str!("../prompt-templates/synthesis/prompt-asset-synthesizer.md")
+        }
+        ManagedPromptKind::SemanticTagSuggester => {
+            include_str!("../prompt-templates/extract/semantic-tags.md")
+        }
+        ManagedPromptKind::GlobalPreferenceSummary => {
+            include_str!("../prompt-templates/summarize/global-preference-summary.md")
+        }
+        ManagedPromptKind::AssistantWenyanRewrite => {
+            include_str!("../prompt-templates/rewrite/assistant-wenyan.md")
+        }
+    }
 }
 
 fn parse_json_payload<T>(content: &str) -> Result<T>
@@ -2248,6 +4659,26 @@ fn prompt_asset_from_llm_item(
 
 fn default_prompt_asset_kind() -> PromptAssetKind {
     PromptAssetKind::PromptMemory
+}
+
+fn prompt_asset_stage_for_kind(kind: &PromptAssetKind) -> MemoryAssetStage {
+    match kind {
+        PromptAssetKind::PromptMemory => MemoryAssetStage::Procedural,
+        PromptAssetKind::SystemPolicy
+        | PromptAssetKind::BehaviorTemplate
+        | PromptAssetKind::StyleGuide
+        | PromptAssetKind::OutputContract => MemoryAssetStage::Compiled,
+    }
+}
+
+fn prompt_asset_form_for_kind(kind: &PromptAssetKind) -> MemoryAssetForm {
+    match kind {
+        PromptAssetKind::SystemPolicy => MemoryAssetForm::Policy,
+        PromptAssetKind::BehaviorTemplate
+        | PromptAssetKind::StyleGuide
+        | PromptAssetKind::OutputContract => MemoryAssetForm::Prompt,
+        PromptAssetKind::PromptMemory => MemoryAssetForm::Policy,
+    }
 }
 
 fn default_preference_memory_kind() -> MemoryKind {
@@ -2408,6 +4839,78 @@ mod tests {
         }
     }
 
+    struct AssertingProvider {
+        id: String,
+        required_substring: String,
+        response_text: String,
+    }
+
+    impl AssertingProvider {
+        fn new(id: &str, required_substring: &str, response_text: &str) -> Self {
+            Self {
+                id: id.to_owned(),
+                required_substring: required_substring.to_owned(),
+                response_text: response_text.to_owned(),
+            }
+        }
+    }
+
+    impl LlmProvider for AssertingProvider {
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                id: self.id.clone(),
+                display_name: "Asserting Test Provider".to_owned(),
+                supports_chat: true,
+                supports_streaming: false,
+            }
+        }
+
+        fn generate(
+            &self,
+            request: &GenerateRequest,
+        ) -> Result<GenerateResponse, hc_llm::LlmError> {
+            let system_message = request
+                .messages
+                .iter()
+                .find(|message| message.role == MessageRole::System)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            assert!(
+                system_message.contains(&self.required_substring),
+                "expected system message to contain {:?}, got {:?}",
+                self.required_substring,
+                system_message
+            );
+            Ok(GenerateResponse {
+                model: request.model.clone(),
+                message: ChatMessage::new(MessageRole::Assistant, self.response_text.clone()),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct StaticMemoryRetriever {
+        memories: Vec<RetrievedMemory>,
+    }
+
+    impl MemoryRetriever for StaticMemoryRetriever {
+        fn retrieve(&self, _query: &ContextMemoryQuery) -> Result<Vec<RetrievedMemory>> {
+            Ok(self.memories.clone())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct NoopPromptAssetSynthesizer;
+
+    impl PromptAssetSynthesizer for NoopPromptAssetSynthesizer {
+        fn synthesize(&self, _memories: &[RetrievedMemory]) -> Result<Vec<PromptAsset>> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn composer_injects_memory_into_system_message() {
         let composer = DefaultContextComposer;
@@ -2468,6 +4971,61 @@ mod tests {
         assert!(messages[0].content.contains("Task Summary"));
         assert!(messages[0].content.contains("source=memory_record"));
         assert!(messages[0].content.contains("kind=Summary"));
+    }
+
+    #[test]
+    fn generate_with_context_uses_compiled_prompt_assets_from_asset_views() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(AssertingProvider::new(
+            "test",
+            "Preserve the repo's established patterns.",
+            "ok",
+        ));
+        let retriever = StaticMemoryRetriever {
+            memories: vec![RetrievedMemory {
+                id: "asset.room.project.honeycomb.prompt.style".to_owned(),
+                title: "Honeycomb Style Guide".to_owned(),
+                summary: "Preserve the repo's established patterns.".to_owned(),
+                scope: MemoryScope::Project,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Project),
+                room_id: Some("room.project.honeycomb".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 980,
+                tags: vec![
+                    "project".to_owned(),
+                    "prompt".to_owned(),
+                    "styleguide".to_owned(),
+                ],
+                derived_from: Vec::new(),
+            }],
+        };
+        let composer = DefaultContextComposer;
+        let request = ContextRequest::new(GenerateRequest::new(
+            ModelRef::new("test", "mock"),
+            vec![ChatMessage::new(MessageRole::User, "continue")],
+        ));
+
+        let response = generate_with_context_using_synthesizer(
+            &registry,
+            &retriever,
+            &composer,
+            &NoopPromptAssetSynthesizer,
+            &request,
+        )
+        .expect("generation should succeed");
+
+        assert!(response.synthesized_prompt_assets.is_empty());
+        assert_eq!(response.response.message.content, "ok");
+    }
+
+    #[test]
+    fn prompt_policy_defaults_to_hard_runtime_policy() {
+        let policy = PromptPolicy::new("Safety", "Be precise and concise.");
+
+        assert_eq!(policy.kind, PromptPolicyKind::HardRuntime);
+        assert_eq!(policy.stage, MemoryAssetStage::Compiled);
+        assert_eq!(policy.form, MemoryAssetForm::Policy);
     }
 
     #[test]
@@ -2588,6 +5146,841 @@ mod tests {
     }
 
     #[test]
+    fn room_tool_asset_maps_to_tool_target() {
+        let asset = MemoryRoomAsset::new(
+            "asset.room.tool.rg.recipe",
+            "room.tool.rg",
+            "workflow.search-narrow-first.md",
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            "RG Narrow Search First",
+            "Prefer narrowing search scope before broad content search.",
+        )
+        .with_namespace(MemoryNamespace::new("tenant-a", "user-a"))
+        .with_memory_kind(MemoryKind::WorkflowMemory)
+        .with_tag("tool")
+        .with_tag("rg")
+        .with_tag("recipe");
+
+        let view = asset_view_from_room_asset(&asset);
+
+        assert_eq!(view.target, AssetTarget::Tool);
+        assert_eq!(view.target_ref.as_deref(), Some("room.tool.rg"));
+        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Executor));
+    }
+
+    #[test]
+    fn project_prompt_asset_maps_to_llm_consumer() {
+        let asset = MemoryRoomAsset::new(
+            "asset.room.project.honeycomb.prompt.style",
+            "room.project.honeycomb",
+            "prompt.honeycomb-style.md",
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            "Honeycomb Style Guide",
+            "Preserve the repo's established patterns.",
+        )
+        .with_namespace(MemoryNamespace::new("tenant-a", "user-a"))
+        .with_memory_kind(MemoryKind::Preference)
+        .with_stage(MemoryAssetStage::Compiled)
+        .with_form(MemoryAssetForm::Prompt)
+        .with_tag("project")
+        .with_tag("prompt")
+        .with_tag("styleguide");
+
+        let view = asset_view_from_room_asset(&asset);
+
+        assert_eq!(view.target, AssetTarget::Project);
+        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Llm));
+    }
+
+    #[test]
+    fn retrieved_room_compressed_maps_to_generalized_stage() {
+        let memory = RetrievedMemory {
+            id: "asset.room.task.runtime-refactor.0001.summary".to_owned(),
+            title: "Runtime Refactor Summary".to_owned(),
+            summary: "Persist task plans and assignment decisions together.".to_owned(),
+            scope: MemoryScope::Task,
+            kind: MemoryKind::Decision,
+            layer: Some(MemoryLayer::Task),
+            room_id: Some("room.task.runtime-refactor.0001".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 980,
+            tags: vec!["task".to_owned(), "runtime".to_owned()],
+            derived_from: Vec::new(),
+        };
+
+        let view = asset_view_from_retrieved_memory(&memory);
+
+        assert_eq!(view.stage, MemoryAssetStage::Generalized);
+        assert_eq!(view.target, AssetTarget::Task);
+    }
+
+    #[test]
+    fn retrieved_compiled_tool_memory_maps_to_compiled_stage() {
+        let memory = RetrievedMemory {
+            id: "asset.room.tool.rg.compiled.recipe".to_owned(),
+            title: "Compiled RG Recipe".to_owned(),
+            summary: "Compiled guidance.".to_owned(),
+            scope: MemoryScope::Project,
+            kind: MemoryKind::WorkflowMemory,
+            layer: Some(MemoryLayer::Project),
+            room_id: Some("room.tool.rg".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 980,
+            tags: vec![
+                "tool".to_owned(),
+                "rg".to_owned(),
+                "recipe".to_owned(),
+                "compiled".to_owned(),
+            ],
+            derived_from: Vec::new(),
+        };
+
+        let view = asset_view_from_retrieved_memory(&memory);
+
+        assert_eq!(view.stage, MemoryAssetStage::Compiled);
+    }
+
+    #[test]
+    fn validation_tag_adds_executor_and_evaluator_consumers() {
+        let memory = RetrievedMemory {
+            id: "asset.room.tool.rg.validation".to_owned(),
+            title: "RG Validation".to_owned(),
+            summary: "If results are too broad, refine by path before answering.".to_owned(),
+            scope: MemoryScope::Project,
+            kind: MemoryKind::Knowledge,
+            layer: Some(MemoryLayer::Project),
+            room_id: Some("room.tool.rg".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 900,
+            tags: vec!["tool".to_owned(), "rg".to_owned(), "validation".to_owned()],
+            derived_from: Vec::new(),
+        };
+
+        let view = asset_view_from_retrieved_memory(&memory);
+
+        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Executor));
+        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Evaluator));
+    }
+
+    #[test]
+    fn draft_tag_maps_to_draft_status() {
+        let record = MemoryRecord::new(
+            "memory.task.0003",
+            MemoryScope::Task,
+            MemoryOwnerRef::task("task.demo"),
+            MemoryKind::Summary,
+            "Draft Memory",
+            "This is still tentative.",
+        )
+        .with_tag("draft");
+
+        let view = asset_view_from_memory_record(&record);
+
+        assert_eq!(view.status, AssetStatus::Draft);
+    }
+
+    #[test]
+    fn workflow_memory_defaults_to_workflow_form() {
+        let record = MemoryRecord::new(
+            "memory.project.workflow.0001",
+            MemoryScope::Project,
+            MemoryOwnerRef::project("project.honeycomb"),
+            MemoryKind::WorkflowMemory,
+            "Workflow Rule",
+            "Run targeted checks before wider validation.",
+        );
+
+        let view = asset_view_from_memory_record(&record);
+
+        assert_eq!(view.form, MemoryAssetForm::Workflow);
+        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Planner));
+    }
+
+    #[test]
+    fn prompt_asset_from_asset_view_accepts_llm_prompt_assets() {
+        let asset = AssetView {
+            id: "asset.room.project.honeycomb.prompt.style".to_owned(),
+            title: "Honeycomb Style Guide".to_owned(),
+            summary: "Preserve the repo's established patterns.".to_owned(),
+            content: "Preserve the repo's established patterns.".to_owned(),
+            kind: MemoryKind::Preference,
+            stage: MemoryAssetStage::Compiled,
+            form: MemoryAssetForm::Prompt,
+            target: AssetTarget::Project,
+            target_ref: Some("room.project.honeycomb".to_owned()),
+            consumers: vec![AssetConsumer::Llm],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec!["prompt".to_owned(), "styleguide".to_owned()],
+            owners: vec![MemoryOwnerRef::project("project.honeycomb")],
+            derived_from: Vec::new(),
+            source_docs: Vec::new(),
+        };
+
+        let prompt = prompt_asset_from_asset_view(&asset).expect("prompt asset should be created");
+
+        assert_eq!(prompt.kind, PromptAssetKind::StyleGuide);
+        assert!(prompt.content.contains("established patterns"));
+    }
+
+    #[test]
+    fn tool_binder_collects_rg_recipe_validation_and_recovery() {
+        let assets = vec![
+            AssetView {
+                id: "asset.room.tool.rg.recipe".to_owned(),
+                title: "RG Recipe".to_owned(),
+                summary: "Prefer narrowing search scope before broad content search.".to_owned(),
+                content: "Prefer narrowing search scope before broad content search.".to_owned(),
+                kind: MemoryKind::WorkflowMemory,
+                stage: MemoryAssetStage::Generalized,
+                form: MemoryAssetForm::Workflow,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.rg".to_owned()),
+                consumers: vec![AssetConsumer::Executor],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec!["tool".to_owned(), "rg".to_owned(), "recipe".to_owned()],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+            AssetView {
+                id: "asset.room.tool.rg.validation".to_owned(),
+                title: "RG Validation".to_owned(),
+                summary: "If results are too broad, refine by path before answering.".to_owned(),
+                content: "If results are too broad, refine by path before answering.".to_owned(),
+                kind: MemoryKind::Knowledge,
+                stage: MemoryAssetStage::Generalized,
+                form: MemoryAssetForm::Policy,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.rg".to_owned()),
+                consumers: vec![AssetConsumer::Executor, AssetConsumer::Evaluator],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec!["tool".to_owned(), "rg".to_owned(), "validation".to_owned()],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+            AssetView {
+                id: "asset.room.tool.rg.recovery".to_owned(),
+                title: "RG Recovery".to_owned(),
+                summary: "If no matches are found, retry with alternate keywords.".to_owned(),
+                content: "If no matches are found, retry with alternate keywords.".to_owned(),
+                kind: MemoryKind::Decision,
+                stage: MemoryAssetStage::Generalized,
+                form: MemoryAssetForm::Policy,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.rg".to_owned()),
+                consumers: vec![AssetConsumer::Executor],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec!["tool".to_owned(), "rg".to_owned(), "recovery".to_owned()],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+        ];
+
+        let plan = DefaultToolExecutionBinder
+            .bind("find memory prompt flow", &seed_tool_rg(), &assets)
+            .expect("tool binding should succeed");
+
+        assert_eq!(plan.tool_id, "tool.rg");
+        assert_eq!(plan.guidance.len(), 1);
+        assert_eq!(plan.validation_steps.len(), 1);
+        assert_eq!(plan.recovery_steps.len(), 1);
+    }
+
+    #[test]
+    fn tool_binder_prefers_rg_files_for_file_lookup_goal() {
+        let plan = DefaultToolExecutionBinder
+            .bind("find which file defines AssetView", &seed_tool_rg(), &[])
+            .expect("tool binding should succeed");
+
+        assert_eq!(plan.suggested_command, vec!["rg".to_owned(), "--files".to_owned()]);
+    }
+
+    #[test]
+    fn tool_binder_prefers_rg_line_search_for_content_goal() {
+        let plan = DefaultToolExecutionBinder
+            .bind("find memory prompt flow", &seed_tool_rg(), &[])
+            .expect("tool binding should succeed");
+
+        assert_eq!(plan.suggested_command, vec!["rg".to_owned(), "-n".to_owned()]);
+    }
+
+    #[test]
+    fn tool_binder_supports_cargo_test_tool() {
+        let assets = vec![
+            AssetView {
+                id: "asset.room.tool.cargo-test.recipe".to_owned(),
+                title: "Cargo Test Narrow First".to_owned(),
+                summary: "Start with a targeted test filter before wider test runs.".to_owned(),
+                content: "Start with a targeted test filter before wider test runs.".to_owned(),
+                kind: MemoryKind::WorkflowMemory,
+                stage: MemoryAssetStage::Generalized,
+                form: MemoryAssetForm::Workflow,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.cargo-test".to_owned()),
+                consumers: vec![AssetConsumer::Executor],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec![
+                    "tool".to_owned(),
+                    "cargo-test".to_owned(),
+                    "recipe".to_owned(),
+                ],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+            AssetView {
+                id: "asset.room.tool.cargo-test.validation".to_owned(),
+                title: "Cargo Test Validation".to_owned(),
+                summary: "Check whether the intended tests actually ran before trusting the result.".to_owned(),
+                content: "Check whether the intended tests actually ran before trusting the result.".to_owned(),
+                kind: MemoryKind::Knowledge,
+                stage: MemoryAssetStage::Generalized,
+                form: MemoryAssetForm::Policy,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.cargo-test".to_owned()),
+                consumers: vec![AssetConsumer::Executor, AssetConsumer::Evaluator],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec![
+                    "tool".to_owned(),
+                    "cargo-test".to_owned(),
+                    "validation".to_owned(),
+                ],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+        ];
+
+        let plan = DefaultToolExecutionBinder
+            .bind("run a focused test", &seed_tool_cargo_test(), &assets)
+            .expect("tool binding should succeed");
+
+        assert_eq!(plan.tool_id, "tool.cargo-test");
+        assert_eq!(
+            plan.suggested_command,
+            vec!["cargo".to_owned(), "test".to_owned()]
+        );
+        assert_eq!(plan.guidance.len(), 1);
+        assert_eq!(plan.validation_steps.len(), 1);
+    }
+
+    #[test]
+    fn tool_binder_prefers_compiled_assets_when_available() {
+        let assets = vec![
+            AssetView {
+                id: "asset.room.tool.rg.recipe.generalized".to_owned(),
+                title: "RG Recipe".to_owned(),
+                summary: "Generalized recipe".to_owned(),
+                content: "Generalized recipe".to_owned(),
+                kind: MemoryKind::WorkflowMemory,
+                stage: MemoryAssetStage::Generalized,
+                form: MemoryAssetForm::Workflow,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.rg".to_owned()),
+                consumers: vec![AssetConsumer::Executor],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec!["tool".to_owned(), "rg".to_owned(), "recipe".to_owned()],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+            AssetView {
+                id: "asset.room.tool.rg.recipe.compiled".to_owned(),
+                title: "RG Recipe Compiled".to_owned(),
+                summary: "Compiled recipe".to_owned(),
+                content: "Compiled recipe".to_owned(),
+                kind: MemoryKind::WorkflowMemory,
+                stage: MemoryAssetStage::Compiled,
+                form: MemoryAssetForm::Workflow,
+                target: AssetTarget::Tool,
+                target_ref: Some("room.tool.rg".to_owned()),
+                consumers: vec![AssetConsumer::Executor],
+                status: AssetStatus::Active,
+                visibility: MemoryVisibility::Private,
+                tags: vec![
+                    "tool".to_owned(),
+                    "rg".to_owned(),
+                    "recipe".to_owned(),
+                    "compiled".to_owned(),
+                    "promotion".to_owned(),
+                ],
+                owners: Vec::new(),
+                derived_from: Vec::new(),
+                source_docs: Vec::new(),
+            },
+        ];
+
+        let plan = DefaultToolExecutionBinder
+            .bind("find asset view type", &seed_tool_rg(), &assets)
+            .expect("tool binding should succeed");
+
+        assert_eq!(plan.guidance, vec!["Compiled recipe".to_owned()]);
+    }
+
+    #[test]
+    fn build_tool_execution_plan_reads_rg_assets_from_workspace() {
+        let root = unique_temp_dir("context-tool-plan");
+        let namespace = MemoryNamespace::new("tenant-a", "user-a");
+        let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+        let room_repository =
+            MemoryRoomRepository::with_namespace(&root, workspace_namespace.clone());
+        let room = MemoryRoom::new(
+            "room.tool.rg",
+            MemoryLayer::Project,
+            "RG Tool Room",
+            "Reusable rg search guidance.",
+        )
+        .with_namespace(namespace.clone())
+        .with_tag("tool")
+        .with_tag("rg")
+        .with_tag("project");
+        room_repository
+            .write_room(&room)
+            .expect("tool room should be written");
+
+        let recipe = MemoryRoomAsset::new(
+            "asset.room.tool.rg.recipe",
+            room.id.clone(),
+            "workflow.search-narrow-first.md",
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            "RG Narrow Search First",
+            "Prefer narrowing search scope before broad content search.",
+        )
+        .with_namespace(namespace.clone())
+        .with_memory_kind(MemoryKind::WorkflowMemory)
+        .with_tag("tool")
+        .with_tag("rg")
+        .with_tag("recipe");
+        room_repository
+            .write_asset(&room, &recipe)
+            .expect("recipe asset should be written");
+
+        let validation = MemoryRoomAsset::new(
+            "asset.room.tool.rg.validation",
+            room.id.clone(),
+            "validation.refine-broad-results.md",
+            MemoryLayer::Project,
+            MemoryRoomAssetKind::Compressed,
+            "RG Refine Broad Results",
+            "If results are too broad, refine by path before answering.",
+        )
+        .with_namespace(namespace.clone())
+        .with_memory_kind(MemoryKind::Knowledge)
+        .with_tag("tool")
+        .with_tag("rg")
+        .with_tag("validation");
+        room_repository
+            .write_asset(&room, &validation)
+            .expect("validation asset should be written");
+
+        let retriever = WorkspaceMemoryRetriever::new(&root, workspace_namespace);
+        let plan = build_tool_execution_plan(
+            &retriever,
+            &DefaultToolExecutionBinder,
+            namespace,
+            "find memory prompt flow",
+            &seed_tool_rg(),
+        )
+        .expect("tool execution plan should build");
+
+        assert_eq!(plan.tool_id, "tool.rg");
+        assert_eq!(plan.suggested_command, vec!["rg".to_owned(), "-n".to_owned()]);
+        assert_eq!(plan.guidance.len(), 1);
+        assert_eq!(plan.validation_steps.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generalization_policy_allows_human_confirmed_asset() {
+        let asset = AssetView {
+            id: "asset.room.tool.rg.recipe".to_owned(),
+            title: "RG Recipe".to_owned(),
+            summary: "Prefer narrowing search scope before broad content search.".to_owned(),
+            content: "Prefer narrowing search scope before broad content search.".to_owned(),
+            kind: MemoryKind::WorkflowMemory,
+            stage: MemoryAssetStage::Extracted,
+            form: MemoryAssetForm::Workflow,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Executor],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec!["tool".to_owned(), "rg".to_owned()],
+            owners: Vec::new(),
+            derived_from: Vec::new(),
+            source_docs: Vec::new(),
+        };
+
+        assert!(should_generalize(&asset, 0, true, &GeneralizationPolicy::default()));
+    }
+
+    #[test]
+    fn promotion_rule_requires_matching_stage_and_consumer() {
+        let asset = AssetView {
+            id: "asset.room.tool.rg.recipe".to_owned(),
+            title: "RG Recipe".to_owned(),
+            summary: "Prefer narrowing search scope before broad content search.".to_owned(),
+            content: "Prefer narrowing search scope before broad content search.".to_owned(),
+            kind: MemoryKind::WorkflowMemory,
+            stage: MemoryAssetStage::Generalized,
+            form: MemoryAssetForm::Workflow,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Executor],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec!["tool".to_owned(), "rg".to_owned(), "recipe".to_owned()],
+            owners: Vec::new(),
+            derived_from: Vec::new(),
+            source_docs: Vec::new(),
+        };
+        let rule = PromotionRule {
+            from_stage: MemoryAssetStage::Generalized,
+            to_stage: MemoryAssetStage::Compiled,
+            min_confidence_milli: 700,
+            required_tags: vec!["recipe".to_owned()],
+            required_consumers: vec![AssetConsumer::Executor],
+        };
+
+        assert!(can_promote(&asset, &rule));
+    }
+
+    #[test]
+    fn retirement_rule_retires_after_human_rejection() {
+        assert!(should_retire(
+            0,
+            &[EvaluationSignal::HumanRejected],
+            &RetirementRule::default(),
+        ));
+    }
+
+    #[test]
+    fn infer_tool_execution_signals_marks_success_and_validation() {
+        let plan = ToolExecutionPlan {
+            tool_id: "tool.rg".to_owned(),
+            suggested_command: vec!["rg".to_owned(), "-n".to_owned()],
+            guidance: vec!["Prefer narrowing search scope.".to_owned()],
+            validation_steps: vec!["Refine broad results.".to_owned()],
+            recovery_steps: Vec::new(),
+        };
+        let outcome = ToolExecutionOutcome {
+            tool_id: "tool.rg".to_owned(),
+            goal: "find asset view".to_owned(),
+            command: vec!["rg".to_owned(), "-n".to_owned(), "AssetView".to_owned()],
+            success: true,
+            summary: "Found 3 rg match lines.".to_owned(),
+            observations: vec![
+                "crates/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
+                "apps/hc-context-cli/src/main.rs:10:AssetView".to_owned(),
+            ],
+        };
+
+        let signals = infer_tool_execution_signals(&plan, &outcome);
+        assert!(signals.contains(&EvaluationSignal::ExecutionSucceeded));
+        assert!(signals.contains(&EvaluationSignal::ValidationPassed));
+        assert!(signals.contains(&EvaluationSignal::RepeatedReuse));
+    }
+
+    #[test]
+    fn evaluate_tool_execution_returns_promotable_assets() {
+        let tool = seed_tool_rg();
+        let asset = AssetView {
+            id: "asset.room.tool.rg.recipe".to_owned(),
+            title: "RG Recipe".to_owned(),
+            summary: "Prefer narrowing search scope before broad content search.".to_owned(),
+            content: "Prefer narrowing search scope before broad content search.".to_owned(),
+            kind: MemoryKind::WorkflowMemory,
+            stage: MemoryAssetStage::Generalized,
+            form: MemoryAssetForm::Workflow,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Executor],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec!["tool".to_owned(), "rg".to_owned(), "recipe".to_owned()],
+            owners: Vec::new(),
+            derived_from: Vec::new(),
+            source_docs: Vec::new(),
+        };
+        let plan = ToolExecutionPlan {
+            tool_id: tool.id.clone(),
+            suggested_command: vec!["rg".to_owned(), "-n".to_owned()],
+            guidance: vec!["Prefer narrowing search scope.".to_owned()],
+            validation_steps: vec!["Refine broad results.".to_owned()],
+            recovery_steps: Vec::new(),
+        };
+        let outcome = ToolExecutionOutcome {
+            tool_id: tool.id.clone(),
+            goal: "find asset view".to_owned(),
+            command: vec!["rg".to_owned(), "-n".to_owned(), "AssetView".to_owned()],
+            success: true,
+            summary: "Found rg matches.".to_owned(),
+            observations: vec![
+                "crates/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
+                "crates/hc-context/src/lib.rs:60:pub enum AssetTarget".to_owned(),
+            ],
+        };
+        let evaluation = evaluate_tool_execution(
+            &tool,
+            &plan,
+            &outcome,
+            &[asset],
+            &GeneralizationPolicy::default(),
+            &PromotionRule {
+                from_stage: MemoryAssetStage::Generalized,
+                to_stage: MemoryAssetStage::Compiled,
+                min_confidence_milli: 700,
+                required_tags: vec!["tool".to_owned(), "rg".to_owned()],
+                required_consumers: vec![AssetConsumer::Executor],
+            },
+            &RetirementRule::default(),
+        );
+
+        assert_eq!(evaluation.tool_id, "tool.rg");
+        assert_eq!(
+            evaluation.promote_candidate_ids,
+            vec!["asset.room.tool.rg.recipe".to_owned()]
+        );
+        assert!(evaluation
+            .signals
+            .contains(&EvaluationSignal::ExecutionSucceeded));
+        assert!(evaluation
+            .signals
+            .contains(&EvaluationSignal::ValidationPassed));
+        assert!(evaluation
+            .events
+            .iter()
+            .any(|event| matches!(event.action, EvolutionAction::Evaluated)));
+    }
+
+    #[test]
+    fn evaluate_tool_execution_retires_after_repeated_failures() {
+        let tool = seed_tool_rg();
+        let asset_id = "asset.room.tool.rg.recipe".to_owned();
+        let asset = AssetView {
+            id: asset_id.clone(),
+            title: "RG Recipe".to_owned(),
+            summary: "Prefer narrowing search scope before broad content search.".to_owned(),
+            content: "Prefer narrowing search scope before broad content search.".to_owned(),
+            kind: MemoryKind::WorkflowMemory,
+            stage: MemoryAssetStage::Generalized,
+            form: MemoryAssetForm::Workflow,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Executor],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec!["tool".to_owned(), "rg".to_owned(), "recipe".to_owned()],
+            owners: Vec::new(),
+            derived_from: Vec::new(),
+            source_docs: Vec::new(),
+        };
+        let prior_failure_event = |suffix: &str| AssetView {
+            id: format!("asset.room.tool.rg.event.{suffix}"),
+            title: "RG Evaluated".to_owned(),
+            summary: "Prior failed evaluation".to_owned(),
+            content: "Prior failed evaluation".to_owned(),
+            kind: MemoryKind::Summary,
+            stage: MemoryAssetStage::Extracted,
+            form: MemoryAssetForm::Summary,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Human],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec![
+                "tool".to_owned(),
+                "rg".to_owned(),
+                "evaluation-event".to_owned(),
+                "execution_failed".to_owned(),
+            ],
+            owners: Vec::new(),
+            derived_from: vec![asset_id.clone()],
+            source_docs: Vec::new(),
+        };
+        let plan = ToolExecutionPlan {
+            tool_id: tool.id.clone(),
+            suggested_command: vec!["rg".to_owned(), "-n".to_owned()],
+            guidance: vec!["Prefer narrowing search scope.".to_owned()],
+            validation_steps: vec!["Refine broad results.".to_owned()],
+            recovery_steps: Vec::new(),
+        };
+        let outcome = ToolExecutionOutcome {
+            tool_id: tool.id.clone(),
+            goal: "find missing type".to_owned(),
+            command: vec!["rg".to_owned(), "-n".to_owned(), "MissingType".to_owned()],
+            success: false,
+            summary: "No rg matches found.".to_owned(),
+            observations: vec!["stderr: no matches".to_owned()],
+        };
+        let evaluation = evaluate_tool_execution(
+            &tool,
+            &plan,
+            &outcome,
+            &[asset, prior_failure_event("one"), prior_failure_event("two")],
+            &GeneralizationPolicy::default(),
+            &PromotionRule {
+                from_stage: MemoryAssetStage::Generalized,
+                to_stage: MemoryAssetStage::Compiled,
+                min_confidence_milli: 700,
+                required_tags: vec!["tool".to_owned(), "rg".to_owned()],
+                required_consumers: vec![AssetConsumer::Executor],
+            },
+            &RetirementRule::default(),
+        );
+
+        assert_eq!(evaluation.revise_candidate_ids, Vec::<String>::new());
+        assert_eq!(evaluation.retire_candidate_ids, vec![asset_id]);
+        assert!(evaluation
+            .events
+            .iter()
+            .any(|event| matches!(event.action, EvolutionAction::Retired)));
+    }
+
+    #[test]
+    fn tool_evaluation_write_requests_include_summary_and_events() {
+        let tool = seed_tool_rg();
+        let evaluation = ToolExecutionEvaluation {
+            tool_id: tool.id.clone(),
+            matched_asset_ids: vec!["asset.room.tool.rg.recipe".to_owned()],
+            signals: vec![EvaluationSignal::ExecutionSucceeded],
+            supporting_events: 1,
+            generalize_candidate_ids: vec!["asset.room.tool.rg.recipe".to_owned()],
+            promote_candidate_ids: vec!["asset.room.tool.rg.recipe".to_owned()],
+            revise_candidate_ids: Vec::new(),
+            retire_candidate_ids: Vec::new(),
+            events: vec![AssetEvolutionEvent {
+                id: "event.asset.room.tool.rg.recipe.evaluated".to_owned(),
+                asset_id: "asset.room.tool.rg.recipe".to_owned(),
+                action: EvolutionAction::Evaluated,
+                reason: "signals: ExecutionSucceeded".to_owned(),
+                inputs: vec!["rg".to_owned(), "-n".to_owned()],
+                outputs: vec!["match".to_owned()],
+                confidence_milli: 800,
+                created_at_ms: 1,
+            }],
+        };
+
+        let requests = room_memory_write_requests_from_tool_evaluation(&tool, &evaluation);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tags.iter().any(|tag| tag == "evaluation"));
+        assert!(requests[1]
+            .tags
+            .iter()
+            .any(|tag| tag == "evaluation-event"));
+    }
+
+    #[test]
+    fn persist_compiled_tool_assets_writes_promoted_assets() {
+        let root = unique_temp_dir("context-tool-compiled");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let tool = seed_tool_rg();
+        let asset = AssetView {
+            id: "asset.room.tool.rg.recipe".to_owned(),
+            title: "RG Recipe".to_owned(),
+            summary: "Prefer narrowing search scope before broad content search.".to_owned(),
+            content: "Prefer narrowing search scope before broad content search.".to_owned(),
+            kind: MemoryKind::WorkflowMemory,
+            stage: MemoryAssetStage::Generalized,
+            form: MemoryAssetForm::Workflow,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Executor],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec!["tool".to_owned(), "rg".to_owned(), "recipe".to_owned()],
+            owners: Vec::new(),
+            derived_from: Vec::new(),
+            source_docs: Vec::new(),
+        };
+        let evaluation = ToolExecutionEvaluation {
+            tool_id: tool.id.clone(),
+            matched_asset_ids: vec![asset.id.clone()],
+            signals: vec![EvaluationSignal::ExecutionSucceeded],
+            supporting_events: 1,
+            generalize_candidate_ids: Vec::new(),
+            promote_candidate_ids: vec![asset.id.clone()],
+            revise_candidate_ids: Vec::new(),
+            retire_candidate_ids: Vec::new(),
+            events: Vec::new(),
+        };
+
+        let paths = persist_compiled_tool_assets(
+            &root,
+            namespace.clone(),
+            &tool,
+            &[asset],
+            &evaluation,
+        )
+        .expect("compiled tool assets should persist");
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0]
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.starts_with("compiled.")));
+        let contents = fs::read_to_string(&paths[0]).expect("compiled asset should be readable");
+        assert!(contents.contains("Prefer narrowing search scope before broad content search."));
+        assert!(!contents.contains("Compiled guidance for"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persist_tool_evolution_events_writes_timeline_entries() {
+        let root = unique_temp_dir("context-tool-events");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let tool = seed_tool_rg();
+        let evaluation = ToolExecutionEvaluation {
+            tool_id: tool.id.clone(),
+            matched_asset_ids: vec!["asset.room.tool.rg.recipe".to_owned()],
+            signals: vec![EvaluationSignal::ExecutionSucceeded],
+            supporting_events: 1,
+            generalize_candidate_ids: Vec::new(),
+            promote_candidate_ids: vec!["asset.room.tool.rg.recipe".to_owned()],
+            revise_candidate_ids: Vec::new(),
+            retire_candidate_ids: Vec::new(),
+            events: vec![AssetEvolutionEvent {
+                id: "event.asset.room.tool.rg.recipe.promoted".to_owned(),
+                asset_id: "asset.room.tool.rg.recipe".to_owned(),
+                action: EvolutionAction::Promoted,
+                reason: "eligible for promotion to compiled guidance".to_owned(),
+                inputs: vec!["execution_succeeded".to_owned()],
+                outputs: vec!["promote_to:compiled".to_owned()],
+                confidence_milli: 900,
+                created_at_ms: 42,
+            }],
+        };
+
+        let paths = persist_tool_evolution_events(&root, namespace, &tool, &evaluation)
+            .expect("tool evolution events should persist");
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0]
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("memory/rooms/project/room.tool.rg/timeline.md"));
+        let contents = fs::read_to_string(&paths[0]).expect("timeline should be readable");
+        assert!(contents.contains("event.asset.room.tool.rg.recipe.promoted"));
+        assert!(contents.contains("promote_to:compiled"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn request_holds_generation_and_memory_query() {
         let generation = GenerateRequest::new(
             ModelRef::new("openai", "gpt-4.1-mini"),
@@ -2659,6 +6052,296 @@ mod tests {
     }
 
     #[test]
+    fn synthesized_prompt_assets_can_be_persisted_as_room_assets() {
+        let root = unique_temp_dir("context-prompt-writeback");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let response = ContextResponse {
+            response: GenerateResponse {
+                model: ModelRef::new("test", "mock"),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            },
+            recalled_memories: vec![RetrievedMemory {
+                id: "asset.room.global.tenant-a.user-a.pref-language".to_owned(),
+                title: "Language Preference".to_owned(),
+                summary: "User prefers responses in Chinese.".to_owned(),
+                scope: MemoryScope::Global,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Global),
+                room_id: Some("room.global.tenant-a.user-a".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 980,
+                tags: vec!["global".to_owned(), "preference".to_owned()],
+                derived_from: Vec::new(),
+            }],
+            synthesized_prompt_assets: vec![PromptAsset::new(
+                "asset.room.global.tenant-a.user-a.pref-language",
+                PromptAssetKind::StyleGuide,
+                "Language Style Guide",
+                "Respond in concise Chinese.",
+            )],
+        };
+
+        let paths = persist_synthesized_prompt_assets(&root, namespace.clone(), &response)
+            .expect("prompt assets should be persisted");
+        assert_eq!(paths.len(), 1);
+
+        let repository = MemoryRoomRepository::with_namespace(&root, namespace);
+        let relative = PathBuf::from(
+            "memory/rooms/global/room.global.tenant-a.user-a/prompt/prompt.language.style.guide.md",
+        );
+        let loaded = repository
+            .read_asset(relative)
+            .expect("persisted prompt asset should be readable");
+
+        assert_eq!(loaded.stage, MemoryAssetStage::Compiled);
+        assert_eq!(loaded.form, MemoryAssetForm::Prompt);
+        assert_eq!(loaded.memory_kind, MemoryKind::Preference);
+        assert!(loaded.tags.iter().any(|tag| tag == "prompt"));
+        let timeline = root.join(
+            "tenants/tenant-a/users/user-a/memory/rooms/global/room.global.tenant-a.user-a/timeline.md",
+        );
+        assert!(timeline.exists());
+        let timeline_contents =
+            fs::read_to_string(&timeline).expect("prompt timeline should be readable");
+        assert!(timeline_contents.contains("compiled recalled memory into prompt asset"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synthesized_prompt_assets_can_route_into_topic_room() {
+        let root = unique_temp_dir("context-prompt-topic-writeback");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let response = ContextResponse {
+            response: GenerateResponse {
+                model: ModelRef::new("test", "mock"),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            },
+            recalled_memories: vec![RetrievedMemory {
+                id: "asset.room.chat.local.default.1.pref-review".to_owned(),
+                title: "Review Style".to_owned(),
+                summary: "Prioritize regression risks.".to_owned(),
+                scope: MemoryScope::Session,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Chat),
+                room_id: Some("room.chat.local.default.1".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 950,
+                tags: vec!["topic".to_owned(), "review".to_owned()],
+                derived_from: Vec::new(),
+            }],
+            synthesized_prompt_assets: vec![PromptAsset::new(
+                "asset.room.chat.local.default.1.pref-review",
+                PromptAssetKind::BehaviorTemplate,
+                "Review Style Guide",
+                "Prioritize regression risks.",
+            )],
+        };
+
+        let paths = persist_synthesized_prompt_assets(&root, namespace, &response)
+            .expect("topic prompt assets should be persisted");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("memory/rooms/topic/room.topic.review/prompt/")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synthesized_prompt_assets_can_route_into_agent_room() {
+        let root = unique_temp_dir("context-prompt-agent-writeback");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let response = ContextResponse {
+            response: GenerateResponse {
+                model: ModelRef::new("test", "mock"),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            },
+            recalled_memories: vec![RetrievedMemory {
+                id: "asset.room.chat.local.default.1.pref-reviewer".to_owned(),
+                title: "Reviewer Habit".to_owned(),
+                summary: "Focus on regressions first.".to_owned(),
+                scope: MemoryScope::Session,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Chat),
+                room_id: Some("room.chat.local.default.1".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 950,
+                tags: vec!["agent".to_owned(), "reviewer".to_owned()],
+                derived_from: Vec::new(),
+            }],
+            synthesized_prompt_assets: vec![PromptAsset::new(
+                "asset.room.chat.local.default.1.pref-reviewer",
+                PromptAssetKind::BehaviorTemplate,
+                "Reviewer Behavior",
+                "Focus on regressions first.",
+            )],
+        };
+
+        let paths = persist_synthesized_prompt_assets(&root, namespace, &response)
+            .expect("agent prompt assets should be persisted");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("memory/rooms/global/room.agent.reviewer/prompt/")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synthesized_prompt_assets_can_route_into_tool_room() {
+        let root = unique_temp_dir("context-prompt-tool-writeback");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let response = ContextResponse {
+            response: GenerateResponse {
+                model: ModelRef::new("test", "mock"),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            },
+            recalled_memories: vec![RetrievedMemory {
+                id: "asset.room.chat.local.default.1.pref-rg".to_owned(),
+                title: "Ripgrep Workflow".to_owned(),
+                summary: "Use rg first when searching the repo.".to_owned(),
+                scope: MemoryScope::Session,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Chat),
+                room_id: Some("room.chat.local.default.1".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 950,
+                tags: vec!["tool".to_owned(), "rg".to_owned()],
+                derived_from: Vec::new(),
+            }],
+            synthesized_prompt_assets: vec![PromptAsset::new(
+                "asset.room.chat.local.default.1.pref-rg",
+                PromptAssetKind::BehaviorTemplate,
+                "RG Workflow",
+                "Use rg first when searching the repo.",
+            )],
+        };
+
+        let paths = persist_synthesized_prompt_assets(&root, namespace, &response)
+            .expect("tool prompt assets should be persisted");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("memory/rooms/project/room.tool.rg/prompt/")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synthesized_prompt_assets_can_route_into_project_room() {
+        let root = unique_temp_dir("context-prompt-project-writeback");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let response = ContextResponse {
+            response: GenerateResponse {
+                model: ModelRef::new("test", "mock"),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            },
+            recalled_memories: vec![RetrievedMemory {
+                id: "asset.room.chat.local.default.1.pref-honeycomb".to_owned(),
+                title: "Honeycomb Style".to_owned(),
+                summary: "Preserve the repo's established patterns.".to_owned(),
+                scope: MemoryScope::Session,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Chat),
+                room_id: Some("room.chat.local.default.1".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 950,
+                tags: vec!["project".to_owned(), "honeycomb".to_owned()],
+                derived_from: Vec::new(),
+            }],
+            synthesized_prompt_assets: vec![PromptAsset::new(
+                "asset.room.chat.local.default.1.pref-honeycomb",
+                PromptAssetKind::StyleGuide,
+                "Honeycomb Style Guide",
+                "Preserve the repo's established patterns.",
+            )],
+        };
+
+        let paths = persist_synthesized_prompt_assets(&root, namespace, &response)
+            .expect("project prompt assets should be persisted");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("memory/rooms/project/room.project.honeycomb/prompt/")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synthesized_prompt_assets_can_route_into_task_room() {
+        let root = unique_temp_dir("context-prompt-task-writeback");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+        let response = ContextResponse {
+            response: GenerateResponse {
+                model: ModelRef::new("test", "mock"),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            },
+            recalled_memories: vec![RetrievedMemory {
+                id: "asset.room.chat.local.default.1.pref-runtime-refactor".to_owned(),
+                title: "Runtime Refactor Rule".to_owned(),
+                summary: "Land memory changes with green tests.".to_owned(),
+                scope: MemoryScope::Session,
+                kind: MemoryKind::Preference,
+                layer: Some(MemoryLayer::Chat),
+                room_id: Some("room.chat.local.default.1".to_owned()),
+                source_kind: "room_compressed".to_owned(),
+                confidence_milli: 950,
+                tags: vec!["task".to_owned(), "runtime-refactor".to_owned()],
+                derived_from: Vec::new(),
+            }],
+            synthesized_prompt_assets: vec![PromptAsset::new(
+                "asset.room.chat.local.default.1.pref-runtime-refactor",
+                PromptAssetKind::BehaviorTemplate,
+                "Runtime Refactor Guide",
+                "Land memory changes with green tests.",
+            )],
+        };
+
+        let paths = persist_synthesized_prompt_assets(&root, namespace, &response)
+            .expect("task prompt assets should be persisted");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("memory/rooms/task/room.task.runtime.refactor/prompt/")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rule_based_organizer_routes_task_owner_into_task_room() {
         let organizer = CompositeMemoryOrganizer::new(
             RuleBasedMemoryRoomRouter,
@@ -2683,6 +6366,56 @@ mod tests {
         assert_eq!(decision.memory_kind, MemoryKind::Decision);
         assert!(decision.tags.iter().any(|tag| tag == "manual"));
         assert!(decision.tags.iter().any(|tag| tag == "assignment"));
+        assert!(decision.tags.iter().any(|tag| tag == "runtime"));
+    }
+
+    #[test]
+    fn keyword_tag_suggester_infers_semantic_room_tags() {
+        let suggester = KeywordMemoryTagSuggester;
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("tenant-a", "user-a"),
+            "This agent reviewer should use rg for honeycomb project refactor work.",
+        )
+        .with_title_hint("Reviewer RG Workflow");
+
+        let tags = suggester
+            .suggest_tags(&input)
+            .expect("tag suggestion should succeed");
+
+        assert!(tags.iter().any(|tag| tag == "agent"));
+        assert!(tags.iter().any(|tag| tag == "reviewer"));
+        assert!(tags.iter().any(|tag| tag == "tool"));
+        assert!(tags.iter().any(|tag| tag == "rg"));
+        assert!(tags.iter().any(|tag| tag == "project"));
+        assert!(tags.iter().any(|tag| tag == "task"));
+    }
+
+    #[test]
+    fn organizer_merges_dynamic_semantic_tags() {
+        let organizer = CompositeMemoryOrganizer::new(
+            RuleBasedMemoryRoomRouter,
+            RuleBasedMemoryKindResolver,
+            KeywordMemoryTagSuggester,
+            NoopMemoryPromotionAdvisor,
+        );
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("tenant-a", "user-a"),
+            "Project convention: the reviewer agent should use rg when debugging runtime refactors.",
+        )
+        .with_title_hint("Honeycomb Reviewer Workflow")
+        .with_tag("manual");
+
+        let decision = organizer
+            .organize(&input)
+            .expect("organization should succeed");
+
+        assert!(decision.tags.iter().any(|tag| tag == "manual"));
+        assert!(decision.tags.iter().any(|tag| tag == "agent"));
+        assert!(decision.tags.iter().any(|tag| tag == "reviewer"));
+        assert!(decision.tags.iter().any(|tag| tag == "tool"));
+        assert!(decision.tags.iter().any(|tag| tag == "rg"));
+        assert!(decision.tags.iter().any(|tag| tag == "project"));
+        assert!(decision.tags.iter().any(|tag| tag == "task"));
         assert!(decision.tags.iter().any(|tag| tag == "runtime"));
     }
 
@@ -2738,6 +6471,8 @@ mod tests {
 
         assert_eq!(asset.id, memory.id);
         assert_eq!(asset.kind, PromptAssetKind::StyleGuide);
+        assert_eq!(asset.stage, MemoryAssetStage::Compiled);
+        assert_eq!(asset.form, MemoryAssetForm::Prompt);
         assert!(asset.content.contains("concise Chinese"));
         assert!(asset.tags.iter().any(|tag| tag == "style"));
     }
@@ -2755,6 +6490,7 @@ mod tests {
             source_kind: "room_compressed".to_owned(),
             confidence_milli: 980,
             tags: vec!["global".to_owned(), "preference".to_owned()],
+            derived_from: Vec::new(),
         };
 
         let assets = DefaultPromptAssetSynthesizer
@@ -2763,7 +6499,52 @@ mod tests {
 
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].kind, PromptAssetKind::BehaviorTemplate);
+        assert_eq!(assets[0].stage, MemoryAssetStage::Compiled);
+        assert_eq!(assets[0].form, MemoryAssetForm::Prompt);
         assert!(assets[0].content.contains("小八"));
+    }
+
+    #[test]
+    fn default_prompt_asset_synthesizer_prefers_compiled_prompt_memory() {
+        let compiled_prompt = RetrievedMemory {
+            id: "asset.room.global.local.default.prompt.language".to_owned(),
+            title: "Language Style Guide".to_owned(),
+            summary: "Respond in concise Chinese.".to_owned(),
+            scope: MemoryScope::Global,
+            kind: MemoryKind::Preference,
+            layer: Some(MemoryLayer::Global),
+            room_id: Some("room.global.local.default".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 990,
+            tags: vec![
+                "global".to_owned(),
+                "preference".to_owned(),
+                "prompt".to_owned(),
+                "styleguide".to_owned(),
+            ],
+            derived_from: Vec::new(),
+        };
+        let source_preference = RetrievedMemory {
+            id: "asset.room.global.local.default.pref-language".to_owned(),
+            title: "Language Preference".to_owned(),
+            summary: "User prefers responses in Chinese.".to_owned(),
+            scope: MemoryScope::Global,
+            kind: MemoryKind::Preference,
+            layer: Some(MemoryLayer::Global),
+            room_id: Some("room.global.local.default".to_owned()),
+            source_kind: "room_compressed".to_owned(),
+            confidence_milli: 980,
+            tags: vec!["global".to_owned(), "preference".to_owned()],
+            derived_from: Vec::new(),
+        };
+
+        let assets = DefaultPromptAssetSynthesizer
+            .synthesize(&[compiled_prompt, source_preference])
+            .expect("synthesis should succeed");
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, PromptAssetKind::StyleGuide);
+        assert_eq!(assets[0].content, "Respond in concise Chinese.");
     }
 
     #[test]
@@ -2778,6 +6559,7 @@ mod tests {
         let synthesizer = LlmPromptAssetSynthesizer::new(
             &registry,
             ModelRef::new("test", "mock"),
+            WorkspaceNamespace::local_default(),
             DefaultPromptAssetSynthesizer,
         );
         let memory = RetrievedMemory::from(&MemoryRecord::new(
@@ -2809,6 +6591,7 @@ mod tests {
         let synthesizer = LlmPromptAssetSynthesizer::strict(
             &registry,
             ModelRef::new("test", "mock"),
+            WorkspaceNamespace::local_default(),
             DefaultPromptAssetSynthesizer,
         );
         let memory = RetrievedMemory::from(&MemoryRecord::new(
@@ -2828,6 +6611,161 @@ mod tests {
     }
 
     #[test]
+    fn llm_memory_tag_suggester_prefers_llm_output() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(StaticProvider::new(
+            "test",
+            r#"{"tags":["agent","reviewer","tool","rg","task","runtime.refactor"]}"#,
+        ));
+        let suggester = LlmMemoryTagSuggester::new(
+            &registry,
+            ModelRef::new("test", "mock"),
+            WorkspaceNamespace::local_default(),
+            KeywordMemoryTagSuggester,
+        );
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("local", "default"),
+            "The reviewer agent should use rg during the runtime refactor.",
+        )
+        .with_title_hint("Reviewer RG Workflow");
+
+        let tags = suggester
+            .suggest_tags(&input)
+            .expect("llm tag suggestion should succeed");
+
+        assert!(tags.iter().any(|tag| tag == "agent"));
+        assert!(tags.iter().any(|tag| tag == "reviewer"));
+        assert!(tags.iter().any(|tag| tag == "tool"));
+        assert!(tags.iter().any(|tag| tag == "rg"));
+        assert!(tags.iter().any(|tag| tag == "task"));
+        assert!(tags.iter().any(|tag| tag == "runtime.refactor"));
+    }
+
+    #[test]
+    fn llm_memory_tag_suggester_falls_back_when_tags_missing() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(StaticProvider::new(
+            "test",
+            r#"{"note":"no semantic tags"}"#,
+        ));
+        let suggester = LlmMemoryTagSuggester::new(
+            &registry,
+            ModelRef::new("test", "mock"),
+            WorkspaceNamespace::local_default(),
+            KeywordMemoryTagSuggester,
+        );
+        let input = MemoryOrganizationInput::new(
+            MemoryNamespace::new("local", "default"),
+            "This reviewer agent should use rg for project work.",
+        )
+        .with_title_hint("Reviewer RG Workflow");
+
+        let tags = suggester
+            .suggest_tags(&input)
+            .expect("fallback tag suggestion should succeed");
+
+        assert!(tags.iter().any(|tag| tag == "agent"));
+        assert!(tags.iter().any(|tag| tag == "reviewer"));
+        assert!(tags.iter().any(|tag| tag == "tool"));
+        assert!(tags.iter().any(|tag| tag == "rg"));
+        assert!(tags.iter().any(|tag| tag == "project"));
+    }
+
+    #[test]
+    fn load_managed_prompt_body_syncs_prompt_library_room_asset() {
+        let root = unique_temp_dir("managed-prompt-room-asset");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+
+        let body = load_managed_prompt_body(
+            &root,
+            &namespace,
+            ManagedPromptKind::SemanticTagSuggester,
+        )
+        .expect("managed prompt body should load");
+
+        assert!(body.contains("Infer compact semantic tags"));
+
+        let repository = MemoryRoomRepository::with_namespace(&root, namespace.clone());
+        let room = managed_prompt_room(&namespace);
+        let relative = MemoryRoomRepository::prompt_doc_relative_path(&room, "semantic-tags.md");
+        let loaded = repository
+            .read_asset(relative)
+            .expect("managed prompt should be mirrored into prompt library room");
+
+        assert_eq!(loaded.id, "prompt.extract.semantic-tags");
+        assert_eq!(loaded.stage, MemoryAssetStage::Compiled);
+        assert_eq!(loaded.form, MemoryAssetForm::Prompt);
+        assert!(loaded.tags.iter().any(|tag| tag == "managed_prompt"));
+        assert!(loaded.tags.iter().any(|tag| tag == "extract"));
+        let timeline = root.join(
+            "tenants/tenant-a/users/user-a/memory/rooms/project/room.project.prompt-library/timeline.md",
+        );
+        assert!(timeline.exists());
+        let timeline_contents =
+            fs::read_to_string(&timeline).expect("managed prompt timeline should be readable");
+        assert!(timeline_contents.contains("synced managed prompt body into prompt library room"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_prompt_sync_archives_revision_when_local_body_changes() {
+        let root = unique_temp_dir("managed-prompt-revision");
+        let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+
+        let _ = load_managed_prompt_body(
+            &root,
+            &namespace,
+            ManagedPromptKind::SemanticTagSuggester,
+        )
+        .expect("managed prompt body should load");
+
+        let store = WorkspaceStore::new(PathBuf::from(&root));
+        let relative = managed_prompt_relative_path(ManagedPromptKind::SemanticTagSuggester);
+        store
+            .write_text_in_namespace(
+                &namespace,
+                &relative,
+                "Infer semantic tags.\n\nReturn strict JSON with reviewer and rg when relevant.\n",
+            )
+            .expect("updated prompt body should be written");
+
+        let _ = load_managed_prompt_body(
+            &root,
+            &namespace,
+            ManagedPromptKind::SemanticTagSuggester,
+        )
+        .expect("managed prompt body should resync");
+
+        let repository = MemoryRoomRepository::with_namespace(&root, namespace.clone());
+        let room = managed_prompt_room(&namespace);
+        let current_relative = MemoryRoomRepository::prompt_doc_relative_path(&room, "semantic-tags.md");
+        let current = repository
+            .read_asset(current_relative)
+            .expect("current managed prompt asset should be readable");
+
+        assert!(current.summary.contains("reviewer and rg"));
+        assert!(current.derived_from.iter().any(|item| item.starts_with("prompt.extract.semantic-tags.rev.")));
+
+        let revision_dir = repository
+            .root()
+            .join("tenants")
+            .join(&namespace.tenant_id)
+            .join("users")
+            .join(&namespace.user_id)
+            .join("memory/rooms/project/room.project.prompt-library/prompt");
+        let revision_files = fs::read_dir(&revision_dir)
+            .expect("prompt directory should exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("rev.") && name.ends_with(".md"))
+            .collect::<Vec<_>>();
+        assert!(!revision_files.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn composer_renders_synthesized_prompt_assets() {
         let composer = DefaultContextComposer;
         let memory = RetrievedMemory {
@@ -2841,6 +6779,7 @@ mod tests {
             source_kind: "room_compressed".to_owned(),
             confidence_milli: 980,
             tags: vec!["global".to_owned(), "preference".to_owned()],
+            derived_from: Vec::new(),
         };
         let synthesized = DefaultPromptAssetSynthesizer
             .synthesize(&[memory.clone()])
@@ -2957,7 +6896,12 @@ mod tests {
             KeywordMemoryTagSuggester,
             RuleBasedMemoryPromotionAdvisor,
         );
-        let organizer = LlmMemoryOrganizer::new(&registry, ModelRef::new("test", "mock"), fallback);
+        let organizer = LlmMemoryOrganizer::new(
+            &registry,
+            ModelRef::new("test", "mock"),
+            WorkspaceNamespace::local_default(),
+            fallback,
+        );
         let input =
             MemoryOrganizationInput::new(MemoryNamespace::new("local", "default"), "??????")
                 .with_room_hint("room.chat.local.default.1", MemoryLayer::Chat)
