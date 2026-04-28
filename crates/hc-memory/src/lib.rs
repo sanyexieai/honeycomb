@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use hc_store::store::{StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
+use hc_trace::TraceEvent;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1009,8 +1010,34 @@ impl MemoryRepository {
         let relative_path = Self::relative_path_for(record);
         let frontmatter = MemoryFrontmatter::from_record(record, &self.namespace);
         let body = render_memory_body(record);
-        self.store
-            .write_markdown_in_namespace(&self.namespace, relative_path, &frontmatter, &body)
+        let path = self.store.write_markdown_in_namespace(
+            &self.namespace,
+            relative_path,
+            &frontmatter,
+            &body,
+        )?;
+        hc_trace::emit_trace(
+            TraceEvent::info(
+                "hc-memory",
+                "memory_record",
+                "write",
+                "persisted memory record",
+            )
+            .with_status("saved")
+            .with_field("record_id", record.id.clone())
+            .with_field("scope", format!("{:?}", record.scope).to_ascii_lowercase())
+            .with_field(
+                "memory_kind",
+                format!("{:?}", record.kind).to_ascii_lowercase(),
+            )
+            .with_field(
+                "owner_kind",
+                format!("{:?}", record.owner.kind).to_ascii_lowercase(),
+            )
+            .with_field("owner_id", record.owner.id.clone())
+            .with_field("path", path.display().to_string()),
+        );
+        Ok(path)
     }
 
     pub fn read_record(&self, relative_path: impl AsRef<Path>) -> Result<MemoryRecord> {
@@ -1102,8 +1129,21 @@ impl MemoryRoomRepository {
         let relative_path = Self::relative_path_for(room);
         let frontmatter = MemoryRoomFrontmatter::from_room(room, &self.namespace);
         let body = render_room_body(room);
-        self.store
-            .write_markdown_in_namespace(&self.namespace, relative_path, &frontmatter, &body)
+        let path = self.store.write_markdown_in_namespace(
+            &self.namespace,
+            relative_path,
+            &frontmatter,
+            &body,
+        )?;
+        hc_trace::emit_trace(
+            TraceEvent::info("hc-memory", "memory_room", "write", "persisted memory room")
+                .with_status("saved")
+                .with_field("room_id", room.id.clone())
+                .with_field("layer", format!("{:?}", room.layer).to_ascii_lowercase())
+                .with_field("status_value", room.status.clone())
+                .with_field("path", path.display().to_string()),
+        );
+        Ok(path)
     }
 
     pub fn asset_relative_path(room: &MemoryRoom, asset: &MemoryRoomAsset) -> PathBuf {
@@ -1145,9 +1185,9 @@ impl MemoryRoomRepository {
     ) -> Result<MaterializationRecord> {
         let relative_path = Self::asset_relative_path(room, asset);
         let body = render_room_asset_body(asset);
-        let written_path = self
-            .store
-            .write_text_in_namespace(&self.namespace, &relative_path, &body)?;
+        let written_path =
+            self.store
+                .write_text_in_namespace(&self.namespace, &relative_path, &body)?;
         write_room_asset_sidecar(
             &self.store,
             &self.namespace,
@@ -1155,12 +1195,39 @@ impl MemoryRoomRepository {
             &MemoryRoomAssetSidecar::from_asset(asset, &self.namespace),
         )?;
         self.sync_room_objects_for_asset(room, &relative_path, asset)?;
-        Ok(MaterializationRecord::new(
+        let record = MaterializationRecord::new(
             room.id.clone(),
             MaterializationKind::Asset,
             written_path,
             room_relative_path_for_asset(room, &relative_path),
-        ))
+        );
+        hc_trace::emit_trace(
+            TraceEvent::info(
+                "hc-memory",
+                "memory_asset",
+                "materialize",
+                "persisted room asset",
+            )
+            .with_status("saved")
+            .with_field("room_id", room.id.clone())
+            .with_field("asset_id", asset.id.clone())
+            .with_field(
+                "asset_kind",
+                format!("{:?}", asset.kind).to_ascii_lowercase(),
+            )
+            .with_field(
+                "memory_kind",
+                format!("{:?}", asset.memory_kind).to_ascii_lowercase(),
+            )
+            .with_field(
+                "stage_value",
+                format!("{:?}", asset.stage).to_ascii_lowercase(),
+            )
+            .with_field("form", format!("{:?}", asset.form).to_ascii_lowercase())
+            .with_field("path", record.path.display().to_string())
+            .with_field("room_relative_path", record.room_relative_path.clone()),
+        );
+        Ok(record)
     }
 
     pub fn write_artifact_draft(
@@ -1202,7 +1269,9 @@ impl MemoryRoomRepository {
         event: &ArtifactEvolutionEvent,
     ) -> Result<MaterializationRecord> {
         let relative_path = Self::timeline_relative_path(room);
-        let resolved_path = self.store.resolve_in_namespace(&self.namespace, &relative_path);
+        let resolved_path = self
+            .store
+            .resolve_in_namespace(&self.namespace, &relative_path);
         let existing = if resolved_path.exists() {
             fs::read_to_string(&resolved_path)?
         } else {
@@ -1241,6 +1310,23 @@ impl MemoryRoomRepository {
         }
         let mut materialized = self.materialize_asset(room, &asset)?;
         materialized.kind = MaterializationKind::EvolutionEvent;
+        hc_trace::emit_trace(
+            TraceEvent::info(
+                "hc-memory",
+                "memory_timeline",
+                "append_event",
+                "appended room evolution event",
+            )
+            .with_status("saved")
+            .with_field("room_id", room.id.clone())
+            .with_field("event_id", event.id.clone())
+            .with_field("artifact_id", event.artifact_id.clone())
+            .with_field(
+                "event_action",
+                format!("{:?}", event.action).to_ascii_lowercase(),
+            )
+            .with_field("path", materialized.path.display().to_string()),
+        );
         Ok(materialized)
     }
 
@@ -1253,10 +1339,17 @@ impl MemoryRoomRepository {
 
     pub fn read_asset(&self, relative_path: impl AsRef<Path>) -> Result<MemoryRoomAsset> {
         let relative_path = relative_path.as_ref();
-        let path = self.store.resolve_in_namespace(&self.namespace, relative_path);
+        let path = self
+            .store
+            .resolve_in_namespace(&self.namespace, relative_path);
         let body = fs::read_to_string(&path)?;
         let sidecar = read_room_asset_sidecar(&self.store, &self.namespace, relative_path)?;
-        Ok(MemoryRoomAsset::from_plain_document(relative_path, body, sidecar, &self.namespace))
+        Ok(MemoryRoomAsset::from_plain_document(
+            relative_path,
+            body,
+            sidecar,
+            &self.namespace,
+        ))
     }
 
     pub fn read_compressed_assets(&self, room: &MemoryRoom) -> Result<Vec<MemoryRoomAsset>> {
@@ -1583,7 +1676,11 @@ fn merge_room_metadata(target: &mut MemoryRoom, source: &MemoryRoom) {
         }
     }
     for entity in &source.related_entities {
-        if !target.related_entities.iter().any(|existing| existing == entity) {
+        if !target
+            .related_entities
+            .iter()
+            .any(|existing| existing == entity)
+        {
             target.related_entities.push(entity.clone());
         }
     }
@@ -1752,7 +1849,8 @@ fn write_room_asset_sidecar(
     relative_path: &Path,
     sidecar: &MemoryRoomAssetSidecar,
 ) -> Result<()> {
-    let path = store.resolve_in_namespace(namespace, room_asset_sidecar_relative_path(relative_path));
+    let path =
+        store.resolve_in_namespace(namespace, room_asset_sidecar_relative_path(relative_path));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1766,7 +1864,8 @@ fn read_room_asset_sidecar(
     namespace: &WorkspaceNamespace,
     relative_path: &Path,
 ) -> Result<MemoryRoomAssetSidecar> {
-    let path = store.resolve_in_namespace(namespace, room_asset_sidecar_relative_path(relative_path));
+    let path =
+        store.resolve_in_namespace(namespace, room_asset_sidecar_relative_path(relative_path));
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
@@ -1813,6 +1912,8 @@ fn default_memory_asset_form_for_memory_kind(
         MemoryKind::Preference => MemoryAssetForm::Policy,
         MemoryKind::WorkflowMemory => MemoryAssetForm::Workflow,
         MemoryKind::Knowledge => default_memory_asset_form_for_room_asset_kind(kind),
-        MemoryKind::Summary | MemoryKind::Decision => default_memory_asset_form_for_room_asset_kind(kind),
+        MemoryKind::Summary | MemoryKind::Decision => {
+            default_memory_asset_form_for_room_asset_kind(kind)
+        }
     }
 }

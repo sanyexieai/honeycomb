@@ -14,3 +14,4 @@ hc-capability = { path = "../hc-capability" }
 hc-memory = { path = "../hc-memory" }
 hc-persona = { path = "../hc-persona" }
 hc-store = { path = "../hc-store" }
+hc-toolchain = { path = "../hc-toolchain" }

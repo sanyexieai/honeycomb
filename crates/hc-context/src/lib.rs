@@ -14,10 +14,17 @@ use hc_memory::{
 };
 use hc_persona::PersonaProfile;
 use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
+pub use hc_toolchain::{
+    EvaluationSignal, ToolCatalog, ToolComposition, ToolExecutionKind, ToolExecutionOutcome,
+    ToolExecutionPlan, ToolProvider, ToolRepository, ToolSpec, ToolStability, default_tool_catalog,
+    default_tool_command as toolchain_default_tool_command, seed_tool_cargo_test, seed_tool_rg,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,56 +96,6 @@ pub struct AssetView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolExecutionKind {
-    Script,
-    Workflow,
-    Cli,
-    Service,
-    Builtin,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolStability {
-    Experimental,
-    Managed,
-    Stable,
-    Foundational,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolSpec {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub execution_kind: ToolExecutionKind,
-    pub stability: ToolStability,
-    pub model_dependence: hc_capability::ModelDependence,
-    pub default_command: Vec<String>,
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolExecutionPlan {
-    pub tool_id: String,
-    pub suggested_command: Vec<String>,
-    pub guidance: Vec<String>,
-    pub validation_steps: Vec<String>,
-    pub recovery_steps: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolExecutionOutcome {
-    pub tool_id: String,
-    pub goal: String,
-    pub command: Vec<String>,
-    pub success: bool,
-    pub summary: String,
-    pub observations: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolExecutionEvaluation {
     pub tool_id: String,
     pub matched_asset_ids: Vec<String>,
@@ -149,6 +106,33 @@ pub struct ToolExecutionEvaluation {
     pub revise_candidate_ids: Vec<String>,
     pub retire_candidate_ids: Vec<String>,
     pub events: Vec<AssetEvolutionEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCapabilityExportAsset {
+    pub id: String,
+    pub role: String,
+    pub title: String,
+    pub file: String,
+    pub kind: MemoryKind,
+    pub stage: MemoryAssetStage,
+    pub form: MemoryAssetForm,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCapabilityExportManifest {
+    pub schema_version: u16,
+    pub package_id: String,
+    pub tool: ToolSpec,
+    pub command: Vec<String>,
+    pub assets: Vec<ToolCapabilityExportAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCapabilityExportPackage {
+    pub manifest: ToolCapabilityExportManifest,
+    pub plan: ToolExecutionPlan,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -228,19 +212,6 @@ impl Default for RetirementRule {
             allow_replacement_by_newer_asset: true,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EvaluationSignal {
-    HumanConfirmed,
-    HumanRejected,
-    ExecutionSucceeded,
-    ExecutionFailed,
-    ValidationPassed,
-    ValidationFailed,
-    RepeatedReuse,
-    SupersededByNewerAsset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -851,6 +822,16 @@ enum ManagedPromptKind {
     SemanticTagSuggester,
     GlobalPreferenceSummary,
     AssistantWenyanRewrite,
+    ToolChatAssistant,
+    ToolRouter,
+    ToolNaturalLanguageBuilder,
+    AgentResponderSystem,
+    AgentPlannerInput,
+    AgentWorkItemExecution,
+    ContextMemorySystem,
+    ContextMemoryUsagePolicy,
+    ContextLightweightChat,
+    JsonSystemGuard,
 }
 
 #[derive(Debug, Clone)]
@@ -1033,7 +1014,6 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             MemoryRepository::with_namespace(self.root.clone(), self.namespace.clone());
         let room_repository =
             MemoryRoomRepository::with_namespace(self.root.clone(), self.namespace.clone());
-        let _ = store.rebuild_markdown_index_in_namespace(&self.namespace)?;
         let room_candidates = self.discover_room_candidates(query)?;
         let room_candidate_boosts = room_candidates
             .iter()
@@ -1752,14 +1732,13 @@ fn infer_project_slug(
         return None;
     }
 
-    semantic_slug_from_title(title, &["project", "repo", "style", "guide", "architecture"])
+    semantic_slug_from_title(
+        title,
+        &["project", "repo", "style", "guide", "architecture"],
+    )
 }
 
-fn infer_task_slug(
-    lowered: &str,
-    title: &str,
-    owner: Option<&MemoryOwnerRef>,
-) -> Option<String> {
+fn infer_task_slug(lowered: &str, title: &str, owner: Option<&MemoryOwnerRef>) -> Option<String> {
     if let Some(owner) = owner
         && owner.kind == MemoryOwnerKind::Task
     {
@@ -1796,14 +1775,30 @@ fn infer_task_slug(
 fn infer_topic_slug(lowered: &str, title: &str) -> Option<String> {
     if !contains_any(
         lowered,
-        &["topic", "concept", "knowledge", "reference", "theme", "主题", "话题", "知识"],
+        &[
+            "topic",
+            "concept",
+            "knowledge",
+            "reference",
+            "theme",
+            "主题",
+            "话题",
+            "知识",
+        ],
     ) {
         return None;
     }
 
     semantic_slug_from_title(
         title,
-        &["topic", "concept", "knowledge", "reference", "guide", "style"],
+        &[
+            "topic",
+            "concept",
+            "knowledge",
+            "reference",
+            "guide",
+            "style",
+        ],
     )
 }
 
@@ -2009,7 +2004,9 @@ where
             Ok(tags) if !tags.is_empty() => Ok(tags),
             Ok(_) if self.fallback_on_error => self.fallback.suggest_tags(input),
             Ok(tags) => Ok(tags),
-            Err(error) if self.fallback_on_error => self.fallback.suggest_tags(input).or(Err(error)),
+            Err(error) if self.fallback_on_error => {
+                self.fallback.suggest_tags(input).or(Err(error))
+            }
             Err(error) => Err(error),
         }
     }
@@ -2025,15 +2022,17 @@ where
             &self.workspace_namespace,
             ManagedPromptKind::PromptAssetSynthesizer,
         )?;
+        let system_prompt = load_managed_prompt_body(
+            default_workspace_root(),
+            &self.workspace_namespace,
+            ManagedPromptKind::JsonSystemGuard,
+        )?;
         let response = self
             .registry
             .generate(&GenerateRequest {
                 model: self.model.clone(),
                 messages: vec![
-                    ChatMessage::new(
-                        MessageRole::System,
-                        managed_json_system_prompt(),
-                    ),
+                    ChatMessage::new(MessageRole::System, system_prompt),
                     ChatMessage::new(
                         MessageRole::User,
                         format!(
@@ -2069,15 +2068,17 @@ where
             &self.workspace_namespace,
             ManagedPromptKind::SemanticTagSuggester,
         )?;
+        let system_prompt = load_managed_prompt_body(
+            default_workspace_root(),
+            &self.workspace_namespace,
+            ManagedPromptKind::JsonSystemGuard,
+        )?;
         let response = self
             .registry
             .generate(&GenerateRequest {
                 model: self.model.clone(),
                 messages: vec![
-                    ChatMessage::new(
-                        MessageRole::System,
-                        managed_json_system_prompt(),
-                    ),
+                    ChatMessage::new(MessageRole::System, system_prompt),
                     ChatMessage::new(
                         MessageRole::User,
                         format!(
@@ -2127,15 +2128,17 @@ where
             &self.workspace_namespace,
             ManagedPromptKind::MemoryOrganizer,
         )?;
+        let system_prompt = load_managed_prompt_body(
+            default_workspace_root(),
+            &self.workspace_namespace,
+            ManagedPromptKind::JsonSystemGuard,
+        )?;
         let response = self
             .registry
             .generate(&GenerateRequest {
                 model: self.model.clone(),
                 messages: vec![
-                    ChatMessage::new(
-                        MessageRole::System,
-                        managed_json_system_prompt(),
-                    ),
+                    ChatMessage::new(MessageRole::System, system_prompt),
                     ChatMessage::new(
                         MessageRole::User,
                         format!(
@@ -2380,7 +2383,14 @@ pub fn workspace_namespace_from_memory_namespace(
 }
 
 pub fn default_workspace_root() -> &'static Path {
-    Path::new("workspace")
+    static WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+    WORKSPACE_ROOT
+        .get_or_init(|| {
+            env::var("HC_WORKSPACE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("workspace"))
+        })
+        .as_path()
 }
 
 pub fn load_assistant_wenyan_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
@@ -2388,6 +2398,78 @@ pub fn load_assistant_wenyan_prompt(namespace: &WorkspaceNamespace) -> Result<St
         default_workspace_root(),
         namespace,
         ManagedPromptKind::AssistantWenyanRewrite,
+    )
+}
+
+pub fn load_tool_chat_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::ToolChatAssistant,
+    )
+}
+
+pub fn load_tool_router_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::ToolRouter,
+    )
+}
+
+pub fn load_tool_natural_language_builder_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::ToolNaturalLanguageBuilder,
+    )
+}
+
+pub fn load_agent_responder_system_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::AgentResponderSystem,
+    )
+}
+
+pub fn load_agent_planner_input_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::AgentPlannerInput,
+    )
+}
+
+pub fn load_agent_work_item_execution_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::AgentWorkItemExecution,
+    )
+}
+
+pub fn load_context_memory_system_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::ContextMemorySystem,
+    )
+}
+
+pub fn load_context_memory_usage_policy_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::ContextMemoryUsagePolicy,
+    )
+}
+
+pub fn load_context_lightweight_chat_prompt(namespace: &WorkspaceNamespace) -> Result<String> {
+    load_managed_prompt_body(
+        default_workspace_root(),
+        namespace,
+        ManagedPromptKind::ContextLightweightChat,
     )
 }
 
@@ -2510,7 +2592,10 @@ pub fn persist_synthesized_prompt_assets(
                 ArtifactEvolutionAction::Promoted,
                 "compiled recalled memory into prompt asset",
             ),
-            vec!["prompt".to_owned(), format!("{:?}", prompt_asset.kind).to_ascii_lowercase()],
+            vec![
+                "prompt".to_owned(),
+                format!("{:?}", prompt_asset.kind).to_ascii_lowercase(),
+            ],
             vec![source_memory.id.clone()],
             vec![materialized.room_relative_path.clone()],
         )?;
@@ -2581,7 +2666,12 @@ pub fn prompt_asset_from_compiled_memory(memory: &RetrievedMemory) -> Option<Pro
     }
 
     let kind = infer_prompt_asset_kind_from_compiled_memory(memory)?;
-    let mut asset = PromptAsset::new(memory.id.clone(), kind, memory.title.clone(), memory.summary.clone());
+    let mut asset = PromptAsset::new(
+        memory.id.clone(),
+        kind,
+        memory.title.clone(),
+        memory.summary.clone(),
+    );
     for tag in &memory.tags {
         asset = asset.with_tag(tag.clone());
     }
@@ -2590,15 +2680,22 @@ pub fn prompt_asset_from_compiled_memory(memory: &RetrievedMemory) -> Option<Pro
 
 pub fn prompt_asset_from_asset_view(asset: &AssetView) -> Option<PromptAsset> {
     if asset.status == AssetStatus::Retired
-        || !asset.consumers.iter().any(|consumer| consumer == &AssetConsumer::Llm)
+        || !asset
+            .consumers
+            .iter()
+            .any(|consumer| consumer == &AssetConsumer::Llm)
         || asset.form != MemoryAssetForm::Prompt
     {
         return None;
     }
 
     let kind = infer_prompt_asset_kind_from_asset_view(asset)?;
-    let mut prompt_asset =
-        PromptAsset::new(asset.id.clone(), kind, asset.title.clone(), asset.content.clone());
+    let mut prompt_asset = PromptAsset::new(
+        asset.id.clone(),
+        kind,
+        asset.title.clone(),
+        asset.content.clone(),
+    );
     for tag in &asset.tags {
         prompt_asset = prompt_asset.with_tag(tag.clone());
     }
@@ -2687,7 +2784,10 @@ pub fn asset_view_from_retrieved_memory(memory: &RetrievedMemory) -> AssetView {
             .as_ref()
             .zip(memory.layer.as_ref())
             .map(|(room_id, layer)| {
-                vec![MemoryOwnerRef::new(owner_kind_for_layer(layer), room_id.clone())]
+                vec![MemoryOwnerRef::new(
+                    owner_kind_for_layer(layer),
+                    room_id.clone(),
+                )]
             })
             .unwrap_or_default(),
         derived_from: memory.derived_from.clone(),
@@ -2729,7 +2829,10 @@ pub fn load_tool_assets(
     assets.retain(|asset| {
         !superseded.contains(&asset.id)
             || asset.tags.iter().any(|tag| {
-                matches!(tag.as_str(), "compiled" | "promotion" | "revision" | "retired")
+                matches!(
+                    tag.as_str(),
+                    "compiled" | "promotion" | "revision" | "retired"
+                )
             })
     });
     assets.sort_by_key(tool_asset_priority);
@@ -2756,6 +2859,109 @@ pub fn build_tool_execution_plan(
     let goal = goal.into();
     let assets = load_tool_assets(retriever, namespace, tool)?;
     build_tool_execution_plan_from_assets(binder, goal, tool, &assets)
+}
+
+pub fn export_tool_capability_package(
+    output_dir: impl AsRef<Path>,
+    tool: &ToolSpec,
+    assets: &[AssetView],
+) -> Result<ToolCapabilityExportPackage> {
+    let clean_assets = clean_tool_export_assets(tool, assets);
+    let plan = build_tool_execution_plan_from_assets(
+        &DefaultToolExecutionBinder,
+        format!("use {}", tool.name),
+        tool,
+        &clean_assets,
+    )?;
+    let output_dir = output_dir.as_ref();
+    let portable_dir = output_dir.join("portable");
+    let runnable_dir = output_dir.join("runnable");
+    let assets_dir = portable_dir.join("assets");
+    fs::create_dir_all(&assets_dir)?;
+    fs::create_dir_all(&runnable_dir)?;
+
+    let manifest_assets = clean_assets
+        .iter()
+        .map(|asset| {
+            let role = tool_export_asset_role(asset);
+            let file_name = format!("{}.{}.md", role, slugify_for_memory(&asset.title));
+            let file = format!("assets/{file_name}");
+            let clean_tags = clean_export_tags(&asset.tags);
+            fs::write(
+                assets_dir.join(&file_name),
+                render_export_asset_markdown(asset, &role, &clean_tags),
+            )?;
+            Ok(ToolCapabilityExportAsset {
+                id: asset.id.clone(),
+                role,
+                title: asset.title.clone(),
+                file,
+                kind: asset.kind.clone(),
+                stage: asset.stage.clone(),
+                form: asset.form.clone(),
+                tags: clean_tags,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let package_id = format!("capability.{}", tool.id.trim_start_matches("tool."));
+    let manifest = ToolCapabilityExportManifest {
+        schema_version: 1,
+        package_id: package_id.clone(),
+        tool: tool.clone(),
+        command: plan.suggested_command.clone(),
+        assets: manifest_assets,
+    };
+    let package = ToolCapabilityExportPackage { manifest, plan };
+    fs::write(
+        portable_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&package.manifest)?,
+    )?;
+    fs::write(
+        portable_dir.join("plan.json"),
+        serde_json::to_string_pretty(&package.plan)?,
+    )?;
+    fs::write(
+        portable_dir.join("README.md"),
+        render_portable_capability_readme(&package),
+    )?;
+    fs::write(
+        runnable_dir.join("tool.json"),
+        serde_json::to_string_pretty(tool)?,
+    )?;
+    fs::write(
+        runnable_dir.join("plan.json"),
+        serde_json::to_string_pretty(&package.plan)?,
+    )?;
+    fs::write(
+        runnable_dir.join("README.md"),
+        render_runnable_capability_readme(&package),
+    )?;
+    let run_script = runnable_dir.join("run.sh");
+    fs::write(&run_script, render_run_script(&package.plan))?;
+    make_executable(&run_script)?;
+    fs::write(
+        output_dir.join("package.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "package_id": package_id,
+            "layers": {
+                "portable": {
+                    "path": "portable",
+                    "manifest": "portable/manifest.json"
+                },
+                "runnable": {
+                    "path": "runnable",
+                    "entrypoint": "runnable/run.sh"
+                }
+            }
+        }))?,
+    )?;
+    fs::write(
+        output_dir.join("README.md"),
+        render_layered_capability_readme(&package),
+    )?;
+    Ok(package)
 }
 
 pub fn evaluate_tool_execution(
@@ -2810,8 +3016,8 @@ pub fn evaluate_tool_execution(
         ) {
             generalize_candidate_ids.push(asset.id.clone());
         }
-        let failed_evaluations = failed_tool_evaluation_count(&asset.id, assets)
-            + usize::from(revision_triggered);
+        let failed_evaluations =
+            failed_tool_evaluation_count(&asset.id, assets) + usize::from(revision_triggered);
         if should_retire(failed_evaluations, &signals, retirement_rule) {
             retire_candidate_ids.push(asset.id.clone());
         } else {
@@ -2819,7 +3025,7 @@ pub fn evaluate_tool_execution(
                 promote_candidate_ids.push(asset.id.clone());
             }
             if revision_triggered {
-            revise_candidate_ids.push(asset.id.clone());
+                revise_candidate_ids.push(asset.id.clone());
             }
         }
 
@@ -2883,7 +3089,10 @@ pub fn evaluate_tool_execution(
 
     ToolExecutionEvaluation {
         tool_id: tool.id.clone(),
-        matched_asset_ids: matched_assets.iter().map(|asset| asset.id.clone()).collect(),
+        matched_asset_ids: matched_assets
+            .iter()
+            .map(|asset| asset.id.clone())
+            .collect(),
         signals,
         supporting_events,
         generalize_candidate_ids,
@@ -2900,6 +3109,23 @@ pub fn room_memory_write_request_from_tool_outcome(
 ) -> RoomMemoryWriteRequest {
     let tool_slug = tool.id.trim_start_matches("tool.");
     let mut summary = outcome.summary.clone();
+    if let Some(parent_tool_id) = &outcome.parent_tool_id {
+        summary.push_str("\n\nParent tool:\n- ");
+        summary.push_str(parent_tool_id);
+    }
+    if !outcome.invoked_tool_ids.is_empty() {
+        summary.push_str("\n\nInvoked tools:\n");
+        for tool_id in &outcome.invoked_tool_ids {
+            summary.push_str("- ");
+            summary.push_str(tool_id);
+            summary.push('\n');
+        }
+        summary = summary.trim_end().to_owned();
+    }
+    if !outcome.command.is_empty() {
+        summary.push_str("\n\nCommand:\n- ");
+        summary.push_str(&outcome.command.join(" "));
+    }
     if !outcome.observations.is_empty() {
         summary.push_str("\n\nObservations:\n");
         for observation in &outcome.observations {
@@ -2921,7 +3147,11 @@ pub fn room_memory_write_request_from_tool_outcome(
     .with_tag("tool")
     .with_tag(tool_slug)
     .with_tag("execution")
-    .with_tag(if outcome.success { "success" } else { "failure" })
+    .with_tag(if outcome.success {
+        "success"
+    } else {
+        "failure"
+    })
 }
 
 pub fn room_memory_write_requests_from_tool_evaluation(
@@ -3039,7 +3269,10 @@ pub fn persist_tool_evolution_events(
     let mut paths = Vec::new();
 
     for event in &evaluation.events {
-        let event_tags = vec!["tool".to_owned(), tool.id.trim_start_matches("tool.").to_owned()];
+        let event_tags = vec![
+            "tool".to_owned(),
+            tool.id.trim_start_matches("tool.").to_owned(),
+        ];
         let memory_event = ArtifactEvolutionEvent::new(
             event.id.clone(),
             event.asset_id.clone(),
@@ -3084,7 +3317,9 @@ fn persist_room_evolution_event(
     inputs: Vec<String>,
     outputs: Vec<String>,
 ) -> Result<PathBuf> {
-    let event = tags.into_iter().fold(event, |event, tag| event.with_tag(tag));
+    let event = tags
+        .into_iter()
+        .fold(event, |event, tag| event.with_tag(tag));
     let event = inputs
         .into_iter()
         .fold(event, |event, input| event.with_input(input));
@@ -3333,23 +3568,25 @@ pub fn summarize_global_preference_with_llm(
         &workspace_namespace_from_memory_namespace(&input.namespace),
         ManagedPromptKind::GlobalPreferenceSummary,
     )?;
+    let system_prompt = load_managed_prompt_body(
+        default_workspace_root(),
+        &workspace_namespace_from_memory_namespace(&input.namespace),
+        ManagedPromptKind::JsonSystemGuard,
+    )?;
     let response = registry
         .generate(&GenerateRequest {
             model: model.clone(),
             messages: vec![
+                ChatMessage::new(MessageRole::System, system_prompt),
                 ChatMessage::new(
-                    MessageRole::System,
-                    managed_json_system_prompt(),
-                ),
-                    ChatMessage::new(
-                        MessageRole::User,
-                        format!(
-                            "{}\n\nInput JSON:\n{}",
-                            instructions,
-                            serde_json::to_string_pretty(input)?
-                        ),
+                    MessageRole::User,
+                    format!(
+                        "{}\n\nInput JSON:\n{}",
+                        instructions,
+                        serde_json::to_string_pretty(input)?
                     ),
-                ],
+                ),
+            ],
             temperature: Some(0.1),
             max_output_tokens: Some(300),
             metadata: Default::default(),
@@ -3403,7 +3640,11 @@ fn infer_asset_target_from_room_asset(asset: &MemoryRoomAsset) -> AssetTarget {
 }
 
 fn infer_asset_target_from_memory_record(record: &MemoryRecord) -> AssetTarget {
-    infer_asset_target_from_owner_scope_and_tags(Some(&record.owner), Some(&record.scope), &record.tags)
+    infer_asset_target_from_owner_scope_and_tags(
+        Some(&record.owner),
+        Some(&record.scope),
+        &record.tags,
+    )
 }
 
 fn infer_asset_target_ref_from_memory_record(record: &MemoryRecord) -> Option<String> {
@@ -3418,7 +3659,9 @@ fn infer_asset_target_ref_from_memory_record(record: &MemoryRecord) -> Option<St
 fn infer_asset_target_from_retrieved_memory(memory: &RetrievedMemory) -> AssetTarget {
     if let Some(room_id) = &memory.room_id {
         infer_asset_target_from_room_id_and_tags(Some(room_id), &memory.tags)
-    } else if matches!(memory.scope, MemoryScope::Global) || memory.tags.iter().any(|tag| tag == "global") {
+    } else if matches!(memory.scope, MemoryScope::Global)
+        || memory.tags.iter().any(|tag| tag == "global")
+    {
         AssetTarget::Global
     } else {
         infer_asset_target_from_room_id_and_tags(None, &memory.tags)
@@ -3469,12 +3712,13 @@ fn infer_asset_target_from_owner_scope_and_tags(
     scope: Option<&MemoryScope>,
     tags: &[String],
 ) -> AssetTarget {
-    if owner.is_some_and(|owner| owner.id.starts_with("tool.")) || tags.iter().any(|tag| tag == "tool")
+    if owner.is_some_and(|owner| owner.id.starts_with("tool."))
+        || tags.iter().any(|tag| tag == "tool")
     {
         AssetTarget::Tool
-    } else if owner.is_some_and(|owner| {
-        owner.id.starts_with("agent.") || owner.id.starts_with("persona.")
-    }) || tags.iter().any(|tag| tag == "agent")
+    } else if owner
+        .is_some_and(|owner| owner.id.starts_with("agent.") || owner.id.starts_with("persona."))
+        || tags.iter().any(|tag| tag == "agent")
     {
         AssetTarget::Agent
     } else if owner.is_some_and(|owner| owner.id.starts_with("project."))
@@ -3568,55 +3812,19 @@ fn infer_prompt_asset_kind_from_asset_view(asset: &AssetView) -> Option<PromptAs
         Some(PromptAssetKind::OutputContract)
     } else if asset.tags.iter().any(|tag| tag == "systempolicy") {
         Some(PromptAssetKind::SystemPolicy)
-    } else if asset.tags.iter().any(|tag| tag == "promptmemory" || tag == "prompt") {
+    } else if asset
+        .tags
+        .iter()
+        .any(|tag| tag == "promptmemory" || tag == "prompt")
+    {
         Some(PromptAssetKind::PromptMemory)
     } else {
         None
     }
 }
 
-pub fn seed_tool_rg() -> ToolSpec {
-    ToolSpec {
-        id: "tool.rg".to_owned(),
-        name: "ripgrep".to_owned(),
-        description: "Fast recursive workspace search.".to_owned(),
-        execution_kind: ToolExecutionKind::Cli,
-        stability: ToolStability::Stable,
-        model_dependence: hc_capability::ModelDependence::Optional,
-        default_command: vec!["rg".to_owned()],
-        tags: vec![
-            "tool".to_owned(),
-            "rg".to_owned(),
-            "search".to_owned(),
-            "workspace".to_owned(),
-        ],
-    }
-}
-
-pub fn seed_tool_cargo_test() -> ToolSpec {
-    ToolSpec {
-        id: "tool.cargo-test".to_owned(),
-        name: "cargo test".to_owned(),
-        description: "Run Rust test targets with optional filtering.".to_owned(),
-        execution_kind: ToolExecutionKind::Cli,
-        stability: ToolStability::Stable,
-        model_dependence: hc_capability::ModelDependence::Optional,
-        default_command: vec!["cargo".to_owned(), "test".to_owned()],
-        tags: vec![
-            "tool".to_owned(),
-            "cargo-test".to_owned(),
-            "testing".to_owned(),
-            "workspace".to_owned(),
-        ],
-    }
-}
-
 fn default_tool_command(tool: &ToolSpec, goal: &str) -> Vec<String> {
-    match tool.id.as_str() {
-        "tool.rg" => default_rg_command(goal),
-        "tool.cargo-test" => default_cargo_test_command(goal),
-        _ => tool.default_command.clone(),
-    }
+    toolchain_default_tool_command(tool, goal)
 }
 
 pub fn tool_room_id(tool: &ToolSpec) -> String {
@@ -3632,7 +3840,8 @@ fn read_tool_room_memories(
         return Ok(Vec::new());
     };
     let workspace_namespace = workspace_namespace_from_memory_namespace(namespace);
-    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace);
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace);
     let room = MemoryRoom::new(
         tool_room_id(tool),
         MemoryLayer::Project,
@@ -3640,7 +3849,10 @@ fn read_tool_room_memories(
         tool.description.clone(),
     );
     let assets = repository.read_compressed_assets(&room).unwrap_or_default();
-    Ok(assets.into_iter().map(|asset| RetrievedMemory::from(&asset)).collect())
+    Ok(assets
+        .into_iter()
+        .map(|asset| RetrievedMemory::from(&asset))
+        .collect())
 }
 
 fn merge_retrieved_memories(existing: &mut Vec<RetrievedMemory>, extras: Vec<RetrievedMemory>) {
@@ -3655,19 +3867,6 @@ fn merge_retrieved_memories(existing: &mut Vec<RetrievedMemory>, extras: Vec<Ret
     }
 }
 
-fn default_rg_command(goal: &str) -> Vec<String> {
-    let lowered = goal.to_ascii_lowercase();
-    if contains_any(&lowered, &["file", "path", "which file", "哪个文件", "在哪"]) {
-        vec!["rg".to_owned(), "--files".to_owned()]
-    } else {
-        vec!["rg".to_owned(), "-n".to_owned()]
-    }
-}
-
-fn default_cargo_test_command(_goal: &str) -> Vec<String> {
-    vec!["cargo".to_owned(), "test".to_owned()]
-}
-
 fn tool_slug_from_asset(asset: &AssetView) -> Option<String> {
     if let Some(target_ref) = &asset.target_ref
         && let Some(rest) = target_ref.strip_prefix("room.tool.")
@@ -3675,9 +3874,15 @@ fn tool_slug_from_asset(asset: &AssetView) -> Option<String> {
         return Some(rest.to_owned());
     }
 
-    asset.tags
+    asset
+        .tags
         .iter()
-        .find(|tag| !matches!(tag.as_str(), "tool" | "recipe" | "validation" | "recovery" | "prompt"))
+        .find(|tag| {
+            !matches!(
+                tag.as_str(),
+                "tool" | "recipe" | "validation" | "recovery" | "prompt"
+            )
+        })
         .cloned()
 }
 
@@ -3696,6 +3901,158 @@ fn asset_matches_tool(asset: &AssetView, tool: &ToolSpec) -> bool {
     tool_slug_from_asset(asset).is_some_and(|slug| slug == tool_slug)
 }
 
+fn clean_tool_export_assets(tool: &ToolSpec, assets: &[AssetView]) -> Vec<AssetView> {
+    let mut selected = assets
+        .iter()
+        .filter(|asset| asset_matches_tool(asset, tool))
+        .filter(|asset| !is_process_asset(asset))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    selected.sort_by_key(tool_asset_priority);
+    selected.reverse();
+    selected
+}
+
+fn is_process_asset(asset: &AssetView) -> bool {
+    asset.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "evaluation"
+                | "evaluation-event"
+                | "revision"
+                | "draft"
+                | "retired"
+                | "retirement"
+                | "timeline"
+                | "event"
+                | "deprecated"
+        )
+    })
+}
+
+fn tool_export_asset_role(asset: &AssetView) -> String {
+    if asset.tags.iter().any(|tag| tag == "recipe") {
+        "recipe".to_owned()
+    } else if asset.tags.iter().any(|tag| tag == "validation") {
+        "validation".to_owned()
+    } else if asset.tags.iter().any(|tag| tag == "recovery") {
+        "recovery".to_owned()
+    } else if asset.form == MemoryAssetForm::Prompt {
+        "prompt".to_owned()
+    } else {
+        "support".to_owned()
+    }
+}
+
+fn clean_export_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .filter(|tag| {
+            !matches!(
+                tag.as_str(),
+                "promotion"
+                    | "evaluation"
+                    | "evaluation-event"
+                    | "revision"
+                    | "draft"
+                    | "retired"
+                    | "retirement"
+                    | "timeline"
+                    | "event"
+                    | "deprecated"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn render_export_asset_markdown(asset: &AssetView, role: &str, tags: &[String]) -> String {
+    let tags = if tags.is_empty() {
+        "none".to_owned()
+    } else {
+        tags.join(", ")
+    };
+    format!(
+        "# {}\n\nRole: {}\nKind: {:?}\nStage: {:?}\nForm: {:?}\nTags: {}\n\n{}\n",
+        asset.title,
+        role,
+        asset.kind,
+        asset.stage,
+        asset.form,
+        tags,
+        asset.content.trim()
+    )
+}
+
+fn render_layered_capability_readme(package: &ToolCapabilityExportPackage) -> String {
+    format!(
+        "# {}\n\n{}\n\n## Layers\n\n- portable: importable capability manifest and clean assets.\n- runnable: current executable plan and `run.sh` entrypoint.\n",
+        package.manifest.tool.name, package.manifest.tool.description
+    )
+}
+
+fn render_portable_capability_readme(package: &ToolCapabilityExportPackage) -> String {
+    let mut readme = format!(
+        "# {} Portable Capability\n\n{}\n\n## Assets\n\n",
+        package.manifest.tool.name, package.manifest.tool.description,
+    );
+    if package.manifest.assets.is_empty() {
+        readme.push_str("No clean executable assets were available at export time.\n");
+    } else {
+        for asset in &package.manifest.assets {
+            readme.push_str(&format!(
+                "- {}: [{}]({})\n",
+                asset.role, asset.title, asset.file
+            ));
+        }
+    }
+    readme
+}
+
+fn render_runnable_capability_readme(package: &ToolCapabilityExportPackage) -> String {
+    format!(
+        "# {} Runnable Capability\n\n```sh\n./run.sh\n```\n\nDefault command:\n\n```sh\n{}\n```\n",
+        package.manifest.tool.name,
+        package.manifest.command.join(" ")
+    )
+}
+
+fn render_run_script(plan: &ToolExecutionPlan) -> String {
+    let command = plan
+        .suggested_command
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("#!/usr/bin/env sh\nset -eu\nexec {command} \"$@\"\n")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 impl ToolExecutionBinder for DefaultToolExecutionBinder {
     fn bind(&self, goal: &str, tool: &ToolSpec, assets: &[AssetView]) -> Result<ToolExecutionPlan> {
         let mut compiled_guidance = Vec::new();
@@ -3705,7 +4062,10 @@ impl ToolExecutionBinder for DefaultToolExecutionBinder {
         let mut compiled_recovery_steps = Vec::new();
         let mut recovery_steps = Vec::new();
 
-        for asset in assets.iter().filter(|asset| asset_matches_tool(asset, tool)) {
+        for asset in assets
+            .iter()
+            .filter(|asset| asset_matches_tool(asset, tool))
+        {
             if asset.tags.iter().any(|tag| tag == "recipe") {
                 if asset.stage == MemoryAssetStage::Compiled
                     || asset.tags.iter().any(|tag| tag == "compiled")
@@ -3781,10 +4141,12 @@ pub fn can_promote(asset: &AssetView, rule: &PromotionRule) -> bool {
             .required_tags
             .iter()
             .all(|tag| asset.tags.iter().any(|candidate| candidate == tag))
-        && rule
-            .required_consumers
-            .iter()
-            .all(|consumer| asset.consumers.iter().any(|candidate| candidate == consumer))
+        && rule.required_consumers.iter().all(|consumer| {
+            asset
+                .consumers
+                .iter()
+                .any(|candidate| candidate == consumer)
+        })
 }
 
 pub fn should_retire(
@@ -3907,8 +4269,7 @@ fn retired_tool_asset_content(asset: &AssetView, signals: &[EvaluationSignal]) -
 
 fn tool_asset_priority(asset: &AssetView) -> u8 {
     let mut score = 0u8;
-    if asset.stage == MemoryAssetStage::Compiled || asset.tags.iter().any(|tag| tag == "compiled")
-    {
+    if asset.stage == MemoryAssetStage::Compiled || asset.tags.iter().any(|tag| tag == "compiled") {
         score += 4;
     }
     if asset.tags.iter().any(|tag| tag == "promotion") {
@@ -4272,7 +4633,9 @@ fn infer_prompt_asset_kind_from_preference(memory: &RetrievedMemory) -> PromptAs
     }
 }
 
-fn infer_prompt_asset_kind_from_compiled_memory(memory: &RetrievedMemory) -> Option<PromptAssetKind> {
+fn infer_prompt_asset_kind_from_compiled_memory(
+    memory: &RetrievedMemory,
+) -> Option<PromptAssetKind> {
     if memory.tags.iter().any(|tag| tag == "styleguide") {
         Some(PromptAssetKind::StyleGuide)
     } else if memory.tags.iter().any(|tag| tag == "behaviortemplate") {
@@ -4286,10 +4649,6 @@ fn infer_prompt_asset_kind_from_compiled_memory(memory: &RetrievedMemory) -> Opt
     } else {
         None
     }
-}
-
-fn managed_json_system_prompt() -> &'static str {
-    "Follow the provided local prompt asset. Return JSON only."
 }
 
 fn load_managed_prompt_body(
@@ -4319,12 +4678,16 @@ fn ensure_managed_prompt(
         store.write_text_in_namespace(namespace, &relative_path, default_content)?;
     }
 
-    let sidecar_path = store.resolve_in_namespace(namespace, managed_prompt_sidecar_relative_path(kind));
+    let sidecar_path =
+        store.resolve_in_namespace(namespace, managed_prompt_sidecar_relative_path(kind));
     if !sidecar_path.exists() {
         if let Some(parent) = sidecar_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&sidecar_path, serde_json::to_string_pretty(&managed_prompt_metadata(kind))?)?;
+        fs::write(
+            &sidecar_path,
+            serde_json::to_string_pretty(&managed_prompt_metadata(kind))?,
+        )?;
     }
 
     let prompt_body = fs::read_to_string(&prompt_path)?;
@@ -4338,7 +4701,8 @@ fn sync_managed_prompt_room_asset(
     kind: ManagedPromptKind,
     content: &str,
 ) -> Result<PathBuf> {
-    let repository = MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
+    let repository =
+        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), namespace.clone());
     let room = managed_prompt_room(namespace);
     repository.write_room(&room)?;
 
@@ -4357,15 +4721,11 @@ fn sync_managed_prompt_room_asset(
     if let Some(previous) = previous_asset
         && previous.summary.trim() != content.trim()
     {
-        let revision_asset = archive_managed_prompt_revision(
-            &repository,
-            &room,
-            &metadata,
-            kind,
-            &previous,
-        )?;
+        let revision_asset =
+            archive_managed_prompt_revision(&repository, &room, &metadata, kind, &previous)?;
         derived_from.push(revision_asset.id.clone());
-        let revision_relative = MemoryRoomRepository::prompt_doc_relative_path(&room, &revision_asset.file_name);
+        let revision_relative =
+            MemoryRoomRepository::prompt_doc_relative_path(&room, &revision_asset.file_name);
         source_docs.push(revision_relative.display().to_string());
         persist_room_evolution_event(
             &repository,
@@ -4427,7 +4787,11 @@ fn sync_managed_prompt_room_asset(
         &repository,
         &room,
         ArtifactEvolutionEvent::new(
-            format!("event.{}.compiled.{}", metadata.id, current_unix_timestamp_ms()),
+            format!(
+                "event.{}.compiled.{}",
+                metadata.id,
+                current_unix_timestamp_ms()
+            ),
             metadata.id.clone(),
             room.id.clone(),
             ArtifactEvolutionAction::Promoted,
@@ -4518,21 +4882,32 @@ fn managed_prompt_room(namespace: &WorkspaceNamespace) -> MemoryRoom {
 fn managed_prompt_relative_path(kind: ManagedPromptKind) -> PathBuf {
     let (group, file_name) = match kind {
         ManagedPromptKind::MemoryOrganizer => ("organizer", "memory-organizer.md"),
-        ManagedPromptKind::PromptAssetSynthesizer => {
-            ("synthesis", "prompt-asset-synthesizer.md")
-        }
+        ManagedPromptKind::PromptAssetSynthesizer => ("synthesis", "prompt-asset-synthesizer.md"),
         ManagedPromptKind::SemanticTagSuggester => ("extract", "semantic-tags.md"),
-        ManagedPromptKind::GlobalPreferenceSummary => {
-            ("summarize", "global-preference-summary.md")
-        }
+        ManagedPromptKind::GlobalPreferenceSummary => ("summarize", "global-preference-summary.md"),
         ManagedPromptKind::AssistantWenyanRewrite => ("rewrite", "assistant-wenyan.md"),
+        ManagedPromptKind::ToolChatAssistant => ("tool", "tool-chat-assistant.md"),
+        ManagedPromptKind::ToolRouter => ("tool", "tool-router.md"),
+        ManagedPromptKind::ToolNaturalLanguageBuilder => {
+            ("tool", "natural-language-tool-builder.md")
+        }
+        ManagedPromptKind::AgentResponderSystem => ("agent", "responder-system.md"),
+        ManagedPromptKind::AgentPlannerInput => ("agent", "planner-input.md"),
+        ManagedPromptKind::AgentWorkItemExecution => ("agent", "work-item-execution.md"),
+        ManagedPromptKind::ContextMemorySystem => ("context", "memory-system.md"),
+        ManagedPromptKind::ContextMemoryUsagePolicy => ("context", "memory-usage-policy.md"),
+        ManagedPromptKind::ContextLightweightChat => ("context", "lightweight-chat.md"),
+        ManagedPromptKind::JsonSystemGuard => ("system", "json-guard.md"),
     };
     PathBuf::from("prompts").join(group).join(file_name)
 }
 
 fn managed_prompt_sidecar_relative_path(kind: ManagedPromptKind) -> PathBuf {
     let path = managed_prompt_relative_path(kind);
-    let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("prompt.md");
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("prompt.md");
     path.with_file_name(format!("{}.meta.json", file_name.trim_end_matches(".md")))
 }
 
@@ -4543,14 +4918,22 @@ fn managed_prompt_metadata(kind: ManagedPromptKind) -> ManagedPromptMetadata {
             r#type: "prompt_template".to_owned(),
             title: "Memory Organizer".to_owned(),
             kind: "organizer".to_owned(),
-            tags: vec!["memory".to_owned(), "organizer".to_owned(), "routing".to_owned()],
+            tags: vec![
+                "memory".to_owned(),
+                "organizer".to_owned(),
+                "routing".to_owned(),
+            ],
         },
         ManagedPromptKind::PromptAssetSynthesizer => ManagedPromptMetadata {
             id: "prompt.synthesis.prompt-assets".to_owned(),
             r#type: "prompt_template".to_owned(),
             title: "Prompt Asset Synthesizer".to_owned(),
             kind: "synthesis".to_owned(),
-            tags: vec!["prompt".to_owned(), "synthesis".to_owned(), "behavior".to_owned()],
+            tags: vec![
+                "prompt".to_owned(),
+                "synthesis".to_owned(),
+                "behavior".to_owned(),
+            ],
         },
         ManagedPromptKind::SemanticTagSuggester => ManagedPromptMetadata {
             id: "prompt.extract.semantic-tags".to_owned(),
@@ -4564,14 +4947,112 @@ fn managed_prompt_metadata(kind: ManagedPromptKind) -> ManagedPromptMetadata {
             r#type: "prompt_template".to_owned(),
             title: "Global Preference Summary".to_owned(),
             kind: "summary".to_owned(),
-            tags: vec!["memory".to_owned(), "global".to_owned(), "preference".to_owned()],
+            tags: vec![
+                "memory".to_owned(),
+                "global".to_owned(),
+                "preference".to_owned(),
+            ],
         },
         ManagedPromptKind::AssistantWenyanRewrite => ManagedPromptMetadata {
             id: "prompt.rewrite.assistant-wenyan".to_owned(),
             r#type: "prompt_template".to_owned(),
             title: "Assistant Wenyan Rewrite".to_owned(),
             kind: "rewrite".to_owned(),
-            tags: vec!["rewrite".to_owned(), "wenyan".to_owned(), "assistant".to_owned()],
+            tags: vec![
+                "rewrite".to_owned(),
+                "wenyan".to_owned(),
+                "assistant".to_owned(),
+            ],
+        },
+        ManagedPromptKind::ToolChatAssistant => ManagedPromptMetadata {
+            id: "prompt.tool.chat-assistant".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Tool Chat Assistant".to_owned(),
+            kind: "tool_chat".to_owned(),
+            tags: vec!["tool".to_owned(), "chat".to_owned(), "assistant".to_owned()],
+        },
+        ManagedPromptKind::ToolRouter => ManagedPromptMetadata {
+            id: "prompt.tool.router".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Tool Router".to_owned(),
+            kind: "tool_router".to_owned(),
+            tags: vec!["tool".to_owned(), "router".to_owned(), "json".to_owned()],
+        },
+        ManagedPromptKind::ToolNaturalLanguageBuilder => ManagedPromptMetadata {
+            id: "prompt.tool.natural-language-builder".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Natural Language Tool Builder".to_owned(),
+            kind: "tool_builder".to_owned(),
+            tags: vec!["tool".to_owned(), "builder".to_owned(), "json".to_owned()],
+        },
+        ManagedPromptKind::AgentResponderSystem => ManagedPromptMetadata {
+            id: "prompt.agent.responder-system".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Agent Responder System".to_owned(),
+            kind: "agent_responder".to_owned(),
+            tags: vec![
+                "agent".to_owned(),
+                "responder".to_owned(),
+                "system".to_owned(),
+            ],
+        },
+        ManagedPromptKind::AgentPlannerInput => ManagedPromptMetadata {
+            id: "prompt.agent.planner-input".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Agent Planner Input".to_owned(),
+            kind: "agent_planner".to_owned(),
+            tags: vec!["agent".to_owned(), "planner".to_owned(), "json".to_owned()],
+        },
+        ManagedPromptKind::AgentWorkItemExecution => ManagedPromptMetadata {
+            id: "prompt.agent.work-item-execution".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Agent Work Item Execution".to_owned(),
+            kind: "agent_execution".to_owned(),
+            tags: vec![
+                "agent".to_owned(),
+                "execution".to_owned(),
+                "task".to_owned(),
+            ],
+        },
+        ManagedPromptKind::ContextMemorySystem => ManagedPromptMetadata {
+            id: "prompt.context.memory-system".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Context Memory System".to_owned(),
+            kind: "context_memory".to_owned(),
+            tags: vec![
+                "context".to_owned(),
+                "memory".to_owned(),
+                "system".to_owned(),
+            ],
+        },
+        ManagedPromptKind::ContextMemoryUsagePolicy => ManagedPromptMetadata {
+            id: "prompt.context.memory-usage-policy".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Context Memory Usage Policy".to_owned(),
+            kind: "context_policy".to_owned(),
+            tags: vec![
+                "context".to_owned(),
+                "memory".to_owned(),
+                "policy".to_owned(),
+            ],
+        },
+        ManagedPromptKind::ContextLightweightChat => ManagedPromptMetadata {
+            id: "prompt.context.lightweight-chat".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "Context Lightweight Chat".to_owned(),
+            kind: "context_lightweight_chat".to_owned(),
+            tags: vec![
+                "context".to_owned(),
+                "chat".to_owned(),
+                "lightweight".to_owned(),
+            ],
+        },
+        ManagedPromptKind::JsonSystemGuard => ManagedPromptMetadata {
+            id: "prompt.system.json-guard".to_owned(),
+            r#type: "prompt_template".to_owned(),
+            title: "JSON System Guard".to_owned(),
+            kind: "system_guard".to_owned(),
+            tags: vec!["system".to_owned(), "json".to_owned(), "guard".to_owned()],
         },
     }
 }
@@ -4592,6 +5073,36 @@ fn managed_prompt_default_body(kind: ManagedPromptKind) -> &'static str {
         }
         ManagedPromptKind::AssistantWenyanRewrite => {
             include_str!("../prompt-templates/rewrite/assistant-wenyan.md")
+        }
+        ManagedPromptKind::ToolChatAssistant => {
+            include_str!("../prompt-templates/tool/tool-chat-assistant.md")
+        }
+        ManagedPromptKind::ToolRouter => {
+            include_str!("../prompt-templates/tool/tool-router.md")
+        }
+        ManagedPromptKind::ToolNaturalLanguageBuilder => {
+            include_str!("../prompt-templates/tool/natural-language-tool-builder.md")
+        }
+        ManagedPromptKind::AgentResponderSystem => {
+            include_str!("../prompt-templates/agent/responder-system.md")
+        }
+        ManagedPromptKind::AgentPlannerInput => {
+            include_str!("../prompt-templates/agent/planner-input.md")
+        }
+        ManagedPromptKind::AgentWorkItemExecution => {
+            include_str!("../prompt-templates/agent/work-item-execution.md")
+        }
+        ManagedPromptKind::ContextMemorySystem => {
+            include_str!("../prompt-templates/context/memory-system.md")
+        }
+        ManagedPromptKind::ContextMemoryUsagePolicy => {
+            include_str!("../prompt-templates/context/memory-usage-policy.md")
+        }
+        ManagedPromptKind::ContextLightweightChat => {
+            include_str!("../prompt-templates/context/lightweight-chat.md")
+        }
+        ManagedPromptKind::JsonSystemGuard => {
+            include_str!("../prompt-templates/system/json-guard.md")
         }
     }
 }
@@ -5166,7 +5677,11 @@ mod tests {
 
         assert_eq!(view.target, AssetTarget::Tool);
         assert_eq!(view.target_ref.as_deref(), Some("room.tool.rg"));
-        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Executor));
+        assert!(
+            view.consumers
+                .iter()
+                .any(|consumer| consumer == &AssetConsumer::Executor)
+        );
     }
 
     #[test]
@@ -5191,7 +5706,11 @@ mod tests {
         let view = asset_view_from_room_asset(&asset);
 
         assert_eq!(view.target, AssetTarget::Project);
-        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Llm));
+        assert!(
+            view.consumers
+                .iter()
+                .any(|consumer| consumer == &AssetConsumer::Llm)
+        );
     }
 
     #[test]
@@ -5260,8 +5779,16 @@ mod tests {
 
         let view = asset_view_from_retrieved_memory(&memory);
 
-        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Executor));
-        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Evaluator));
+        assert!(
+            view.consumers
+                .iter()
+                .any(|consumer| consumer == &AssetConsumer::Executor)
+        );
+        assert!(
+            view.consumers
+                .iter()
+                .any(|consumer| consumer == &AssetConsumer::Evaluator)
+        );
     }
 
     #[test]
@@ -5295,7 +5822,11 @@ mod tests {
         let view = asset_view_from_memory_record(&record);
 
         assert_eq!(view.form, MemoryAssetForm::Workflow);
-        assert!(view.consumers.iter().any(|consumer| consumer == &AssetConsumer::Planner));
+        assert!(
+            view.consumers
+                .iter()
+                .any(|consumer| consumer == &AssetConsumer::Planner)
+        );
     }
 
     #[test]
@@ -5395,12 +5926,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_binder_prefers_rg_files_for_file_lookup_goal() {
+    fn tool_binder_uses_declared_rg_default_command() {
         let plan = DefaultToolExecutionBinder
             .bind("find which file defines AssetView", &seed_tool_rg(), &[])
             .expect("tool binding should succeed");
 
-        assert_eq!(plan.suggested_command, vec!["rg".to_owned(), "--files".to_owned()]);
+        assert_eq!(
+            plan.suggested_command,
+            vec!["rg".to_owned(), "-n".to_owned()]
+        );
     }
 
     #[test]
@@ -5409,7 +5943,10 @@ mod tests {
             .bind("find memory prompt flow", &seed_tool_rg(), &[])
             .expect("tool binding should succeed");
 
-        assert_eq!(plan.suggested_command, vec!["rg".to_owned(), "-n".to_owned()]);
+        assert_eq!(
+            plan.suggested_command,
+            vec!["rg".to_owned(), "-n".to_owned()]
+        );
     }
 
     #[test]
@@ -5440,8 +5977,12 @@ mod tests {
             AssetView {
                 id: "asset.room.tool.cargo-test.validation".to_owned(),
                 title: "Cargo Test Validation".to_owned(),
-                summary: "Check whether the intended tests actually ran before trusting the result.".to_owned(),
-                content: "Check whether the intended tests actually ran before trusting the result.".to_owned(),
+                summary:
+                    "Check whether the intended tests actually ran before trusting the result."
+                        .to_owned(),
+                content:
+                    "Check whether the intended tests actually ran before trusting the result."
+                        .to_owned(),
                 kind: MemoryKind::Knowledge,
                 stage: MemoryAssetStage::Generalized,
                 form: MemoryAssetForm::Policy,
@@ -5596,7 +6137,10 @@ mod tests {
         .expect("tool execution plan should build");
 
         assert_eq!(plan.tool_id, "tool.rg");
-        assert_eq!(plan.suggested_command, vec!["rg".to_owned(), "-n".to_owned()]);
+        assert_eq!(
+            plan.suggested_command,
+            vec!["rg".to_owned(), "-n".to_owned()]
+        );
         assert_eq!(plan.guidance.len(), 1);
         assert_eq!(plan.validation_steps.len(), 1);
 
@@ -5624,7 +6168,12 @@ mod tests {
             source_docs: Vec::new(),
         };
 
-        assert!(should_generalize(&asset, 0, true, &GeneralizationPolicy::default()));
+        assert!(should_generalize(
+            &asset,
+            0,
+            true,
+            &GeneralizationPolicy::default()
+        ));
     }
 
     #[test]
@@ -5678,6 +6227,8 @@ mod tests {
         };
         let outcome = ToolExecutionOutcome {
             tool_id: "tool.rg".to_owned(),
+            parent_tool_id: None,
+            invoked_tool_ids: Vec::new(),
             goal: "find asset view".to_owned(),
             command: vec!["rg".to_owned(), "-n".to_owned(), "AssetView".to_owned()],
             success: true,
@@ -5724,6 +6275,8 @@ mod tests {
         };
         let outcome = ToolExecutionOutcome {
             tool_id: tool.id.clone(),
+            parent_tool_id: None,
+            invoked_tool_ids: Vec::new(),
             goal: "find asset view".to_owned(),
             command: vec!["rg".to_owned(), "-n".to_owned(), "AssetView".to_owned()],
             success: true,
@@ -5754,16 +6307,96 @@ mod tests {
             evaluation.promote_candidate_ids,
             vec!["asset.room.tool.rg.recipe".to_owned()]
         );
-        assert!(evaluation
-            .signals
-            .contains(&EvaluationSignal::ExecutionSucceeded));
-        assert!(evaluation
-            .signals
-            .contains(&EvaluationSignal::ValidationPassed));
-        assert!(evaluation
-            .events
-            .iter()
-            .any(|event| matches!(event.action, EvolutionAction::Evaluated)));
+        assert!(
+            evaluation
+                .signals
+                .contains(&EvaluationSignal::ExecutionSucceeded)
+        );
+        assert!(
+            evaluation
+                .signals
+                .contains(&EvaluationSignal::ValidationPassed)
+        );
+        assert!(
+            evaluation
+                .events
+                .iter()
+                .any(|event| matches!(event.action, EvolutionAction::Evaluated))
+        );
+    }
+
+    #[test]
+    fn export_tool_capability_package_writes_clean_single_capability_bundle() {
+        let root = unique_temp_dir("tool-export");
+        let tool = seed_tool_rg();
+        let recipe = AssetView {
+            id: "asset.room.tool.rg.compiled.recipe".to_owned(),
+            title: "RG Compiled Recipe".to_owned(),
+            summary: "Use focused rg searches before broad scans.".to_owned(),
+            content: "Use focused rg searches before broad scans.".to_owned(),
+            kind: MemoryKind::WorkflowMemory,
+            stage: MemoryAssetStage::Compiled,
+            form: MemoryAssetForm::Workflow,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Executor],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec![
+                "tool".to_owned(),
+                "rg".to_owned(),
+                "recipe".to_owned(),
+                "compiled".to_owned(),
+                "promotion".to_owned(),
+            ],
+            owners: Vec::new(),
+            derived_from: vec!["asset.room.tool.rg.recipe.raw".to_owned()],
+            source_docs: Vec::new(),
+        };
+        let evaluation_event = AssetView {
+            id: "asset.room.tool.rg.event.evaluated".to_owned(),
+            title: "RG Evaluated".to_owned(),
+            summary: "This should stay out of the export.".to_owned(),
+            content: "This should stay out of the export.".to_owned(),
+            kind: MemoryKind::Summary,
+            stage: MemoryAssetStage::Extracted,
+            form: MemoryAssetForm::Summary,
+            target: AssetTarget::Tool,
+            target_ref: Some("room.tool.rg".to_owned()),
+            consumers: vec![AssetConsumer::Human],
+            status: AssetStatus::Active,
+            visibility: MemoryVisibility::Private,
+            tags: vec![
+                "tool".to_owned(),
+                "rg".to_owned(),
+                "evaluation-event".to_owned(),
+            ],
+            owners: Vec::new(),
+            derived_from: vec![recipe.id.clone()],
+            source_docs: Vec::new(),
+        };
+
+        let package = export_tool_capability_package(&root, &tool, &[recipe, evaluation_event])
+            .expect("tool capability export should succeed");
+
+        assert_eq!(package.manifest.package_id, "capability.rg");
+        assert_eq!(package.manifest.assets.len(), 1);
+        assert_eq!(package.manifest.assets[0].role, "recipe");
+        assert!(
+            !package.manifest.assets[0]
+                .tags
+                .iter()
+                .any(|tag| tag == "promotion")
+        );
+        assert!(root.join("README.md").exists());
+        assert!(root.join("package.json").exists());
+        assert!(root.join("portable").join("manifest.json").exists());
+        assert!(root.join("runnable").join("run.sh").exists());
+        assert!(
+            root.join("portable")
+                .join(&package.manifest.assets[0].file)
+                .exists()
+        );
     }
 
     #[test]
@@ -5820,6 +6453,8 @@ mod tests {
         };
         let outcome = ToolExecutionOutcome {
             tool_id: tool.id.clone(),
+            parent_tool_id: None,
+            invoked_tool_ids: Vec::new(),
             goal: "find missing type".to_owned(),
             command: vec!["rg".to_owned(), "-n".to_owned(), "MissingType".to_owned()],
             success: false,
@@ -5830,7 +6465,11 @@ mod tests {
             &tool,
             &plan,
             &outcome,
-            &[asset, prior_failure_event("one"), prior_failure_event("two")],
+            &[
+                asset,
+                prior_failure_event("one"),
+                prior_failure_event("two"),
+            ],
             &GeneralizationPolicy::default(),
             &PromotionRule {
                 from_stage: MemoryAssetStage::Generalized,
@@ -5844,10 +6483,12 @@ mod tests {
 
         assert_eq!(evaluation.revise_candidate_ids, Vec::<String>::new());
         assert_eq!(evaluation.retire_candidate_ids, vec![asset_id]);
-        assert!(evaluation
-            .events
-            .iter()
-            .any(|event| matches!(event.action, EvolutionAction::Retired)));
+        assert!(
+            evaluation
+                .events
+                .iter()
+                .any(|event| matches!(event.action, EvolutionAction::Retired))
+        );
     }
 
     #[test]
@@ -5877,10 +6518,7 @@ mod tests {
         let requests = room_memory_write_requests_from_tool_evaluation(&tool, &evaluation);
         assert_eq!(requests.len(), 2);
         assert!(requests[0].tags.iter().any(|tag| tag == "evaluation"));
-        assert!(requests[1]
-            .tags
-            .iter()
-            .any(|tag| tag == "evaluation-event"));
+        assert!(requests[1].tags.iter().any(|tag| tag == "evaluation-event"));
     }
 
     #[test]
@@ -5918,20 +6556,17 @@ mod tests {
             events: Vec::new(),
         };
 
-        let paths = persist_compiled_tool_assets(
-            &root,
-            namespace.clone(),
-            &tool,
-            &[asset],
-            &evaluation,
-        )
-        .expect("compiled tool assets should persist");
+        let paths =
+            persist_compiled_tool_assets(&root, namespace.clone(), &tool, &[asset], &evaluation)
+                .expect("compiled tool assets should persist");
 
         assert_eq!(paths.len(), 1);
-        assert!(paths[0]
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.starts_with("compiled.")));
+        assert!(
+            paths[0]
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with("compiled."))
+        );
         let contents = fs::read_to_string(&paths[0]).expect("compiled asset should be readable");
         assert!(contents.contains("Prefer narrowing search scope before broad content search."));
         assert!(!contents.contains("Compiled guidance for"));
@@ -5969,10 +6604,12 @@ mod tests {
             .expect("tool evolution events should persist");
 
         assert_eq!(paths.len(), 1);
-        assert!(paths[0]
-            .to_string_lossy()
-            .replace('\\', "/")
-            .ends_with("memory/rooms/project/room.tool.rg/timeline.md"));
+        assert!(
+            paths[0]
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with("memory/rooms/project/room.tool.rg/timeline.md")
+        );
         let contents = fs::read_to_string(&paths[0]).expect("timeline should be readable");
         assert!(contents.contains("event.asset.room.tool.rg.recipe.promoted"));
         assert!(contents.contains("promote_to:compiled"));
@@ -6676,12 +7313,9 @@ mod tests {
         let root = unique_temp_dir("managed-prompt-room-asset");
         let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
 
-        let body = load_managed_prompt_body(
-            &root,
-            &namespace,
-            ManagedPromptKind::SemanticTagSuggester,
-        )
-        .expect("managed prompt body should load");
+        let body =
+            load_managed_prompt_body(&root, &namespace, ManagedPromptKind::SemanticTagSuggester)
+                .expect("managed prompt body should load");
 
         assert!(body.contains("Infer compact semantic tags"));
 
@@ -6713,12 +7347,9 @@ mod tests {
         let root = unique_temp_dir("managed-prompt-revision");
         let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
 
-        let _ = load_managed_prompt_body(
-            &root,
-            &namespace,
-            ManagedPromptKind::SemanticTagSuggester,
-        )
-        .expect("managed prompt body should load");
+        let _ =
+            load_managed_prompt_body(&root, &namespace, ManagedPromptKind::SemanticTagSuggester)
+                .expect("managed prompt body should load");
 
         let store = WorkspaceStore::new(PathBuf::from(&root));
         let relative = managed_prompt_relative_path(ManagedPromptKind::SemanticTagSuggester);
@@ -6730,22 +7361,25 @@ mod tests {
             )
             .expect("updated prompt body should be written");
 
-        let _ = load_managed_prompt_body(
-            &root,
-            &namespace,
-            ManagedPromptKind::SemanticTagSuggester,
-        )
-        .expect("managed prompt body should resync");
+        let _ =
+            load_managed_prompt_body(&root, &namespace, ManagedPromptKind::SemanticTagSuggester)
+                .expect("managed prompt body should resync");
 
         let repository = MemoryRoomRepository::with_namespace(&root, namespace.clone());
         let room = managed_prompt_room(&namespace);
-        let current_relative = MemoryRoomRepository::prompt_doc_relative_path(&room, "semantic-tags.md");
+        let current_relative =
+            MemoryRoomRepository::prompt_doc_relative_path(&room, "semantic-tags.md");
         let current = repository
             .read_asset(current_relative)
             .expect("current managed prompt asset should be readable");
 
         assert!(current.summary.contains("reviewer and rg"));
-        assert!(current.derived_from.iter().any(|item| item.starts_with("prompt.extract.semantic-tags.rev.")));
+        assert!(
+            current
+                .derived_from
+                .iter()
+                .any(|item| item.starts_with("prompt.extract.semantic-tags.rev."))
+        );
 
         let revision_dir = repository
             .root()

@@ -1,5 +1,5 @@
 [package]
-name = "hc-context-cli"
+name = "hc-tool-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+rustyline.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+hc-capability = { path = "../../crates/hc-capability" }
 hc-context = { path = "../../crates/hc-context" }
-hc-log = { path = "../../crates/hc-log" }
 hc-llm = { path = "../../crates/hc-llm" }
-hc-memory = { path = "../../crates/hc-memory" }
 hc-skill = { path = "../../crates/hc-skill" }
 hc-store = { path = "../../crates/hc-store" }
-hc-trace = { path = "../../crates/hc-trace" }
+hc-toolchain = { path = "../../crates/hc-toolchain" }

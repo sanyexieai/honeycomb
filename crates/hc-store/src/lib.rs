@@ -384,7 +384,10 @@ pub mod store {
             namespace: &WorkspaceNamespace,
             query: &MarkdownQuery,
         ) -> Result<Vec<MarkdownIndexEntry>> {
-            let index = self.read_markdown_index_in_namespace(namespace)?;
+            let index = match self.read_markdown_index_in_namespace(namespace) {
+                Ok(index) => index,
+                Err(_) => self.rebuild_markdown_index_in_namespace(namespace)?,
+            };
             Ok(apply_query(index.documents, query))
         }
     }
@@ -529,7 +532,10 @@ pub mod store {
             format!("failed to read sidecar metadata {}", sidecar_path.display())
         })?;
         serde_json::from_str(&content).with_context(|| {
-            format!("failed to parse sidecar metadata {}", sidecar_path.display())
+            format!(
+                "failed to parse sidecar metadata {}",
+                sidecar_path.display()
+            )
         })
     }
 
@@ -543,8 +549,9 @@ pub mod store {
     }
 
     fn required_json_string_field(value: &serde_json::Value, field: &str) -> Result<String> {
-        optional_json_string_field(value, field)
-            .ok_or_else(|| anyhow::anyhow!("plain markdown sidecar is missing required field `{field}`"))
+        optional_json_string_field(value, field).ok_or_else(|| {
+            anyhow::anyhow!("plain markdown sidecar is missing required field `{field}`")
+        })
     }
 
     fn json_string_list_field(value: &serde_json::Value, field: &str) -> Option<Vec<String>> {

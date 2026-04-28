@@ -4,43 +4,47 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc,
+    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use hc_context::{
-    DefaultToolExecutionBinder, EvaluationSignal, GeneralizationPolicy, PromotionRule,
-    RetirementRule, ToolExecutionOutcome, build_tool_execution_plan_from_assets,
-    CompositeMemoryOrganizer, ContextMemoryQuery, ContextRequest, DefaultContextComposer,
-    DefaultPromptAssetSynthesizer, KeywordMemoryTagSuggester, LlmMemoryOrganizer,
-    LlmMemoryTagSuggester, LlmPromptAssetSynthesizer, MemoryOrganizationInput,
-    MemoryOrganizer, PromptAssetSynthesizer, PromptPolicy, RuleBasedMemoryKindResolver,
-    RuleBasedMemoryPromotionAdvisor, RuleBasedMemoryRoomRouter, WorkspaceMemoryRetriever,
-    default_workspace_root, evaluate_tool_execution,
-    generate_with_context_stream_using_synthesizer,
-    generate_with_context_using_synthesizer, load_assistant_wenyan_prompt,
-    load_tool_assets, persist_room_memory, persist_synthesized_prompt_assets,
-    persist_retired_tool_assets, persist_revised_tool_assets, persist_tool_evolution_events,
-    persist_compiled_tool_assets,
-    room_memory_write_requests_from_tool_evaluation,
-    room_memory_write_request_from_tool_outcome,
-    room_memory_write_request_from_response, summarize_global_preference,
+    CompositeMemoryOrganizer, ContextMemoryQuery, ContextRequest, ContextResponse,
+    DefaultContextComposer, DefaultPromptAssetSynthesizer, DefaultToolExecutionBinder,
+    EvaluationSignal, GeneralizationPolicy, KeywordMemoryTagSuggester, LlmMemoryOrganizer,
+    LlmMemoryTagSuggester, LlmPromptAssetSynthesizer, MemoryOrganizationInput, MemoryOrganizer,
+    PromotionRule, PromptAssetSynthesizer, PromptPolicy, RetirementRule,
+    RuleBasedMemoryKindResolver, RuleBasedMemoryPromotionAdvisor, RuleBasedMemoryRoomRouter,
+    ToolCatalog, ToolComposition, ToolExecutionKind, ToolExecutionOutcome, ToolRepository,
+    WorkspaceMemoryRetriever, build_tool_execution_plan_from_assets, default_tool_catalog,
+    default_workspace_root, evaluate_tool_execution, export_tool_capability_package,
+    generate_with_context_stream_using_synthesizer, generate_with_context_using_synthesizer,
+    load_assistant_wenyan_prompt, load_context_lightweight_chat_prompt,
+    load_context_memory_system_prompt, load_context_memory_usage_policy_prompt, load_tool_assets,
+    persist_compiled_tool_assets, persist_retired_tool_assets, persist_revised_tool_assets,
+    persist_room_memory, persist_synthesized_prompt_assets, persist_tool_evolution_events,
+    room_memory_write_request_from_response, room_memory_write_request_from_tool_outcome,
+    room_memory_write_requests_from_tool_evaluation, summarize_global_preference,
     summarize_global_preference_with_llm, workspace_namespace_from_memory_namespace,
-    seed_tool_cargo_test, seed_tool_rg,
 };
 use hc_llm::{
-    ChatMessage, GenerateRequest, MessageRole, ModelRef, OpenAiCompatibleProvider,
-    ProviderRegistry, StreamChunk,
+    ChatMessage, GenerateRequest, MessageRole, ModelRef, ProviderRegistry, StreamChunk,
+    default_model_from_env, default_provider_from_env, default_registry_from_env,
 };
+use hc_log::CliLogger;
 use hc_memory::{
     ArtifactDraft, ArtifactEvolutionAction, ArtifactEvolutionEvent, MemoryEntityKind,
     MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerKind, MemoryOwnerRef,
     MemoryRelation, MemoryRelationKind, MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind,
     MemoryRoomRepository, MemoryScope, MemoryVisibility,
 };
+use hc_skill::{SkillProfile, SkillRepository};
 use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore};
+use hc_trace::{
+    TraceContext, TraceScopeGuard, current_trace_context, new_trace_id, replace_trace_context,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestMode {
@@ -89,16 +93,194 @@ struct BackgroundMemoryWorker {
     handle: thread::JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct LlmPriorityState {
+    active_foreground: usize,
+    active_background: usize,
+}
+
+#[derive(Default)]
+struct LlmPriorityGate {
+    state: Mutex<LlmPriorityState>,
+    changed: Condvar,
+}
+
+enum LlmPriorityClass {
+    Foreground,
+    Background,
+}
+
+struct LlmPriorityPermit {
+    gate: Arc<LlmPriorityGate>,
+    class: LlmPriorityClass,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OutputStyle {
     typewriter: bool,
     typewriter_delay_ms: u64,
 }
 
+static CLI_LOGGER: OnceLock<CliLogger> = OnceLock::new();
+const TRACE_COMPONENT: &str = "hc-context-cli";
+
+fn init_cli_trace(namespace: &WorkspaceNamespace) {
+    let logger = CliLogger::init_for_workspace_run(
+        default_workspace_root(),
+        namespace,
+        "hc-context-cli",
+        TRACE_COMPONENT,
+    );
+    let _ = CLI_LOGGER.set(logger);
+}
+
+fn current_run_id() -> Option<String> {
+    cli_logger().current_run_id()
+}
+
+fn enter_flow_context(flow_id: impl Into<String>) -> TraceScopeGuard {
+    cli_logger().enter_flow_context(flow_id)
+}
+
+fn emit_cli_trace(stage: &str, action: &str, status: Option<&str>, message: impl Into<String>) {
+    cli_logger().emit(stage, action, status, message);
+}
+
+fn emit_cli_trace_with_fields(
+    stage: &str,
+    action: &str,
+    status: Option<&str>,
+    message: impl Into<String>,
+    fields: BTreeMap<String, String>,
+) {
+    cli_logger().emit_with_fields(stage, action, status, message, fields);
+}
+
+fn print_organize_status(stage: &str, detail: impl AsRef<str>) {
+    cli_logger().print_status(stage, detail);
+}
+
+fn eprint_organize_status(stage: &str, detail: impl AsRef<str>) {
+    cli_logger().eprint_status(stage, detail);
+}
+
+fn set_active_prompt(prompt: &str) {
+    cli_logger().set_active_prompt(prompt);
+}
+
+fn clear_active_prompt() {
+    cli_logger().clear_active_prompt();
+}
+
+fn cli_logger() -> &'static CliLogger {
+    CLI_LOGGER
+        .get()
+        .expect("cli trace logger should be initialized before use")
+}
+
+impl LlmPriorityGate {
+    fn acquire_foreground(self: &Arc<Self>) -> LlmPriorityPermit {
+        let mut state = self.state.lock().expect("llm priority state should lock");
+        // Foreground work should not wait for an already-running background task.
+        // Background admission is still gated on foreground activity below, so this
+        // keeps interactive replies responsive without letting background jobs pile up.
+        state.active_foreground += 1;
+        if priority_debug_enabled() {
+            eprint_organize_status(
+                "priority",
+                format!(
+                    "class=foreground action=acquired active_foreground={} active_background={}",
+                    state.active_foreground, state.active_background
+                ),
+            );
+        }
+        LlmPriorityPermit {
+            gate: Arc::clone(self),
+            class: LlmPriorityClass::Foreground,
+        }
+    }
+
+    fn acquire_background(self: &Arc<Self>) -> LlmPriorityPermit {
+        let mut state = self.state.lock().expect("llm priority state should lock");
+        while state.active_foreground > 0 || state.active_background > 0 {
+            if priority_debug_enabled() {
+                eprint_organize_status(
+                    "priority",
+                    format!(
+                        "class=background action=waiting active_foreground={} active_background={}",
+                        state.active_foreground, state.active_background
+                    ),
+                );
+            }
+            state = self
+                .changed
+                .wait(state)
+                .expect("llm priority state should wait");
+        }
+        state.active_background += 1;
+        if priority_debug_enabled() {
+            eprint_organize_status(
+                "priority",
+                format!(
+                    "class=background action=acquired active_foreground={} active_background={}",
+                    state.active_foreground, state.active_background
+                ),
+            );
+        }
+        LlmPriorityPermit {
+            gate: Arc::clone(self),
+            class: LlmPriorityClass::Background,
+        }
+    }
+}
+
+impl Drop for LlmPriorityPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .expect("llm priority state should lock");
+        match self.class {
+            LlmPriorityClass::Foreground => {
+                state.active_foreground = state.active_foreground.saturating_sub(1);
+            }
+            LlmPriorityClass::Background => {
+                state.active_background = state.active_background.saturating_sub(1);
+            }
+        }
+        if priority_debug_enabled() {
+            let class = match self.class {
+                LlmPriorityClass::Foreground => "foreground",
+                LlmPriorityClass::Background => "background",
+            };
+            eprint_organize_status(
+                "priority",
+                format!(
+                    "class={class} action=released active_foreground={} active_background={}",
+                    state.active_foreground, state.active_background
+                ),
+            );
+        }
+        self.gate.changed.notify_all();
+    }
+}
+
 fn main() -> Result<()> {
     load_local_env_file()?;
+    let trace_namespace = workspace_namespace_from_memory_namespace(&runtime_memory_namespace());
+    init_cli_trace(&trace_namespace);
     let args: Vec<String> = env::args().skip(1).collect();
     let registry = default_registry();
+    emit_cli_trace(
+        "runtime",
+        "start",
+        Some("started"),
+        format!(
+            "starting hc-context-cli command {}",
+            args.first().cloned().unwrap_or_else(|| "chat".to_owned())
+        ),
+    );
 
     if args.is_empty() {
         return handle_chat(&registry, &[]);
@@ -108,7 +290,9 @@ fn main() -> Result<()> {
         Some("generate") => handle_generate(&registry, &args[1..]),
         Some("tool-plan") => handle_tool_plan(&registry, &args[1..]),
         Some("tool-run") => handle_tool_run(&args[1..]),
+        Some("tool-export") => handle_tool_export(&args[1..]),
         Some("tool-seed") => handle_tool_seed(&args[1..]),
+        Some("skill") => handle_skill(&args[1..]),
         Some("chat") => handle_chat(&registry, &args[1..]),
         Some("help") | Some("--help") | Some("-h") => print_help(),
         Some(other) => bail!("unknown command: {other}"),
@@ -122,6 +306,14 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             "usage: hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]"
         );
     }
+    let generate_flow = new_trace_id("flow.generate");
+    let _flow_guard = enter_flow_context(generate_flow.clone());
+    emit_cli_trace(
+        "generate",
+        "start",
+        Some("started"),
+        "starting generate command",
+    );
 
     let mut provider = default_provider();
     let mut model = default_model();
@@ -363,14 +555,23 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     } else {
         memory_query.with_text(prompt_text.clone())
     };
+    let context_namespace = workspace_namespace_from_memory_namespace(
+        &effective_memory_query
+            .memory_query
+            .namespace
+            .clone()
+            .unwrap_or_else(runtime_memory_namespace),
+    );
+    let system_prompt = match system_message {
+        Some(system_message) => system_message,
+        None => load_context_memory_system_prompt(&context_namespace)?,
+    };
     let request = ContextRequest::new(generation)
         .with_memory_query(effective_memory_query.clone())
-        .with_system_prompt(system_message.unwrap_or_else(|| {
-            "Use recalled memory when it is relevant, but do not invent facts from memory that are not present.".to_owned()
-        }))
+        .with_system_prompt(system_prompt)
         .with_prompt_policy(PromptPolicy::new(
             "Memory Usage Policy",
-            "Treat recalled memory as supporting context. Prefer direct user intent when they conflict, and do not invent missing facts.",
+            load_context_memory_usage_policy_prompt(&context_namespace)?,
         ));
 
     let memory_namespace = runtime_memory_namespace();
@@ -496,65 +697,36 @@ fn handle_generate(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         print_recalled_memories_for_generate(&response.recalled_memories);
     }
 
-    if !json && let Some(path) = persisted_path {
+    if !json && let Some(path) = &persisted_path {
         println!("persisted room memory: {}", path.display());
     }
+
+    emit_cli_trace_with_fields(
+        "generate",
+        "finish",
+        Some("completed"),
+        "generate command completed",
+        BTreeMap::from([
+            ("flow_id".to_owned(), generate_flow),
+            (
+                "recalled_count".to_owned(),
+                response.recalled_memories.len().to_string(),
+            ),
+            (
+                "persisted".to_owned(),
+                persisted_path
+                    .as_ref()
+                    .map(|_| "true".to_owned())
+                    .unwrap_or_else(|| "false".to_owned()),
+            ),
+        ]),
+    );
 
     Ok(())
 }
 
 fn default_registry() -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
-    let provider_id = default_provider();
-    let api_key = provider_api_key(&provider_id);
-    let base_url = provider_base_url(&provider_id);
-
-    if let Some(api_key) = api_key {
-        if let Ok(provider) = OpenAiCompatibleProvider::new(
-            provider_id.clone(),
-            format!("{provider_id} compatible"),
-            base_url,
-            api_key,
-        ) {
-            registry.register(provider);
-        }
-    }
-
-    registry
-}
-
-fn provider_api_key(provider_id: &str) -> Option<String> {
-    env::var("HC_LLM_API_KEY")
-        .ok()
-        .or_else(|| env::var(provider_api_key_var_name(provider_id)).ok())
-}
-
-fn provider_base_url(provider_id: &str) -> String {
-    env::var("HC_LLM_BASE_URL")
-        .ok()
-        .or_else(|| env::var(provider_base_url_var_name(provider_id)).ok())
-        .unwrap_or_else(|| default_base_url_for_provider(provider_id))
-}
-
-fn provider_api_key_var_name(provider_id: &str) -> &'static str {
-    match provider_id.trim().to_ascii_lowercase().as_str() {
-        "minimax" => "MINIMAX_API_KEY",
-        _ => "OPENAI_API_KEY",
-    }
-}
-
-fn provider_base_url_var_name(provider_id: &str) -> &'static str {
-    match provider_id.trim().to_ascii_lowercase().as_str() {
-        "minimax" => "MINIMAX_BASE_URL",
-        _ => "OPENAI_BASE_URL",
-    }
-}
-
-fn default_base_url_for_provider(provider_id: &str) -> String {
-    match provider_id.trim().to_ascii_lowercase().as_str() {
-        "minimax" => "https://api.minimaxi.com/v1".to_owned(),
-        _ => "https://api.openai.com/v1".to_owned(),
-    }
+    default_registry_from_env()
 }
 
 fn print_help() -> Result<()> {
@@ -566,16 +738,490 @@ fn print_help() -> Result<()> {
     println!(
         "hc-context-cli generate <prompt> [--provider <id>] [--model <name>] [--system <text>] [--scope <scope>] [--owner-kind <kind>] [--owner-id <id>] [--memory-kind <kind>] [--tag <tag>] [--memory-limit <n>] [--request-mode <direct|stream>] [--stream] [--direct] [--typewriter] [--typewriter-delay-ms <n>] [--show-memory] [--json] [--prompt-asset-mode <auto|llm|rule>] [--write-room-id <id> --write-room-layer <layer>]"
     );
-    println!("hc-context-cli tool-plan <rg|cargo-test> <goal...> [--json]");
-    println!("hc-context-cli tool-run rg <pattern> [--goal <text>] [--path <path>] [--json] [--persist-outcome] [--persist-evaluation] [--persist-promotions] [--persist-revisions] [--persist-retirements]");
-    println!("hc-context-cli tool-run cargo-test [<filter>] [--goal <text>] [--package <pkg>] [--json] [--persist-outcome] [--persist-evaluation] [--persist-promotions] [--persist-revisions] [--persist-retirements]");
+    println!("hc-context-cli tool-plan <auto|rg|cargo-test|tool-id|skill-id> <goal...> [--json]");
+    println!(
+        "hc-context-cli tool-run <rg|tool.rg|skill.workspace.search> <pattern> [--goal <text>] [--path <path>] [--json] [--persist-outcome] [--persist-evaluation] [--persist-promotions] [--persist-revisions] [--persist-retirements]"
+    );
+    println!(
+        "hc-context-cli tool-run <cargo-test|tool.cargo-test|skill.rust.test> [<filter>] [--goal <text>] [--package <pkg>] [--json] [--persist-outcome] [--persist-evaluation] [--persist-promotions] [--persist-revisions] [--persist-retirements]"
+    );
+    println!("hc-context-cli tool-export <rg|cargo-test|tool-id|skill-id> [--out <dir>] [--json]");
     println!("hc-context-cli tool-seed <rg|cargo-test>");
+    println!("hc-context-cli skill list [--json]");
+    println!(
+        "hc-context-cli skill create <skill-id> <name> --description <text> --instructions <text> [--tool-id <id>] [--tool-ref <id>] [--kind <cli|builtin|script|workflow|service>] [--command <token>] [--tag <tag>]"
+    );
+    println!("hc-context-cli skill seed <rg|cargo-test>");
+    println!("hc-context-cli skill show <skill-id> [--json]");
     Ok(())
+}
+
+fn handle_skill(args: &[String]) -> Result<()> {
+    match args {
+        [action] if action == "list" => handle_skill_list(&[]),
+        [action, rest @ ..] if action == "list" => handle_skill_list(rest),
+        [action, skill_id, skill_name] if action == "create" => {
+            handle_skill_create(skill_id, skill_name, &[])
+        }
+        [action, skill_id, skill_name, rest @ ..] if action == "create" => {
+            handle_skill_create(skill_id, skill_name, rest)
+        }
+        [action, seed_name] if action == "seed" => handle_skill_seed(seed_name),
+        [action, skill_id] if action == "show" => handle_skill_show(skill_id, &[]),
+        [action, skill_id, rest @ ..] if action == "show" => handle_skill_show(skill_id, rest),
+        _ => bail!(
+            "usage: hc-context-cli skill list [--json] | hc-context-cli skill show <skill-id> [--json] | hc-context-cli skill seed <rg|cargo-test> | hc-context-cli skill create <skill-id> <name> --description <text> --instructions <text> [--tool-id <id>] [--tool-ref <id>] [--kind <cli|builtin|script|workflow|service>] [--command <token>] [--tag <tag>]"
+        ),
+    }
+}
+
+fn handle_skill_list(args: &[String]) -> Result<()> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => bail!("unexpected argument for skill list: {other}"),
+        }
+    }
+
+    let memory_namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+    let repository = SkillRepository::with_namespace(default_workspace_root(), workspace_namespace);
+    let skills = repository.list_profiles()?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&skills).context("failed to serialize skills")?
+        );
+    } else if skills.is_empty() {
+        println!("skill> none");
+    } else {
+        for skill in skills {
+            let command = if skill.default_command.is_empty() {
+                "-".to_owned()
+            } else {
+                skill.default_command.join(" ")
+            };
+            println!(
+                "skill> id={} tool={} kind={:?} command={}",
+                skill.id,
+                skill.resolved_tool_id(),
+                skill.execution_kind,
+                command
+            );
+            if !skill.description.is_empty() {
+                println!("summary> {}", skill.description);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_skill_show(skill_id: &str, args: &[String]) -> Result<()> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => bail!("unexpected argument for skill show: {other}"),
+        }
+    }
+
+    let memory_namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+    let repository = SkillRepository::with_namespace(default_workspace_root(), workspace_namespace);
+    let relative_path = format!("skills/{skill_id}.md");
+    let skill = repository
+        .read_profile(&relative_path)
+        .with_context(|| format!("failed to load skill {skill_id}"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&skill).context("failed to serialize skill")?
+        );
+    } else {
+        println!("skill> {}", skill.id);
+        println!("name> {}", skill.name);
+        println!("tool> {}", skill.resolved_tool_id());
+        println!(
+            "command> {}",
+            if skill.default_command.is_empty() {
+                "-".to_owned()
+            } else {
+                skill.default_command.join(" ")
+            }
+        );
+        if !skill.tool_refs.is_empty() {
+            println!("refs> {}", skill.tool_refs.join(", "));
+        }
+        if !skill.tags.is_empty() {
+            println!("tags> {}", skill.tags.join(", "));
+        }
+        if !skill.description.is_empty() {
+            println!("summary> {}", skill.description);
+        }
+        if !skill.instructions.is_empty() {
+            println!("instructions>");
+            for line in skill.instructions.lines() {
+                println!("{line}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_skill_create(skill_id: &str, skill_name: &str, args: &[String]) -> Result<()> {
+    let mut description: Option<String> = None;
+    let mut instructions: Option<String> = None;
+    let mut tool_id: Option<String> = None;
+    let mut tool_refs = Vec::new();
+    let mut tags = Vec::new();
+    let mut default_command = Vec::new();
+    let mut execution_kind = ToolExecutionKind::Builtin;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--description" => {
+                description = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --description")?,
+                );
+                index += 2;
+            }
+            "--instructions" => {
+                instructions = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --instructions")?,
+                );
+                index += 2;
+            }
+            "--tool-id" => {
+                tool_id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tool-id")?,
+                );
+                index += 2;
+            }
+            "--tool-ref" => {
+                tool_refs.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tool-ref")?,
+                );
+                index += 2;
+            }
+            "--kind" => {
+                execution_kind = parse_tool_execution_kind(
+                    args.get(index + 1).context("missing value for --kind")?,
+                )?;
+                index += 2;
+            }
+            "--command" => {
+                default_command.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --command")?,
+                );
+                index += 2;
+            }
+            "--tag" => {
+                tags.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tag")?,
+                );
+                index += 2;
+            }
+            other => bail!("unexpected argument for skill create: {other}"),
+        }
+    }
+
+    let description = description.context("skill create requires --description <text>")?;
+    let instructions = instructions.context("skill create requires --instructions <text>")?;
+
+    let memory_namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+    let repository = SkillRepository::with_namespace(default_workspace_root(), workspace_namespace);
+
+    let mut skill = SkillProfile::new(skill_id, skill_name)
+        .with_description(description)
+        .with_instructions(instructions)
+        .with_execution_kind(execution_kind);
+
+    if let Some(tool_id) = tool_id {
+        skill = skill.with_tool_id(tool_id);
+    }
+    if !default_command.is_empty() {
+        skill = skill.with_default_command(default_command);
+    }
+    for tool_ref in tool_refs {
+        skill = skill.with_tool_ref(tool_ref);
+    }
+    for tag in tags {
+        skill = skill.with_tag(tag);
+    }
+
+    let path = repository.write_profile(&skill)?;
+    println!("skill> created {}", skill.id);
+    println!("tool> {}", skill.resolved_tool_id());
+    println!("persisted skill: {}", path.display());
+    Ok(())
+}
+
+fn handle_skill_seed(seed_name: &str) -> Result<()> {
+    let memory_namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+    let repository = SkillRepository::with_namespace(default_workspace_root(), workspace_namespace);
+    let skill = match seed_name {
+        "rg" => seed_rg_skill(),
+        "cargo-test" => seed_cargo_test_skill(),
+        other => bail!("unsupported skill seed: {other}"),
+    };
+    let path = repository.write_profile(&skill)?;
+    println!("skill> seeded {} as {}", seed_name, skill.id);
+    println!("persisted skill: {}", path.display());
+    Ok(())
+}
+
+fn parse_tool_execution_kind(value: &str) -> Result<ToolExecutionKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cli" => Ok(ToolExecutionKind::Cli),
+        "builtin" => Ok(ToolExecutionKind::Builtin),
+        "script" => Ok(ToolExecutionKind::Script),
+        "workflow" => Ok(ToolExecutionKind::Workflow),
+        "service" => Ok(ToolExecutionKind::Service),
+        other => bail!(
+            "unsupported tool execution kind: {other}. supported kinds: cli, builtin, script, workflow, service"
+        ),
+    }
+}
+
+fn seed_rg_skill() -> SkillProfile {
+    SkillProfile::new("skill.workspace.search", "Workspace Search")
+        .with_description("Search workspace files with ripgrep before answering codebase questions.")
+        .with_instructions(
+            "Use rg first to locate candidate files or symbols. Prefer --files when the goal is to find the right file, and use -n searches when the goal is to inspect matching content.",
+        )
+        .with_tool_id("tool.rg")
+        .with_execution_kind(ToolExecutionKind::Cli)
+        .with_default_command(["rg", "-n"])
+        .with_tool_ref("tool.rg")
+        .with_tag("search")
+        .with_tag("workspace")
+}
+
+fn seed_cargo_test_skill() -> SkillProfile {
+    SkillProfile::new("skill.rust.test", "Rust Test Runner")
+        .with_description("Run focused Rust test targets to validate changes before broader sweeps.")
+        .with_instructions(
+            "Prefer a narrow cargo test invocation first, using a filter or package when possible. Escalate to a broader test sweep only after the focused check passes or if scope is unclear.",
+        )
+        .with_tool_id("tool.cargo-test")
+        .with_execution_kind(ToolExecutionKind::Cli)
+        .with_default_command(["cargo", "test"])
+        .with_tool_ref("tool.cargo-test")
+        .with_tag("rust")
+        .with_tag("testing")
+}
+
+fn load_cli_tool_catalog() -> Result<ToolCatalog> {
+    let memory_namespace = runtime_memory_namespace();
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+    let skill_repository =
+        SkillRepository::with_namespace(default_workspace_root(), workspace_namespace.clone());
+    let tool_repository =
+        ToolRepository::with_namespace(default_workspace_root(), workspace_namespace);
+    let mut catalog = default_tool_catalog();
+    if let Ok(custom_catalog) = tool_repository.load_catalog() {
+        catalog.register_provider(&custom_catalog);
+    }
+    if let Ok(skill_catalog) = skill_repository.load_catalog() {
+        catalog.register_provider(&skill_catalog);
+    }
+    Ok(catalog)
+}
+
+struct ResolvedToolTarget {
+    tool: hc_context::ToolSpec,
+    delegated_tool: Option<hc_context::ToolSpec>,
+    skill: Option<SkillProfile>,
+}
+
+fn resolve_tool_selector(selector: &str) -> Result<ResolvedToolTarget> {
+    let normalized = match selector {
+        "rg" => "tool.rg",
+        "cargo-test" => "tool.cargo-test",
+        other => other,
+    };
+
+    if normalized.starts_with("skill.") {
+        let memory_namespace = runtime_memory_namespace();
+        let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+        let repository =
+            SkillRepository::with_namespace(default_workspace_root(), workspace_namespace);
+        let relative_path = format!("skills/{normalized}.md");
+        let skill = repository
+            .read_profile(&relative_path)
+            .with_context(|| format!("failed to load skill {normalized}"))?;
+        let delegated_tool = match skill.delegated_tool_id() {
+            Some(tool_id) => load_cli_tool_catalog()?
+                .get(tool_id)
+                .cloned()
+                .with_context(|| format!("skill {normalized} references unknown tool {tool_id}"))?,
+            None => skill.to_tool_spec(),
+        };
+        return Ok(ResolvedToolTarget {
+            tool: skill.to_tool_spec(),
+            delegated_tool: Some(delegated_tool),
+            skill: Some(skill),
+        });
+    }
+
+    let catalog = load_cli_tool_catalog()?;
+    if let Some(tool) = catalog.get(normalized) {
+        if tool.composition == ToolComposition::Composite {
+            let memory_namespace = runtime_memory_namespace();
+            let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
+            let repository =
+                SkillRepository::with_namespace(default_workspace_root(), workspace_namespace);
+            if let Some(skill) = repository
+                .list_profiles()?
+                .into_iter()
+                .find(|skill| skill.resolved_tool_id() == tool.id)
+            {
+                let delegated_tool = match skill.delegated_tool_id() {
+                    Some(tool_id) => load_cli_tool_catalog()?
+                        .get(tool_id)
+                        .cloned()
+                        .with_context(|| {
+                            format!("skill {} references unknown tool {tool_id}", skill.id)
+                        })?,
+                    None => skill.to_tool_spec(),
+                };
+                return Ok(ResolvedToolTarget {
+                    tool: tool.clone(),
+                    delegated_tool: Some(delegated_tool),
+                    skill: Some(skill),
+                });
+            }
+        }
+        return Ok(ResolvedToolTarget {
+            tool: tool.clone(),
+            delegated_tool: None,
+            skill: None,
+        });
+    }
+
+    bail!("unsupported tool or skill selector: {selector}")
+}
+
+fn auto_select_tool(
+    goal: &str,
+) -> Result<(hc_context::ToolSpec, Vec<(hc_context::ToolSpec, i32)>)> {
+    let catalog = load_cli_tool_catalog()?;
+    let mut scored = catalog
+        .list()
+        .into_iter()
+        .cloned()
+        .map(|tool| {
+            let score = score_tool_for_goal(&tool, goal);
+            (tool, score)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    let selected = scored
+        .first()
+        .cloned()
+        .context("no tools or skills are registered")?;
+    Ok((selected.0, scored))
+}
+
+fn score_tool_for_goal(tool: &hc_context::ToolSpec, goal: &str) -> i32 {
+    let lowered_goal = goal.to_ascii_lowercase();
+    let mut score = 0i32;
+
+    for token in lowered_goal.split(|character: char| !character.is_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if tool.id.to_ascii_lowercase().contains(token) {
+            score += 5;
+        }
+        if tool.name.to_ascii_lowercase().contains(token) {
+            score += 6;
+        }
+        if tool.description.to_ascii_lowercase().contains(token) {
+            score += 3;
+        }
+        if tool
+            .tags
+            .iter()
+            .any(|tag| tag.to_ascii_lowercase().contains(token))
+        {
+            score += 8;
+        }
+    }
+
+    if goal_contains_any(
+        &lowered_goal,
+        &["search", "find", "grep", "file", "path", "symbol"],
+    ) {
+        if tool.id == "tool.rg" {
+            score += 20;
+        }
+        if tool
+            .tags
+            .iter()
+            .any(|tag| tag == "search" || tag == "workspace")
+        {
+            score += 10;
+        }
+    }
+
+    if goal_contains_any(
+        &lowered_goal,
+        &["test", "testing", "cargo", "assert", "spec"],
+    ) {
+        if tool.id == "tool.cargo-test" {
+            score += 20;
+        }
+        if tool
+            .tags
+            .iter()
+            .any(|tag| tag == "testing" || tag == "rust")
+        {
+            score += 10;
+        }
+    }
+
+    if tool.tags.iter().any(|tag| tag == "skill") {
+        score += 1;
+    }
+
+    score
+}
+
+fn goal_contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn handle_tool_plan(_registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: hc-context-cli tool-plan <rg|cargo-test> <goal...> [--json]");
+        bail!(
+            "usage: hc-context-cli tool-plan <auto|rg|cargo-test|tool-id|skill-id> <goal...> [--json]"
+        );
     }
 
     let tool_name = args.first().cloned().unwrap_or_default();
@@ -594,10 +1240,11 @@ fn handle_tool_plan(_registry: &ProviderRegistry, args: &[String]) -> Result<()>
         bail!("missing goal for tool-plan");
     }
 
-    let tool = match tool_name.as_str() {
-        "rg" => seed_tool_rg(),
-        "cargo-test" => seed_tool_cargo_test(),
-        other => bail!("unsupported tool for tool-plan: {other}"),
+    let goal = goal_parts.join(" ");
+    let (tool, candidates) = if tool_name == "auto" {
+        auto_select_tool(&goal)?
+    } else {
+        (resolve_tool_selector(&tool_name)?.tool, Vec::new())
     };
 
     let memory_namespace = runtime_memory_namespace();
@@ -605,16 +1252,61 @@ fn handle_tool_plan(_registry: &ProviderRegistry, args: &[String]) -> Result<()>
         default_workspace_root(),
         workspace_namespace_from_memory_namespace(&memory_namespace),
     );
-    let goal = goal_parts.join(" ");
-    let assets = load_tool_assets(&retriever, memory_namespace, &tool)?;
-    let plan = build_tool_execution_plan_from_assets(&DefaultToolExecutionBinder, goal, &tool, &assets)?;
+    let resolved = if tool_name == "auto" {
+        ResolvedToolTarget {
+            tool: tool.clone(),
+            delegated_tool: None,
+            skill: None,
+        }
+    } else {
+        resolve_tool_selector(&tool_name)?
+    };
+    let planning_tool = resolved.delegated_tool.as_ref().unwrap_or(&resolved.tool);
+    let assets = load_tool_assets(&retriever, memory_namespace, planning_tool)?;
+    let mut plan = build_tool_execution_plan_from_assets(
+        &DefaultToolExecutionBinder,
+        goal,
+        planning_tool,
+        &assets,
+    )?;
+    plan.tool_id = resolved.tool.id.clone();
+    if let Some(skill) = &resolved.skill
+        && !skill.instructions.trim().is_empty()
+    {
+        plan.guidance.insert(0, skill.instructions.clone());
+    }
 
     if json {
+        let payload = if tool_name == "auto" {
+            serde_json::json!({
+                "selected_tool": tool,
+                "plan": plan,
+                "candidates": candidates.into_iter().map(|(tool, score)| {
+                    serde_json::json!({
+                        "tool_id": tool.id,
+                        "name": tool.name,
+                        "score": score,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        } else {
+            serde_json::json!(plan)
+        };
         println!(
             "{}",
-            serde_json::to_string_pretty(&plan).context("failed to serialize tool plan")?
+            serde_json::to_string_pretty(&payload).context("failed to serialize tool plan")?
         );
     } else {
+        if tool_name == "auto" {
+            println!("selector> auto");
+            println!("selected> {}", tool.id);
+            for (candidate, score) in candidates.iter().take(5) {
+                println!(
+                    "candidate> {} score={} composition={:?}",
+                    candidate.id, score, candidate.composition
+                );
+            }
+        }
         println!("tool> {}", plan.tool_id);
         println!("command> {}", plan.suggested_command.join(" "));
         for line in &plan.guidance {
@@ -632,7 +1324,9 @@ fn handle_tool_plan(_registry: &ProviderRegistry, args: &[String]) -> Result<()>
 }
 
 fn handle_tool_seed(args: &[String]) -> Result<()> {
-    let tool_name = args.first().context("usage: hc-context-cli tool-seed <rg|cargo-test>")?;
+    let tool_name = args
+        .first()
+        .context("usage: hc-context-cli tool-seed <rg|cargo-test>")?;
     match tool_name.as_str() {
         "rg" => seed_rg_tool_assets(),
         "cargo-test" => seed_cargo_test_tool_assets(),
@@ -640,9 +1334,110 @@ fn handle_tool_seed(args: &[String]) -> Result<()> {
     }
 }
 
+fn handle_tool_export(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!(
+            "usage: hc-context-cli tool-export <rg|cargo-test|tool-id|skill-id> [--out <dir>] [--json]"
+        );
+    }
+
+    let selector = args.first().cloned().unwrap_or_default();
+    let mut output_dir: Option<PathBuf> = None;
+    let mut json = false;
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                output_dir = Some(PathBuf::from(
+                    args.get(index + 1).context("missing value for --out")?,
+                ));
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected argument for tool-export: {other}"),
+        }
+    }
+
+    let resolved = resolve_tool_selector(&selector)?;
+    let export_tool = resolved
+        .delegated_tool
+        .as_ref()
+        .unwrap_or(&resolved.tool)
+        .clone();
+    let export_slug = export_tool.id.trim_start_matches("tool.");
+    let output_dir = output_dir.unwrap_or_else(|| {
+        default_workspace_root()
+            .join("exports")
+            .join("capabilities")
+            .join(export_slug)
+    });
+    let memory_namespace = runtime_memory_namespace();
+    let retriever = WorkspaceMemoryRetriever::new(
+        default_workspace_root(),
+        workspace_namespace_from_memory_namespace(&memory_namespace),
+    );
+    let assets = load_tool_assets(&retriever, memory_namespace, &export_tool)?;
+    let package = export_tool_capability_package(&output_dir, &export_tool, &assets)?;
+
+    let skill_path = if let Some(skill) = &resolved.skill {
+        let path = output_dir.join("portable").join("skill.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(skill).context("failed to serialize skill")?,
+        )?;
+        Some(path)
+    } else {
+        None
+    };
+
+    if json {
+        let payload = serde_json::json!({
+            "selector": selector,
+            "exported_tool_id": export_tool.id,
+            "package_dir": output_dir.display().to_string(),
+            "asset_count": package.manifest.assets.len(),
+            "portable_manifest_path": output_dir.join("portable").join("manifest.json").display().to_string(),
+            "runnable_entrypoint": output_dir.join("runnable").join("run.sh").display().to_string(),
+            "skill_path": skill_path.as_ref().map(|path| path.display().to_string()),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).context("failed to serialize tool export")?
+        );
+    } else {
+        println!("export> {}", output_dir.display());
+        println!("tool> {}", package.manifest.tool.id);
+        println!("assets> {}", package.manifest.assets.len());
+        println!(
+            "portable> {}",
+            output_dir.join("portable").join("manifest.json").display()
+        );
+        println!(
+            "runnable> {}",
+            output_dir.join("runnable").join("run.sh").display()
+        );
+        println!("readme> {}", output_dir.join("README.md").display());
+        if let Some(path) = skill_path {
+            println!("skill> {}", path.display());
+        }
+        for asset in &package.manifest.assets {
+            println!(
+                "asset> {} {}",
+                asset.role,
+                output_dir.join("portable").join(&asset.file).display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_tool_run(args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: hc-context-cli tool-run <rg|cargo-test> ...");
+        bail!("usage: hc-context-cli tool-run <rg|cargo-test|tool-id|skill-id> ...");
     }
 
     let tool_name = args.first().cloned().unwrap_or_default();
@@ -718,12 +1513,13 @@ fn handle_tool_run(args: &[String]) -> Result<()> {
         }
     }
 
-    let tool = match tool_name.as_str() {
-        "rg" => seed_tool_rg(),
-        "cargo-test" => seed_tool_cargo_test(),
-        other => bail!("unsupported tool for tool-run: {other}"),
-    };
-    let pattern = if tool_name == "rg" {
+    let resolved = resolve_tool_selector(&tool_name)?;
+    let tool = resolved.tool.clone();
+    let delegated_tool = resolved
+        .delegated_tool
+        .clone()
+        .unwrap_or_else(|| tool.clone());
+    let pattern = if delegated_tool.id == "tool.rg" {
         Some(pattern.context("missing search pattern for tool-run rg")?)
     } else {
         pattern
@@ -739,23 +1535,49 @@ fn handle_tool_run(args: &[String]) -> Result<()> {
         default_workspace_root(),
         workspace_namespace_from_memory_namespace(&memory_namespace),
     );
-    let assets = load_tool_assets(&retriever, memory_namespace.clone(), &tool)?;
-    let plan =
-        build_tool_execution_plan_from_assets(&DefaultToolExecutionBinder, goal.clone(), &tool, &assets)?;
-    let outcome = match tool_name.as_str() {
-        "rg" => run_rg_with_plan(
+    let assets = load_tool_assets(&retriever, memory_namespace.clone(), &delegated_tool)?;
+    let delegated_plan = build_tool_execution_plan_from_assets(
+        &DefaultToolExecutionBinder,
+        goal.clone(),
+        &delegated_tool,
+        &assets,
+    )?;
+    let mut plan = delegated_plan.clone();
+    plan.tool_id = tool.id.clone();
+    if let Some(skill) = &resolved.skill
+        && !skill.instructions.trim().is_empty()
+    {
+        plan.guidance.insert(0, skill.instructions.clone());
+    }
+    let atomic_outcome = match delegated_tool.id.as_str() {
+        "tool.rg" => run_rg_with_plan(
             &goal,
             pattern.as_deref().expect("rg pattern should exist"),
             search_path.as_deref(),
-            &plan,
+            &delegated_plan,
         )?,
-        "cargo-test" => run_cargo_test_with_plan(
+        "tool.cargo-test" => run_cargo_test_with_plan(
             &goal,
             pattern.as_deref(),
             package.as_deref(),
-            &plan,
+            &delegated_plan,
         )?,
-        _ => unreachable!("tool validated above"),
+        _ => run_generic_tool_with_plan(
+            &goal,
+            pattern.as_deref(),
+            search_path.as_deref(),
+            &delegated_plan,
+        )?,
+    };
+    let delegated_outcome = if delegated_tool.id != tool.id {
+        Some(atomic_outcome.clone().with_parent_tool_id(tool.id.clone()))
+    } else {
+        None
+    };
+    let outcome = if delegated_tool.id != tool.id {
+        atomic_outcome.wrapped_by(tool.id.clone())
+    } else {
+        atomic_outcome
     };
     let evaluation = evaluate_tool_execution(
         &tool,
@@ -774,6 +1596,21 @@ fn handle_tool_run(args: &[String]) -> Result<()> {
             workspace_namespace_from_memory_namespace(&memory_namespace),
             &request,
         )?)
+    } else {
+        None
+    };
+    let persisted_delegated_path = if persist_outcome {
+        if let Some(delegated_outcome) = &delegated_outcome {
+            let request =
+                room_memory_write_request_from_tool_outcome(&delegated_tool, delegated_outcome);
+            Some(persist_room_memory(
+                default_workspace_root(),
+                workspace_namespace_from_memory_namespace(&memory_namespace),
+                &request,
+            )?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -837,8 +1674,12 @@ fn handle_tool_run(args: &[String]) -> Result<()> {
         let payload = serde_json::json!({
             "plan": plan,
             "outcome": outcome,
+            "delegated_outcome": delegated_outcome,
             "evaluation": evaluation,
             "persisted_path": persisted_path.as_ref().map(|path| path.display().to_string()),
+            "persisted_delegated_path": persisted_delegated_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
             "persisted_evaluation_paths": persisted_evaluation_paths
                 .iter()
                 .map(|path| path.display().to_string())
@@ -862,6 +1703,12 @@ fn handle_tool_run(args: &[String]) -> Result<()> {
         );
     } else {
         println!("tool> {}", plan.tool_id);
+        if let Some(parent_tool_id) = &outcome.parent_tool_id {
+            println!("parent> {}", parent_tool_id);
+        }
+        if !outcome.invoked_tool_ids.is_empty() {
+            println!("invoked> {}", outcome.invoked_tool_ids.join(", "));
+        }
         println!("command> {}", outcome.command.join(" "));
         println!("success> {}", outcome.success);
         println!("summary> {}", outcome.summary);
@@ -881,16 +1728,16 @@ fn handle_tool_run(args: &[String]) -> Result<()> {
             println!("signal> {}", signal_label(signal));
         }
         if !evaluation.promote_candidate_ids.is_empty() {
-            println!(
-                "promote> {}",
-                evaluation.promote_candidate_ids.join(", ")
-            );
+            println!("promote> {}", evaluation.promote_candidate_ids.join(", "));
         }
         if !evaluation.retire_candidate_ids.is_empty() {
             println!("retire> {}", evaluation.retire_candidate_ids.join(", "));
         }
         if let Some(path) = persisted_path {
             println!("persisted tool outcome: {}", path.display());
+        }
+        if let Some(path) = persisted_delegated_path {
+            println!("persisted delegated outcome: {}", path.display());
         }
         for path in &persisted_evaluation_paths {
             println!("persisted evaluation: {}", path.display());
@@ -1055,11 +1902,7 @@ fn run_rg_with_plan(
 ) -> Result<ToolExecutionOutcome> {
     let scope = search_path.unwrap_or(".");
     let mut command = plan.suggested_command.clone();
-    let output = if plan
-        .suggested_command
-        .iter()
-        .any(|arg| arg == "--files")
-    {
+    let output = if plan.suggested_command.iter().any(|arg| arg == "--files") {
         if scope != "." {
             command.push(scope.to_owned());
         }
@@ -1076,11 +1919,16 @@ fn run_rg_with_plan(
         let success = output.status.success() && !matched.is_empty();
         ToolExecutionOutcome {
             tool_id: plan.tool_id.clone(),
+            parent_tool_id: None,
+            invoked_tool_ids: Vec::new(),
             goal: goal.to_owned(),
             command,
             success,
             summary: if success {
-                format!("Filtered {} matching file candidates for pattern `{pattern}`.", matched.len())
+                format!(
+                    "Filtered {} matching file candidates for pattern `{pattern}`.",
+                    matched.len()
+                )
             } else {
                 format!("No file candidates matched pattern `{pattern}`.")
             },
@@ -1103,11 +1951,16 @@ fn run_rg_with_plan(
         }
         ToolExecutionOutcome {
             tool_id: plan.tool_id.clone(),
+            parent_tool_id: None,
+            invoked_tool_ids: Vec::new(),
             goal: goal.to_owned(),
             command,
             success,
             summary: if success {
-                format!("Found {} rg match lines for pattern `{pattern}`.", observations.len())
+                format!(
+                    "Found {} rg match lines for pattern `{pattern}`.",
+                    observations.len()
+                )
             } else {
                 format!("No rg matches found for pattern `{pattern}`.")
             },
@@ -1164,10 +2017,62 @@ fn run_cargo_test_with_plan(
 
     Ok(ToolExecutionOutcome {
         tool_id: plan.tool_id.clone(),
+        parent_tool_id: None,
+        invoked_tool_ids: Vec::new(),
         goal: goal.to_owned(),
         command,
         success,
         summary,
+        observations,
+    })
+}
+
+fn run_generic_tool_with_plan(
+    goal: &str,
+    argument: Option<&str>,
+    working_dir: Option<&str>,
+    plan: &hc_context::ToolExecutionPlan,
+) -> Result<ToolExecutionOutcome> {
+    let mut command = plan.suggested_command.clone();
+    if command.is_empty() {
+        bail!("tool {} has no command to execute", plan.tool_id);
+    }
+    if let Some(argument) = argument
+        && !argument.trim().is_empty()
+    {
+        command.push(argument.to_owned());
+    }
+
+    let mut process = Command::new(&command[0]);
+    process.args(&command[1..]);
+    if let Some(working_dir) = working_dir {
+        process.current_dir(working_dir);
+    }
+    let output = process
+        .output()
+        .with_context(|| format!("failed to run {}", command.join(" ")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let observations = stdout
+        .lines()
+        .map(|line| format!("stdout: {line}"))
+        .chain(stderr.lines().map(|line| format!("stderr: {line}")))
+        .take(12)
+        .collect::<Vec<_>>();
+    let success = output.status.success();
+
+    Ok(ToolExecutionOutcome {
+        tool_id: plan.tool_id.clone(),
+        parent_tool_id: None,
+        invoked_tool_ids: Vec::new(),
+        goal: goal.to_owned(),
+        command,
+        success,
+        summary: if success {
+            format!("tool command succeeded for goal `{goal}`.")
+        } else {
+            format!("tool command failed for goal `{goal}`.")
+        },
         observations,
     })
 }
@@ -1177,7 +2082,10 @@ fn default_tool_promotion_rule(tool: &hc_context::ToolSpec) -> PromotionRule {
         from_stage: hc_memory::MemoryAssetStage::Generalized,
         to_stage: hc_memory::MemoryAssetStage::Compiled,
         min_confidence_milli: 800,
-        required_tags: vec!["tool".to_owned(), tool.id.trim_start_matches("tool.").to_owned()],
+        required_tags: vec![
+            "tool".to_owned(),
+            tool.id.trim_start_matches("tool.").to_owned(),
+        ],
         required_consumers: vec![hc_context::AssetConsumer::Executor],
     }
 }
@@ -1196,6 +2104,8 @@ fn signal_label(signal: &EvaluationSignal) -> &'static str {
 }
 
 fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
+    let chat_flow = new_trace_id("flow.chat");
+    let _chat_flow_guard = enter_flow_context(chat_flow.clone());
     let mut provider = default_provider();
     let mut model = default_model();
     let mut system_message = env::var("HC_LLM_SYSTEM").ok();
@@ -1428,20 +2338,51 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         bail!("--owner-kind and --owner-id must be used together");
     }
 
+    emit_cli_trace_with_fields(
+        "chat",
+        "start",
+        Some("started"),
+        "starting interactive chat session",
+        BTreeMap::from([
+            ("flow_id".to_owned(), chat_flow.clone()),
+            ("provider".to_owned(), provider.clone()),
+            ("model".to_owned(), model.clone()),
+            (
+                "request_mode".to_owned(),
+                request_mode_label(request_mode).to_owned(),
+            ),
+            (
+                "organizer_mode".to_owned(),
+                strategy_mode_label(organizer_mode).to_owned(),
+            ),
+            (
+                "prompt_asset_mode".to_owned(),
+                strategy_mode_label(prompt_asset_mode).to_owned(),
+            ),
+            (
+                "promotion_trigger".to_owned(),
+                promotion_trigger_mode_label(promotion_trigger).to_owned(),
+            ),
+        ]),
+    );
+
     println!("hc-context chat");
-    println!(
-        "provider={provider} model={model} request_mode={} memory_scope={} organizer={} prompt_assets={} preference_summary={} promotion_trigger={} promotion_window_size={} literary_memory={} literary_trigger={} literary_window_size={} chat_room_window_size={}",
-        request_mode_label(request_mode),
-        memory_scope_label(memory_query.memory_query.scope.as_ref()),
-        strategy_mode_label(organizer_mode),
-        strategy_mode_label(prompt_asset_mode),
-        strategy_mode_label(preference_summary_mode),
-        promotion_trigger_mode_label(promotion_trigger),
-        promotion_window_size,
-        if persist_literary_memory { "on" } else { "off" },
-        promotion_trigger_mode_label(literary_trigger),
-        literary_window_size,
-        chat_room_window_size,
+    print_organize_status(
+        "ready",
+        format!(
+            "provider={provider} model={model} request_mode={} memory_scope={} organizer={} prompt_assets={} preference_summary={} promotion_trigger={} promotion_window_size={} literary_memory={} literary_trigger={} literary_window_size={} chat_room_window_size={}",
+            request_mode_label(request_mode),
+            memory_scope_label(memory_query.memory_query.scope.as_ref()),
+            strategy_mode_label(organizer_mode),
+            strategy_mode_label(prompt_asset_mode),
+            strategy_mode_label(preference_summary_mode),
+            promotion_trigger_mode_label(promotion_trigger),
+            promotion_window_size,
+            if persist_literary_memory { "on" } else { "off" },
+            promotion_trigger_mode_label(literary_trigger),
+            literary_window_size,
+            chat_room_window_size,
+        ),
     );
     println!("Type /help for commands, /quit to exit.");
 
@@ -1451,6 +2392,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         WorkspaceMemoryRetriever::new(default_workspace_root(), workspace_namespace.clone());
     let composer = DefaultContextComposer;
     let organizer_model = ModelRef::new(provider.clone(), model.clone());
+    let llm_priority_gate = Arc::new(LlmPriorityGate::default());
     let organizer = build_memory_organizer(
         registry,
         &organizer_model,
@@ -1472,10 +2414,10 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             chat_room_id.clone(),
         )?;
         ensure_chat_room(default_workspace_root(), &workspace_namespace, &room)?;
-        println!("chat_memory=on room={}", room.id);
+        print_organize_status("capture", format!("status=ready room={}", room.id));
         Some(room)
     } else {
-        println!("chat_memory=off");
+        print_organize_status("capture", "status=disabled");
         None
     };
     let mut turn_index = 0usize;
@@ -1494,6 +2436,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 model.clone(),
                 organizer_mode,
                 preference_summary_mode,
+                llm_priority_gate.clone(),
             ))
         } else {
             None
@@ -1503,9 +2446,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
     };
 
     loop {
-        print!("you> ");
-        io::stdout().flush().context("failed to flush stdout")?;
-        let input = prompt_raw("")?;
+        let input = prompt_raw("you> ")?;
         let trimmed = input.trim();
         if trimmed.is_empty() {
             continue;
@@ -1564,9 +2505,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
             "/promote" => {
                 if promotion_trigger == PromotionTriggerMode::Background {
-                    println!(
-                        "promotion> background worker is enabled; queued work drains asynchronously"
-                    );
+                    print_organize_status("promote", "status=background");
                     continue;
                 }
                 let flushed = flush_global_promotion_queue(
@@ -1580,14 +2519,12 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     &organizer_model,
                     preference_summary_mode,
                 )?;
-                println!("promotion> flushed {} pending item(s)", flushed);
+                print_organize_status("promote", format!("status=drained items={flushed}"));
                 continue;
             }
             "/wenyan" => {
                 if literary_trigger == PromotionTriggerMode::Background {
-                    println!(
-                        "literary> background worker is enabled; queued work drains asynchronously"
-                    );
+                    print_organize_status("literary", "status=background");
                     continue;
                 }
                 let flushed = flush_literary_memory_queue(
@@ -1598,7 +2535,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     &workspace_namespace,
                     chat_room.as_ref(),
                 )?;
-                println!("literary> flushed {} pending item(s)", flushed);
+                print_organize_status("literary", format!("status=drained items={flushed}"));
                 continue;
             }
             _ if trimmed.starts_with("/system ") => {
@@ -1619,6 +2556,27 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         }
 
         turn_index += 1;
+        let turn_flow = format!("{chat_flow}.turn.{turn_index}");
+        let _turn_flow_guard = enter_flow_context(turn_flow.clone());
+        emit_cli_trace_with_fields(
+            "chat_turn",
+            "receive_input",
+            Some("started"),
+            "processing chat turn",
+            BTreeMap::from([
+                ("turn_index".to_owned(), turn_index.to_string()),
+                (
+                    "input_chars".to_owned(),
+                    trimmed.chars().count().to_string(),
+                ),
+                (
+                    "lightweight_candidate".to_owned(),
+                    should_use_lightweight_chat_path(trimmed, turn_index).to_string(),
+                ),
+            ]),
+        );
+        let should_enqueue_background_promotion =
+            chat_room.is_some() && promotion_trigger == PromotionTriggerMode::Background;
         if let Some(room) = &chat_room {
             persist_chat_turn_user_message(
                 default_workspace_root(),
@@ -1627,17 +2585,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 turn_index,
                 trimmed,
             )?;
-            if promotion_trigger == PromotionTriggerMode::Background {
-                if let Some(worker) = &background_worker {
-                    enqueue_background_task(
-                        &worker.sender,
-                        BackgroundMemoryTask::GlobalPromotion {
-                            content: trimmed.to_owned(),
-                        },
-                        "promotion",
-                    );
-                }
-            } else {
+            if !should_enqueue_background_promotion {
                 pending_global_promotions.push_back(trimmed.to_owned());
                 if promotion_trigger == PromotionTriggerMode::Immediate {
                     flush_global_promotion_queue(
@@ -1651,6 +2599,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                         &organizer_model,
                         preference_summary_mode,
                     )?;
+                    print_organize_status("promote", "status=drained trigger=immediate");
                 }
             }
         }
@@ -1674,6 +2623,19 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             chat_room.as_ref(),
         )? {
             ContextRoomResolution::Created(room) => {
+                emit_cli_trace_with_fields(
+                    "context_room",
+                    "resolve",
+                    Some("created"),
+                    "created context room for input",
+                    BTreeMap::from([
+                        ("room_id".to_owned(), room.id.clone()),
+                        (
+                            "layer".to_owned(),
+                            format!("{:?}", room.layer).to_ascii_lowercase(),
+                        ),
+                    ]),
+                );
                 println!(
                     "room> created {} room: {}",
                     format!("{:?}", room.layer).to_ascii_lowercase(),
@@ -1681,39 +2643,95 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                 );
             }
             ContextRoomResolution::Reused(room) if show_memory => {
+                emit_cli_trace_with_fields(
+                    "context_room",
+                    "resolve",
+                    Some("reused"),
+                    "reused context room for input",
+                    BTreeMap::from([
+                        ("room_id".to_owned(), room.id.clone()),
+                        (
+                            "layer".to_owned(),
+                            format!("{:?}", room.layer).to_ascii_lowercase(),
+                        ),
+                    ]),
+                );
                 println!(
                     "room> reused {} room: {}",
                     format!("{:?}", room.layer).to_ascii_lowercase(),
                     room.id
                 );
             }
-            ContextRoomResolution::Reused(_) | ContextRoomResolution::None => {}
+            ContextRoomResolution::Reused(room) => {
+                emit_cli_trace_with_fields(
+                    "context_room",
+                    "resolve",
+                    Some("reused"),
+                    "reused context room for input",
+                    BTreeMap::from([("room_id".to_owned(), room.id.clone())]),
+                );
+            }
+            ContextRoomResolution::None => {
+                emit_cli_trace(
+                    "context_room",
+                    "resolve",
+                    Some("skipped"),
+                    "no context room materialized for input",
+                );
+            }
         }
         let generation = GenerateRequest::new(
             ModelRef::new(provider.clone(), model.clone()),
             history.clone(),
         );
+        let context_namespace = workspace_namespace_from_memory_namespace(
+            &effective_memory_query
+                .memory_query
+                .namespace
+                .clone()
+                .unwrap_or_else(runtime_memory_namespace),
+        );
+        let system_prompt = match system_message.clone() {
+            Some(system_message) => system_message,
+            None => load_context_memory_system_prompt(&context_namespace)?,
+        };
         let request = ContextRequest::new(generation)
             .with_memory_query(effective_memory_query.clone())
-            .with_system_prompt(system_message.clone().unwrap_or_else(|| {
-                "Use recalled memory when it is relevant, but do not invent facts from memory that are not present.".to_owned()
-            }))
+            .with_system_prompt(system_prompt)
             .with_prompt_policy(PromptPolicy::new(
                 "Memory Usage Policy",
-                "Treat recalled memory as supporting context. Prefer direct user intent when they conflict, and do not invent missing facts.",
+                load_context_memory_usage_policy_prompt(&context_namespace)?,
             ));
+        let use_lightweight_chat_path = should_use_lightweight_chat_path(trimmed, turn_index);
 
+        let _permit = llm_priority_gate.acquire_foreground();
+        if should_enqueue_background_promotion {
+            if let Some(worker) = &background_worker {
+                enqueue_background_task(
+                    &worker.sender,
+                    BackgroundMemoryTask::GlobalPromotion {
+                        content: trimmed.to_owned(),
+                    },
+                    "promotion",
+                );
+                print_organize_status("promote", "status=queued mode=background");
+            }
+        }
         print!("assistant> ");
         io::stdout().flush().context("failed to flush stdout")?;
         let response_result = match request_mode {
             RequestMode::Direct => {
-                let response = generate_with_context_using_synthesizer(
-                    registry,
-                    &retriever,
-                    &composer,
-                    prompt_asset_synthesizer.as_ref(),
-                    &request,
-                );
+                let response = if use_lightweight_chat_path {
+                    generate_lightweight_chat_response(registry, &request)
+                } else {
+                    generate_with_context_using_synthesizer(
+                        registry,
+                        &retriever,
+                        &composer,
+                        prompt_asset_synthesizer.as_ref(),
+                        &request,
+                    )
+                };
                 if let Ok(response) = &response {
                     render_output(&response.response.message.content, output_style)?;
                 }
@@ -1725,19 +2743,30 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                         .map_err(|error| hc_llm::LlmError::ProviderFailure(error.to_string()))?;
                     Ok(())
                 };
-                generate_with_context_stream_using_synthesizer(
-                    registry,
-                    &retriever,
-                    &composer,
-                    prompt_asset_synthesizer.as_ref(),
-                    &request,
-                    &mut callback,
-                )
+                if use_lightweight_chat_path {
+                    generate_lightweight_chat_response_stream(registry, &request, &mut callback)
+                } else {
+                    generate_with_context_stream_using_synthesizer(
+                        registry,
+                        &retriever,
+                        &composer,
+                        prompt_asset_synthesizer.as_ref(),
+                        &request,
+                        &mut callback,
+                    )
+                }
             }
         };
         let response = match response_result {
             Ok(response) => response,
             Err(error) => {
+                emit_cli_trace_with_fields(
+                    "chat_turn",
+                    "generate_response",
+                    Some("failed"),
+                    concise_error_message(&error),
+                    BTreeMap::from([("turn_index".to_owned(), turn_index.to_string())]),
+                );
                 println!();
                 history.pop();
                 if is_retryable_provider_error(&error) {
@@ -1752,6 +2781,33 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             }
         };
         println!();
+        emit_cli_trace_with_fields(
+            "chat_turn",
+            "generate_response",
+            Some("completed"),
+            "generated assistant response",
+            BTreeMap::from([
+                ("turn_index".to_owned(), turn_index.to_string()),
+                (
+                    "response_chars".to_owned(),
+                    response
+                        .response
+                        .message
+                        .content
+                        .chars()
+                        .count()
+                        .to_string(),
+                ),
+                (
+                    "recalled_count".to_owned(),
+                    response.recalled_memories.len().to_string(),
+                ),
+                (
+                    "lightweight_path".to_owned(),
+                    use_lightweight_chat_path.to_string(),
+                ),
+            ]),
+        );
         history.push(response.response.message.clone());
 
         let persisted_prompt_assets = persist_synthesized_prompt_assets(
@@ -1759,10 +2815,26 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
             workspace_namespace.clone(),
             &response,
         )?;
+        emit_cli_trace_with_fields(
+            "prompt_assets",
+            "persist",
+            Some("completed"),
+            "persisted synthesized prompt assets",
+            BTreeMap::from([
+                ("turn_index".to_owned(), turn_index.to_string()),
+                (
+                    "asset_count".to_owned(),
+                    persisted_prompt_assets.len().to_string(),
+                ),
+            ]),
+        );
         if !persisted_prompt_assets.is_empty() {
-            println!(
-                "prompt> persisted {} compiled prompt asset(s)",
-                persisted_prompt_assets.len()
+            print_organize_status(
+                "prompt",
+                format!(
+                    "status=saved compiled_assets={}",
+                    persisted_prompt_assets.len()
+                ),
             );
         }
 
@@ -1785,6 +2857,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                             },
                             "literary",
                         );
+                        print_organize_status("literary", "status=queued mode=background");
                     }
                 } else {
                     pending_literary_memory
@@ -1799,7 +2872,10 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                             Some(room),
                         )?;
                         if flushed > 0 {
-                            println!("literary> flushed {} pending item(s)", flushed);
+                            print_organize_status(
+                                "literary",
+                                format!("status=drained items={flushed} trigger=immediate"),
+                            );
                         }
                     }
                 }
@@ -1823,7 +2899,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     preference_summary_mode,
                 )?;
                 if flushed > 0 {
-                    println!("promotion> flushed {} pending item(s)", flushed);
+                    print_organize_status("promote", format!("status=drained items={flushed}"));
                 }
             }
             if persist_literary_memory
@@ -1842,7 +2918,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     Some(room),
                 )?;
                 if flushed > 0 {
-                    println!("literary> flushed {} pending item(s)", flushed);
+                    print_organize_status("literary", format!("status=drained items={flushed}"));
                 }
             }
         }
@@ -1876,16 +2952,16 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     room,
                     turn_index,
                 )?;
-                println!(
-                    "chat_memory> archived room={} turns={}",
-                    room.id, turn_index
+                print_organize_status(
+                    "capture",
+                    format!("status=archived room={} turns={turn_index}", room.id),
                 );
             }
 
             let next_room =
                 create_chat_room(&memory_namespace, default_chat_room_id(&memory_namespace));
             ensure_chat_room(default_workspace_root(), &workspace_namespace, &next_room)?;
-            println!("chat_memory> rolled to room={}", next_room.id);
+            print_organize_status("capture", format!("status=ready room={}", next_room.id));
             chat_room = Some(next_room.clone());
             history.clear();
             turn_index = 0;
@@ -1902,6 +2978,7 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
                     model.clone(),
                     organizer_mode,
                     preference_summary_mode,
+                    llm_priority_gate.clone(),
                 ))
             } else {
                 None
@@ -1915,7 +2992,92 @@ fn handle_chat(registry: &ProviderRegistry, args: &[String]) -> Result<()> {
         }
     }
 
+    emit_cli_trace_with_fields(
+        "chat",
+        "finish",
+        Some("completed"),
+        "interactive chat session ended",
+        BTreeMap::from([("flow_id".to_owned(), chat_flow)]),
+    );
+
     Ok(())
+}
+
+fn should_use_lightweight_chat_path(input: &str, turn_index: usize) -> bool {
+    if turn_index != 1 {
+        return false;
+    }
+
+    let normalized = input.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "你好"
+            | "您好"
+            | "嗨"
+            | "哈喽"
+            | "在吗"
+            | "在嘛"
+            | "早"
+            | "早上好"
+            | "中午好"
+            | "下午好"
+            | "晚上好"
+    )
+}
+
+fn generate_lightweight_chat_response(
+    registry: &ProviderRegistry,
+    request: &ContextRequest,
+) -> Result<ContextResponse> {
+    let mut generation = request.generation.clone();
+    generation.messages = lightweight_chat_messages(request)?;
+    let response = registry
+        .generate(&generation)
+        .map_err(anyhow::Error::from)?;
+    Ok(ContextResponse {
+        response,
+        recalled_memories: Vec::new(),
+        synthesized_prompt_assets: Vec::new(),
+    })
+}
+
+fn generate_lightweight_chat_response_stream(
+    registry: &ProviderRegistry,
+    request: &ContextRequest,
+    on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), hc_llm::LlmError>,
+) -> Result<ContextResponse> {
+    let mut generation = request.generation.clone();
+    generation.messages = lightweight_chat_messages(request)?;
+    let response = registry
+        .generate_stream(&generation, on_chunk)
+        .map_err(anyhow::Error::from)?;
+    Ok(ContextResponse {
+        response,
+        recalled_memories: Vec::new(),
+        synthesized_prompt_assets: Vec::new(),
+    })
+}
+
+fn lightweight_chat_messages(request: &ContextRequest) -> Result<Vec<ChatMessage>> {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = request.system_prompt.as_deref() {
+        let namespace = request
+            .memory_query
+            .memory_query
+            .namespace
+            .clone()
+            .unwrap_or_else(runtime_memory_namespace);
+        let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+        let lightweight_prompt = load_context_lightweight_chat_prompt(&workspace_namespace)?;
+        messages.push(ChatMessage::new(
+            MessageRole::System,
+            format!("{system_prompt}\n\n{lightweight_prompt}"),
+        ));
+    }
+    messages.extend(request.generation.messages.iter().cloned());
+    Ok(messages)
 }
 
 fn print_room_candidates_for_generate(candidates: &[hc_context::RoomCandidate]) {
@@ -2025,8 +3187,10 @@ fn print_managed_prompt_history(
     workspace_namespace: &WorkspaceNamespace,
     filter: Option<&str>,
 ) -> Result<()> {
-    let repository =
-        MemoryRoomRepository::with_namespace(root.as_ref().to_path_buf(), workspace_namespace.clone());
+    let repository = MemoryRoomRepository::with_namespace(
+        root.as_ref().to_path_buf(),
+        workspace_namespace.clone(),
+    );
     let prompt_dir = repository
         .root()
         .join(workspace_namespace.scoped_prefix())
@@ -2091,7 +3255,10 @@ fn print_managed_prompt_history(
 }
 
 fn managed_prompt_asset_matches_filter(asset: &MemoryRoomAsset, lowered_filter: &str) -> bool {
-    asset.file_name.to_ascii_lowercase().contains(lowered_filter)
+    asset
+        .file_name
+        .to_ascii_lowercase()
+        .contains(lowered_filter)
         || asset.title.to_ascii_lowercase().contains(lowered_filter)
         || asset.summary.to_ascii_lowercase().contains(lowered_filter)
         || asset
@@ -2225,11 +3392,11 @@ fn runtime_memory_namespace() -> MemoryNamespace {
 }
 
 fn default_provider() -> String {
-    env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned())
+    default_provider_from_env()
 }
 
 fn default_model() -> String {
-    env::var("HC_LLM_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_owned())
+    default_model_from_env()
 }
 
 fn default_request_mode() -> RequestMode {
@@ -2296,6 +3463,18 @@ fn default_chat_room_window_size() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(12)
+}
+
+fn priority_debug_enabled() -> bool {
+    env::var("HC_CONTEXT_DEBUG_PRIORITY")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn default_typewriter_delay_ms() -> u64 {
@@ -3350,7 +4529,9 @@ fn persist_chat_turn_assistant_wenyan(
     let response = registry
         .generate(&generation)
         .map_err(anyhow::Error::from)?;
-    let wenyan = strip_think_blocks(&response.message.content).trim().to_owned();
+    let wenyan = strip_think_blocks(&response.message.content)
+        .trim()
+        .to_owned();
     if wenyan.is_empty() {
         return Ok(None);
     }
@@ -3385,7 +4566,10 @@ fn persist_chat_turn_assistant_wenyan(
             "derived wenyan rewrite from assistant reply",
             vec!["chat", "assistant", "wenyan"],
             vec![format!("turn:{turn_index}")],
-            vec!["rewrite:wenyan".to_owned(), materialized.room_relative_path.clone()],
+            vec![
+                "rewrite:wenyan".to_owned(),
+                materialized.room_relative_path.clone(),
+            ],
         ),
     )?;
 
@@ -3411,14 +4595,20 @@ fn chat_event(
     outputs: Vec<String>,
 ) -> ArtifactEvolutionEvent {
     let event = ArtifactEvolutionEvent::new(
-        format!("event.{asset_id}.{}.{}", action_label(&action), current_timestamp_ms()),
+        format!(
+            "event.{asset_id}.{}.{}",
+            action_label(&action),
+            current_timestamp_ms()
+        ),
         asset_id.to_owned(),
         room_id.to_owned(),
         action,
         reason.to_owned(),
     )
     .with_created_at_ms(current_timestamp_ms());
-    let event = tags.into_iter().fold(event, |event, tag| event.with_tag(tag));
+    let event = tags
+        .into_iter()
+        .fold(event, |event, tag| event.with_tag(tag));
     let event = inputs
         .into_iter()
         .fold(event, |event, input| event.with_input(input));
@@ -3547,7 +4737,10 @@ fn persist_global_promotions_for_chat_input(
         .with_file_name(format!("pref.{}.md", file_slug))
         .with_asset_id(format!("asset.{}.{}", room_id, file_slug));
         let path = persist_room_memory(root.as_ref(), workspace_namespace.clone(), &write_request)?;
-        println!("promotion> persisted global memory: {}", path.display());
+        print_organize_status(
+            "promote",
+            format!("status=saved target=global path={}", path.display()),
+        );
     }
 
     Ok(())
@@ -3611,15 +4804,51 @@ fn start_background_memory_worker(
     model: String,
     organizer_mode: StrategyMode,
     preference_summary_mode: StrategyMode,
+    llm_priority_gate: Arc<LlmPriorityGate>,
 ) -> BackgroundMemoryWorker {
     let (sender, receiver) = mpsc::channel::<BackgroundMemoryTask>();
+    emit_cli_trace(
+        "background_worker",
+        "start",
+        Some("started"),
+        "starting background memory worker",
+    );
+    let parent_flow_id = current_trace_context().flow_id;
+    let run_id = current_run_id();
     let handle = thread::spawn(move || {
+        let mut context = TraceContext::default().with_component(TRACE_COMPONENT);
+        if let Some(run_id) = run_id {
+            context = context.with_run_id(run_id);
+        }
+        if let Some(parent_flow_id) = parent_flow_id {
+            context = context.with_parent_flow_id(parent_flow_id);
+        }
+        replace_trace_context(context);
         let registry = default_registry();
         let organizer_model = ModelRef::new(provider, model);
 
         while let Ok(task) = receiver.recv() {
             match task {
                 BackgroundMemoryTask::GlobalPromotion { content } => {
+                    let flow_id = new_trace_id("flow.background.global_promotion");
+                    let _flow_guard = enter_flow_context(flow_id);
+                    let _permit = llm_priority_gate.acquire_background();
+                    emit_cli_trace_with_fields(
+                        "background_worker",
+                        "global_promotion",
+                        Some("started"),
+                        "running background global promotion",
+                        BTreeMap::from([(
+                            "content_chars".to_owned(),
+                            content.chars().count().to_string(),
+                        )]),
+                    );
+                    if priority_debug_enabled() {
+                        eprint_organize_status(
+                            "priority",
+                            "class=background task=global_promotion action=started",
+                        );
+                    }
                     let organizer = build_memory_organizer(
                         &registry,
                         &organizer_model,
@@ -3637,9 +4866,25 @@ fn start_background_memory_worker(
                         &organizer_model,
                         preference_summary_mode,
                     ) {
-                        eprintln!(
-                            "promotion> background task failed: {}",
-                            concise_error_message(&error)
+                        eprint_organize_status(
+                            "promote",
+                            format!(
+                                "status=failed mode=background reason={}",
+                                concise_error_message(&error)
+                            ),
+                        );
+                    } else {
+                        emit_cli_trace(
+                            "background_worker",
+                            "global_promotion",
+                            Some("completed"),
+                            "finished background global promotion",
+                        );
+                    }
+                    if priority_debug_enabled() {
+                        eprint_organize_status(
+                            "priority",
+                            "class=background task=global_promotion action=finished",
                         );
                     }
                 }
@@ -3647,6 +4892,22 @@ fn start_background_memory_worker(
                     turn_index,
                     content,
                 } => {
+                    let flow_id = format!("flow.background.literary.{turn_index}");
+                    let _flow_guard = enter_flow_context(flow_id);
+                    let _permit = llm_priority_gate.acquire_background();
+                    emit_cli_trace_with_fields(
+                        "background_worker",
+                        "literary",
+                        Some("started"),
+                        "running background literary generation",
+                        BTreeMap::from([("turn_index".to_owned(), turn_index.to_string())]),
+                    );
+                    if priority_debug_enabled() {
+                        eprint_organize_status(
+                            "priority",
+                            "class=background task=literary action=started",
+                        );
+                    }
                     match persist_chat_turn_assistant_wenyan(
                         &registry,
                         &organizer_model,
@@ -3658,13 +4919,37 @@ fn start_background_memory_worker(
                     ) {
                         Ok(Some(_path)) => {}
                         Ok(None) => {}
-                        Err(error) => eprintln!(
-                            "literary> background task failed: {}",
-                            concise_error_message(&error)
+                        Err(error) => eprint_organize_status(
+                            "literary",
+                            format!(
+                                "status=failed mode=background reason={}",
+                                concise_error_message(&error)
+                            ),
                         ),
                     }
+                    emit_cli_trace_with_fields(
+                        "background_worker",
+                        "literary",
+                        Some("completed"),
+                        "finished background literary generation",
+                        BTreeMap::from([("turn_index".to_owned(), turn_index.to_string())]),
+                    );
+                    if priority_debug_enabled() {
+                        eprint_organize_status(
+                            "priority",
+                            "class=background task=literary action=finished",
+                        );
+                    }
                 }
-                BackgroundMemoryTask::Shutdown => break,
+                BackgroundMemoryTask::Shutdown => {
+                    emit_cli_trace(
+                        "background_worker",
+                        "shutdown",
+                        Some("completed"),
+                        "background memory worker shutting down",
+                    );
+                    break;
+                }
             }
         }
     });
@@ -3676,13 +4961,28 @@ fn enqueue_background_task(
     task: BackgroundMemoryTask,
     label: &str,
 ) {
+    emit_cli_trace(
+        "background_worker",
+        "enqueue",
+        Some("queued"),
+        format!("queued background task for {label}"),
+    );
     if let Err(error) = sender.send(task) {
-        eprintln!("{label}> failed to enqueue background task: {error}");
+        eprint_organize_status(
+            label,
+            format!("status=failed action=enqueue reason={error}"),
+        );
     }
 }
 
 fn shutdown_background_memory_worker(worker: Option<BackgroundMemoryWorker>) {
     if let Some(worker) = worker {
+        emit_cli_trace(
+            "background_worker",
+            "shutdown",
+            Some("started"),
+            "requesting background worker shutdown",
+        );
         let _ = worker.sender.send(BackgroundMemoryTask::Shutdown);
         let _ = worker.handle.join();
     }
@@ -3712,11 +5012,16 @@ fn flush_literary_memory_queue(
             turn_index,
             &content,
         ) {
-            Ok(Some(path)) => println!("literary> persisted wenyan memory: {}", path.display()),
+            Ok(Some(path)) => {
+                print_organize_status("literary", format!("status=saved path={}", path.display()))
+            }
             Ok(None) => {}
-            Err(error) => eprintln!(
-                "literary> skipped wenyan memory: {}. Set HC_CONTEXT_LITERARY_MEMORY=false to disable this optional step.",
-                concise_error_message(&error)
+            Err(error) => eprint_organize_status(
+                "literary",
+                format!(
+                    "status=skipped optional=true reason={}. Set HC_CONTEXT_LITERARY_MEMORY=false to disable this optional step.",
+                    concise_error_message(&error)
+                ),
             ),
         }
         pending.pop_front();
@@ -3865,12 +5170,15 @@ fn render_output(text: &str, output_style: OutputStyle) -> Result<()> {
 }
 
 fn prompt_raw(prompt: &str) -> Result<String> {
+    set_active_prompt(prompt);
     print!("{prompt}");
     io::stdout().flush().context("failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin()
+    let result = io::stdin()
         .read_line(&mut input)
-        .context("failed to read stdin")?;
+        .context("failed to read stdin");
+    clear_active_prompt();
+    result?;
     Ok(input)
 }
 

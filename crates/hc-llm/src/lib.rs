@@ -1,8 +1,11 @@
 //! Minimal pluggable LLM core for Honeycomb.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error as _;
 use std::io::{BufRead, BufReader};
+use std::thread;
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -131,9 +134,18 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-#[derive(Default)]
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Box<dyn LlmProvider>>,
+    retry_policy: LlmRetryPolicy,
+}
+
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self {
+            providers: BTreeMap::new(),
+            retry_policy: LlmRetryPolicy::from_env(),
+        }
+    }
 }
 
 impl ProviderRegistry {
@@ -157,7 +169,20 @@ impl ProviderRegistry {
         let provider = self
             .provider(&request.model.provider)
             .ok_or_else(|| LlmError::ProviderNotFound(request.model.provider.clone()))?;
-        provider.generate(request)
+        let policy = self.retry_policy;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match provider.generate(request) {
+                Ok(response) => return Ok(response),
+                Err(error) if policy.should_retry(attempt, &error) => {
+                    let delay = policy.backoff_for_attempt(attempt);
+                    policy.log_retry(attempt, &error, delay);
+                    thread::sleep(delay);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn generate_stream(
@@ -168,7 +193,25 @@ impl ProviderRegistry {
         let provider = self
             .provider(&request.model.provider)
             .ok_or_else(|| LlmError::ProviderNotFound(request.model.provider.clone()))?;
-        provider.generate_stream(request, on_chunk)
+        let policy = self.retry_policy;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let mut saw_chunk = false;
+            let mut wrapped = |chunk: StreamChunk| -> Result<(), LlmError> {
+                saw_chunk = true;
+                on_chunk(chunk)
+            };
+            match provider.generate_stream(request, &mut wrapped) {
+                Ok(response) => return Ok(response),
+                Err(error) if !saw_chunk && policy.should_retry(attempt, &error) => {
+                    let delay = policy.backoff_for_attempt(attempt);
+                    policy.log_retry(attempt, &error, delay);
+                    thread::sleep(delay);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn provider_infos(&self) -> Vec<ProviderInfo> {
@@ -187,6 +230,269 @@ pub enum LlmError {
     InvalidRequest(String),
     #[error("provider failure: {0}")]
     ProviderFailure(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub default_base_url: &'static str,
+    pub balanced_model: &'static str,
+    pub fast_model: &'static str,
+    pub coding_model: &'static str,
+}
+
+pub fn default_registry_from_env() -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    let provider_id = default_provider_from_env();
+    let api_key = provider_api_key_from_env(&provider_id);
+    let base_url = provider_base_url_from_env(&provider_id);
+
+    if let Some(api_key) = api_key
+        && let Ok(provider) = OpenAiCompatibleProvider::new(
+            provider_id.clone(),
+            provider_preset(&provider_id)
+                .map(|preset| preset.display_name.to_owned())
+                .unwrap_or_else(|| format!("{provider_id} compatible")),
+            base_url,
+            api_key,
+        )
+    {
+        registry.register(provider);
+    }
+
+    registry
+}
+
+pub fn default_provider_from_env() -> String {
+    if let Ok(provider) = env::var("HC_LLM_PROVIDER")
+        && !provider.trim().eq_ignore_ascii_case("mock")
+    {
+        return provider.trim().to_owned();
+    }
+
+    if env::var("HC_LLM_API_KEY").is_ok() || env::var("OPENAI_API_KEY").is_ok() {
+        return "openai".to_owned();
+    }
+
+    if env::var("MINIMAX_API_KEY").is_ok() {
+        return "minimax".to_owned();
+    }
+
+    if env::var("DEEPSEEK_API_KEY").is_ok() {
+        return "deepseek".to_owned();
+    }
+
+    "openai".to_owned()
+}
+
+pub fn default_model_from_env() -> String {
+    let provider = default_provider_from_env();
+    if let Ok(model) = env::var("HC_LLM_MODEL")
+        && !using_legacy_mock_config()
+    {
+        return model;
+    }
+
+    let model_type = env::var("HC_LLM_MODEL_TYPE").unwrap_or_else(|_| "balanced".to_owned());
+    default_model_for_provider(&provider, &model_type)
+}
+
+pub fn provider_api_key_from_env(provider_id: &str) -> Option<String> {
+    env::var("HC_LLM_API_KEY")
+        .ok()
+        .or_else(|| env::var(provider_api_key_var_name(provider_id)).ok())
+}
+
+pub fn provider_base_url_from_env(provider_id: &str) -> String {
+    env::var("HC_LLM_BASE_URL")
+        .ok()
+        .or_else(|| env::var(provider_base_url_var_name(provider_id)).ok())
+        .unwrap_or_else(|| default_base_url_for_provider(provider_id))
+}
+
+pub fn default_base_url_for_provider(provider: &str) -> String {
+    provider_preset(provider)
+        .map(|preset| preset.default_base_url.to_owned())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_owned())
+}
+
+pub fn default_model_for_provider(provider: &str, model_type: &str) -> String {
+    if let Some(preset) = provider_preset(provider) {
+        return match model_type {
+            "fast" => preset.fast_model.to_owned(),
+            "coding" => preset.coding_model.to_owned(),
+            _ => preset.balanced_model.to_owned(),
+        };
+    }
+
+    match model_type {
+        "fast" => "gpt-4.1-mini".to_owned(),
+        "coding" => "gpt-4.1".to_owned(),
+        _ => "gpt-4.1-mini".to_owned(),
+    }
+}
+
+pub fn provider_presets() -> &'static [ProviderPreset] {
+    &[
+        ProviderPreset {
+            id: "openai",
+            display_name: "OpenAI Compatible",
+            default_base_url: "https://api.openai.com/v1",
+            balanced_model: "gpt-4.1-mini",
+            fast_model: "gpt-4.1-mini",
+            coding_model: "gpt-4.1",
+        },
+        ProviderPreset {
+            id: "minimax",
+            display_name: "MiniMax Compatible",
+            default_base_url: "https://api.minimaxi.com/v1",
+            balanced_model: "MiniMax-M2.5",
+            fast_model: "MiniMax-M2.5-HighSpeed",
+            coding_model: "MiniMax-M2.1",
+        },
+        ProviderPreset {
+            id: "deepseek",
+            display_name: "DeepSeek Compatible",
+            default_base_url: "https://api.deepseek.com",
+            balanced_model: "deepseek-v4-flash",
+            fast_model: "deepseek-v4-flash",
+            coding_model: "deepseek-v4-pro",
+        },
+    ]
+}
+
+pub fn provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
+    provider_presets()
+        .iter()
+        .find(|preset| preset.id.eq_ignore_ascii_case(provider.trim()))
+}
+
+pub fn is_timeout_error(error: &LlmError) -> bool {
+    match error {
+        LlmError::ProviderFailure(message) => {
+            let lowered = message.to_ascii_lowercase();
+            lowered.contains("timed out") || lowered.contains("timeout")
+        }
+        LlmError::ProviderNotFound(_) | LlmError::InvalidRequest(_) => false,
+    }
+}
+
+fn using_legacy_mock_config() -> bool {
+    env::var("HC_LLM_PROVIDER")
+        .map(|provider| provider.trim().eq_ignore_ascii_case("mock"))
+        .unwrap_or(false)
+}
+
+pub fn provider_api_key_var_name(provider_id: &str) -> &'static str {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MINIMAX_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        _ => "OPENAI_API_KEY",
+    }
+}
+
+pub fn provider_base_url_var_name(provider_id: &str) -> &'static str {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MINIMAX_BASE_URL",
+        "deepseek" => "DEEPSEEK_BASE_URL",
+        _ => "OPENAI_BASE_URL",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LlmRetryPolicy {
+    max_attempts: usize,
+    base_delay_ms: u64,
+    log_retries: bool,
+}
+
+impl Default for LlmRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 250,
+            log_retries: false,
+        }
+    }
+}
+
+impl LlmRetryPolicy {
+    fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            max_attempts: env_usize("HC_LLM_RETRY_MAX_ATTEMPTS")
+                .filter(|value| *value > 0)
+                .unwrap_or(defaults.max_attempts),
+            base_delay_ms: env_u64("HC_LLM_RETRY_BASE_DELAY_MS").unwrap_or(defaults.base_delay_ms),
+            log_retries: env_bool("HC_LLM_RETRY_LOG").unwrap_or(defaults.log_retries),
+        }
+    }
+
+    fn should_retry(&self, attempt: usize, error: &LlmError) -> bool {
+        attempt < self.max_attempts && is_retryable_llm_error(error)
+    }
+
+    fn backoff_for_attempt(&self, attempt: usize) -> Duration {
+        let multiplier = 1u64
+            .checked_shl(attempt.saturating_sub(1).min(63) as u32)
+            .unwrap_or(u64::MAX);
+        Duration::from_millis(self.base_delay_ms.saturating_mul(multiplier))
+    }
+
+    fn log_retry(&self, attempt: usize, error: &LlmError, delay: Duration) {
+        if !self.log_retries {
+            return;
+        }
+        eprintln!(
+            "llm retry> attempt {attempt}/{} failed: {}; retrying in {}ms",
+            self.max_attempts,
+            error,
+            delay.as_millis()
+        );
+    }
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok()?.trim().parse().ok()
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok()?.trim().parse().ok()
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let value = env::var(key).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_retryable_llm_error(error: &LlmError) -> bool {
+    match error {
+        LlmError::ProviderFailure(message) => is_retryable_provider_failure_message(message),
+        LlmError::ProviderNotFound(_) | LlmError::InvalidRequest(_) => false,
+    }
+}
+
+fn is_retryable_provider_failure_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "http 408", "http 409", "http 425", "http 429", "http 500", "http 502", "http 503",
+        "http 504", "http 529",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || lower.contains("overloaded_error")
+        || lower.contains("rate limit")
+        || lower.contains("please retry")
+        || lower.contains("retry later")
+        || lower.contains("timed out")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("temporary failure")
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +516,7 @@ impl OpenAiCompatibleProvider {
         }
 
         let client = Client::builder()
+            .timeout(request_timeout_from_env())
             .build()
             .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
 
@@ -255,9 +562,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
             )));
         }
 
-        let raw: OpenAiChatResponse = response
-            .json()
-            .map_err(|error| LlmError::ProviderFailure(error.to_string()))?;
+        let response_text = response
+            .text()
+            .map_err(|error| LlmError::ProviderFailure(format_transport_error(&error)))?;
+        let raw: OpenAiChatResponse = serde_json::from_str(&response_text).map_err(|error| {
+            LlmError::ProviderFailure(format!(
+                "failed to decode chat response: {}; body: {}",
+                error,
+                compact_error_body(&response_text)
+            ))
+        })?;
 
         let choice = raw
             .choices
@@ -265,17 +579,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| LlmError::ProviderFailure("missing choice".to_owned()))?;
 
+        let message = choice.message;
+        let name = message.name.clone();
+
         Ok(GenerateResponse {
             model: request.model.clone(),
             message: ChatMessage {
-                role: parse_openai_role(&choice.message.role),
-                content: choice.message.content.unwrap_or_default(),
-                name: choice.message.name,
+                role: parse_openai_role(&message.role),
+                content: message_content_to_string(message),
+                name,
             },
             finish_reason: parse_finish_reason(choice.finish_reason.as_deref()),
             usage: raw.usage.map(|usage| TokenUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
+                input_tokens: usage.prompt_tokens.unwrap_or_default(),
+                output_tokens: usage.completion_tokens.unwrap_or_default(),
             }),
             raw: raw.raw,
         })
@@ -346,7 +663,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 if let Some(role) = choice.delta.role.as_deref() {
                     assistant_role = parse_openai_role(role);
                 }
-                if let Some(content) = choice.delta.content {
+                if let Some(content) = choice.delta.content.map(content_to_string) {
                     accumulated.push_str(&content);
                     on_chunk(StreamChunk {
                         delta: content,
@@ -386,6 +703,24 @@ fn format_transport_error(error: &reqwest::Error) -> String {
     parts.join(": ")
 }
 
+fn request_timeout_from_env() -> Duration {
+    env_u64("HC_LLM_REQUEST_TIMEOUT_SECS")
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(180))
+}
+
+fn compact_error_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 800 {
+        let mut truncated = compact.chars().take(800).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        compact
+    }
+}
+
 fn build_openai_chat_request(request: &GenerateRequest, stream: bool) -> OpenAiChatRequest {
     OpenAiChatRequest {
         model: request.model.model.clone(),
@@ -394,7 +729,8 @@ fn build_openai_chat_request(request: &GenerateRequest, stream: bool) -> OpenAiC
             .iter()
             .map(|message| OpenAiMessage {
                 role: openai_role(&message.role).to_owned(),
-                content: Some(message.content.clone()),
+                content: Some(OpenAiMessageContent::Text(message.content.clone())),
+                reasoning_content: None,
                 name: message.name.clone(),
             })
             .collect(),
@@ -445,9 +781,53 @@ struct OpenAiChatRequest {
 struct OpenAiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<OpenAiMessageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<OpenAiMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiMessageContentPart>),
+    Other(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiMessageContentPart {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    text: Option<String>,
+}
+
+fn content_to_string(content: OpenAiMessageContent) -> String {
+    match content {
+        OpenAiMessageContent::Text(text) => text,
+        OpenAiMessageContent::Parts(parts) => parts
+            .into_iter()
+            .filter_map(|part| part.text)
+            .collect::<Vec<_>>()
+            .join(""),
+        OpenAiMessageContent::Other(value) => match value {
+            serde_json::Value::String(text) => text,
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        },
+    }
+}
+
+fn message_content_to_string(message: OpenAiMessage) -> String {
+    let content = message.content.map(content_to_string).unwrap_or_default();
+    if !content.trim().is_empty() {
+        return content;
+    }
+    message
+        .reasoning_content
+        .map(content_to_string)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,7 +852,7 @@ struct OpenAiStreamChoice {
 #[derive(Debug, Serialize, Deserialize)]
 struct OpenAiStreamDelta {
     role: Option<String>,
-    content: Option<String>,
+    content: Option<OpenAiMessageContent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,13 +863,89 @@ struct OpenAiChoice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct RetryOnceProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for RetryOnceProvider {
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                id: "retry-once".to_owned(),
+                display_name: "Retry Once".to_owned(),
+                supports_chat: true,
+                supports_streaming: true,
+            }
+        }
+
+        fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse, LlmError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Err(LlmError::ProviderFailure("http 503: overloaded".to_owned()));
+            }
+
+            Ok(GenerateResponse {
+                model: request.model.clone(),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            })
+        }
+    }
+
+    struct RetryStreamOnceProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for RetryStreamOnceProvider {
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                id: "retry-stream-once".to_owned(),
+                display_name: "Retry Stream Once".to_owned(),
+                supports_chat: true,
+                supports_streaming: true,
+            }
+        }
+
+        fn generate(&self, _request: &GenerateRequest) -> Result<GenerateResponse, LlmError> {
+            unreachable!("streaming test should not call non-streaming method")
+        }
+
+        fn generate_stream(
+            &self,
+            request: &GenerateRequest,
+            on_chunk: &mut dyn FnMut(StreamChunk) -> Result<(), LlmError>,
+        ) -> Result<GenerateResponse, LlmError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Err(LlmError::ProviderFailure("http 429: rate limit".to_owned()));
+            }
+
+            on_chunk(StreamChunk {
+                delta: "ok".to_owned(),
+                finish_reason: None,
+            })?;
+            Ok(GenerateResponse {
+                model: request.model.clone(),
+                message: ChatMessage::new(MessageRole::Assistant, "ok"),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                raw: None,
+            })
+        }
+    }
 
     #[test]
     fn registry_returns_error_for_missing_provider() {
@@ -503,5 +959,154 @@ mod tests {
             .generate(&request)
             .expect_err("missing provider should fail");
         assert!(matches!(error, LlmError::ProviderNotFound(provider) if provider == "openai"));
+    }
+
+    #[test]
+    fn registry_retries_retryable_generate_failures() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.retry_policy = LlmRetryPolicy {
+            max_attempts: 2,
+            base_delay_ms: 0,
+            log_retries: false,
+        };
+        registry.register(RetryOnceProvider {
+            calls: calls.clone(),
+        });
+        let request = GenerateRequest::new(
+            ModelRef::new("retry-once", "mock"),
+            vec![ChatMessage::new(MessageRole::User, "hello")],
+        );
+
+        let response = registry.generate(&request).expect("retry should succeed");
+        assert_eq!(response.message.content, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn registry_retries_stream_failures_before_first_chunk() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.retry_policy = LlmRetryPolicy {
+            max_attempts: 2,
+            base_delay_ms: 0,
+            log_retries: false,
+        };
+        registry.register(RetryStreamOnceProvider {
+            calls: calls.clone(),
+        });
+        let request = GenerateRequest::new(
+            ModelRef::new("retry-stream-once", "mock"),
+            vec![ChatMessage::new(MessageRole::User, "hello")],
+        );
+        let mut output = String::new();
+
+        let response = registry
+            .generate_stream(&request, &mut |chunk| {
+                output.push_str(&chunk.delta);
+                Ok(())
+            })
+            .expect("retry should succeed");
+
+        assert_eq!(response.message.content, "ok");
+        assert_eq!(output, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn registry_stops_after_configured_retry_attempts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.retry_policy = LlmRetryPolicy {
+            max_attempts: 1,
+            base_delay_ms: 0,
+            log_retries: false,
+        };
+        registry.register(RetryOnceProvider {
+            calls: calls.clone(),
+        });
+        let request = GenerateRequest::new(
+            ModelRef::new("retry-once", "mock"),
+            vec![ChatMessage::new(MessageRole::User, "hello")],
+        );
+
+        let error = registry
+            .generate(&request)
+            .expect_err("single attempt should return first error");
+
+        assert!(matches!(error, LlmError::ProviderFailure(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retry_policy_backoff_is_exponential() {
+        let policy = LlmRetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 100,
+            log_retries: false,
+        };
+
+        assert_eq!(policy.backoff_for_attempt(1), Duration::from_millis(100));
+        assert_eq!(policy.backoff_for_attempt(2), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn deepseek_provider_preset_uses_openai_compatible_endpoint() {
+        let preset = provider_preset("deepseek").expect("deepseek preset should exist");
+
+        assert_eq!(preset.default_base_url, "https://api.deepseek.com");
+        assert_eq!(preset.balanced_model, "deepseek-v4-flash");
+        assert_eq!(preset.coding_model, "deepseek-v4-pro");
+        assert_eq!(provider_api_key_var_name("deepseek"), "DEEPSEEK_API_KEY");
+        assert_eq!(provider_base_url_var_name("deepseek"), "DEEPSEEK_BASE_URL");
+    }
+
+    #[test]
+    fn openai_compatible_response_accepts_extra_content_shapes() {
+        let response: OpenAiChatResponse = serde_json::from_str(
+            r#"{
+              "id": "chatcmpl-test",
+              "choices": [{
+                "message": {
+                  "role": "assistant",
+                  "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": " world"}
+                  ],
+                  "reasoning_content": "hidden"
+                },
+                "finish_reason": "stop"
+              }],
+              "usage": {"total_tokens": 12}
+            }"#,
+        )
+        .expect("response should decode");
+        let choice = response.choices.into_iter().next().unwrap();
+
+        assert_eq!(
+            choice.message.content.map(content_to_string).unwrap(),
+            "hello world"
+        );
+        assert_eq!(response.usage.unwrap().prompt_tokens.unwrap_or_default(), 0);
+    }
+
+    #[test]
+    fn openai_compatible_response_falls_back_to_reasoning_content() {
+        let response: OpenAiChatResponse = serde_json::from_str(
+            r#"{
+              "choices": [{
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "reasoning_content": "reasoned answer"
+                },
+                "finish_reason": "stop"
+              }]
+            }"#,
+        )
+        .expect("response should decode");
+        let choice = response.choices.into_iter().next().unwrap();
+
+        assert_eq!(message_content_to_string(choice.message), "reasoned answer");
     }
 }

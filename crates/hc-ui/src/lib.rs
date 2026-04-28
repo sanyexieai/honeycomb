@@ -17,11 +17,18 @@ use hc_agent::{
     bootstrap_task_workbench, build_workspace_view, materialize_seed, persist_task_artifacts,
     query_task_artifacts,
 };
+use hc_context::{
+    load_agent_planner_input_prompt, load_agent_responder_system_prompt,
+    load_agent_work_item_execution_prompt,
+};
 use hc_core::{
     MessageKind, MessageRoute, RuntimeCommand, RuntimeCommandResult, RuntimeNamespace,
     RuntimeSupervisor, SessionRecord,
 };
-use hc_llm::{OpenAiCompatibleProvider, ProviderRegistry};
+use hc_llm::{
+    ProviderRegistry, default_model_from_env, default_provider_from_env, default_registry_from_env,
+    provider_api_key_from_env,
+};
 use hc_responder::{
     HumanInboxRepository, HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse,
     ResponderBackend, ResponderBinding, require_human, require_llm,
@@ -1279,12 +1286,14 @@ fn set_window_responder(
             Some(instance_id.clone()),
         )),
         "llm" => ResponderBinding::Llm(LlmResponderConfig {
-            provider: env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned()),
-            model: env::var("HC_LLM_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_owned()),
-            system_prompt: Some(format!(
-                "You are {}. Role: {}. Stay concise and collaborative.",
-                instance_name, role_name
-            )),
+            provider: default_provider_from_env(),
+            model: default_model_from_env(),
+            system_prompt: Some(render_agent_responder_system_prompt(
+                &registry_ref.namespace,
+                &instance_name,
+                &role_name,
+                "Stay concise and collaborative.",
+            )?),
         }),
         _ => bail!("unknown responder mode: {mode}"),
     };
@@ -2896,12 +2905,17 @@ fn configure_default_responder(agent: &mut MaterializedAgent) {
 fn preferred_default_responder(agent_name: &str, role_name: &str) -> ResponderBinding {
     if has_configured_llm_provider() {
         ResponderBinding::Llm(LlmResponderConfig {
-            provider: env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned()),
-            model: env::var("HC_LLM_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_owned()),
-            system_prompt: Some(format!(
-                "You are {}. Role: {}. Stay concise and collaborative.",
-                agent_name, role_name
-            )),
+            provider: default_provider_from_env(),
+            model: default_model_from_env(),
+            system_prompt: Some(
+                render_agent_responder_system_prompt(
+                    &runtime_namespace(),
+                    agent_name,
+                    role_name,
+                    "Stay concise and collaborative.",
+                )
+                .ok(),
+            ),
         })
     } else {
         ResponderBinding::Human(HumanResponderConfig::new(
@@ -2912,7 +2926,7 @@ fn preferred_default_responder(agent_name: &str, role_name: &str) -> ResponderBi
 }
 
 fn has_configured_llm_provider() -> bool {
-    env::var("HC_LLM_API_KEY").is_ok() || env::var("OPENAI_API_KEY").is_ok()
+    provider_api_key_from_env(&default_provider_from_env()).is_some()
 }
 
 fn append_local_line(registry: &Rc<RefCell<UiRegistry>>, window_index: i32, line: String) {
@@ -3249,28 +3263,28 @@ fn run_planner_natural_language_input(
             return apply_manual_planner_input(registry, input, initial, responder.label());
         }
 
-        let source_body = format!(
-            "You are the planning agent for task '{}'.\nTask goal: {}\nCurrent plan status: {:?}\nCurrent planning notes:\n{}\nCurrent work items:\n{}\nCurrent agent proposals:\n{}\n\nUser planning input:\n{}\n\nReturn ONLY valid JSON in this shape:\n{{\"notes\":[\"...\"],\"work_items\":[{{\"stage\":\"...\",\"title\":\"...\",\"goal\":\"...\"}}],\"agent_proposals\":[{{\"role\":\"...\",\"reason\":\"...\"}}]}}\nDo not include markdown fences. Keep arrays incremental and concise.",
-            registry_ref.task_title,
-            registry_ref.task_goal,
-            registry_ref.task_plan.status,
-            registry_ref.task_plan.planning_notes.join("\n"),
-            registry_ref
+        let source_body = render_agent_planner_input_prompt_body(
+            &registry_ref.namespace,
+            &registry_ref.task_title,
+            &registry_ref.task_goal,
+            &format!("{:?}", registry_ref.task_plan.status),
+            &registry_ref.task_plan.planning_notes.join("\n"),
+            &registry_ref
                 .task_plan
                 .work_items
                 .iter()
                 .map(|item| format!("{} | {} | {}", item.stage, item.title, item.goal))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            registry_ref
+            &registry_ref
                 .task_plan
                 .agent_proposals
                 .iter()
                 .map(|proposal| format!("{} | {}", proposal.role, proposal.reason))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            input.trim()
-        );
+            input.trim(),
+        )?;
 
         ReplyRequest {
             source_message_id: if initial {
@@ -3597,10 +3611,13 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
         .ok_or_else(|| anyhow::anyhow!("assigned agent not found: {assigned_agent_id}"))?;
     let target_name = assigned_agent.persona.name.clone();
 
-    let execution_prompt = format!(
-        "Execute work item {}.\nStage: {}\nTitle: {}\nGoal: {}",
-        work_item.id, work_item.stage, work_item.title, work_item.goal
-    );
+    let execution_prompt = render_agent_work_item_execution_prompt_body(
+        &registry_ref.namespace,
+        &work_item.id,
+        &work_item.stage,
+        &work_item.title,
+        &work_item.goal,
+    )?;
     let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
         session_id,
         from: source_id.clone(),
@@ -3828,10 +3845,13 @@ fn execute_work_item(
             .ok_or_else(|| anyhow::anyhow!("assigned agent not found: {assigned_agent_id}"))?;
         let target_name = assigned_agent.persona.name.clone();
 
-        let execution_prompt = format!(
-            "Execute work item {}.\nStage: {}\nTitle: {}\nGoal: {}",
-            work_item.id, work_item.stage, work_item.title, work_item.goal
-        );
+        let execution_prompt = render_agent_work_item_execution_prompt_body(
+            &registry_ref.namespace,
+            &work_item.id,
+            &work_item.stage,
+            &work_item.title,
+            &work_item.goal,
+        )?;
 
         let result = registry_ref.runtime.dispatch(RuntimeCommand::PostMessage {
             session_id,
@@ -4123,6 +4143,62 @@ fn runtime_namespace() -> RuntimeNamespace {
     RuntimeNamespace::new(tenant_id, user_id)
 }
 
+fn workspace_namespace(namespace: &RuntimeNamespace) -> hc_store::store::WorkspaceNamespace {
+    hc_store::store::WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone())
+}
+
+fn render_agent_responder_system_prompt(
+    namespace: &RuntimeNamespace,
+    agent_name: &str,
+    role_name: &str,
+    style: &str,
+) -> Result<String> {
+    Ok(
+        load_agent_responder_system_prompt(&workspace_namespace(namespace))?
+            .replace("{{agent_name}}", agent_name)
+            .replace("{{role_name}}", role_name)
+            .replace("{{style}}", style),
+    )
+}
+
+fn render_agent_planner_input_prompt_body(
+    namespace: &RuntimeNamespace,
+    task_title: &str,
+    task_goal: &str,
+    plan_status: &str,
+    planning_notes: &str,
+    work_items: &str,
+    agent_proposals: &str,
+    user_input: &str,
+) -> Result<String> {
+    Ok(
+        load_agent_planner_input_prompt(&workspace_namespace(namespace))?
+            .replace("{{task_title}}", task_title)
+            .replace("{{task_goal}}", task_goal)
+            .replace("{{plan_status}}", plan_status)
+            .replace("{{planning_notes}}", planning_notes)
+            .replace("{{work_items}}", work_items)
+            .replace("{{agent_proposals}}", agent_proposals)
+            .replace("{{user_input}}", user_input),
+    )
+}
+
+fn render_agent_work_item_execution_prompt_body(
+    namespace: &RuntimeNamespace,
+    work_item_id: &str,
+    stage: &str,
+    title: &str,
+    goal: &str,
+) -> Result<String> {
+    Ok(
+        load_agent_work_item_execution_prompt(&workspace_namespace(namespace))?
+            .replace("{{work_item_id}}", work_item_id)
+            .replace("{{stage}}", stage)
+            .replace("{{title}}", title)
+            .replace("{{goal}}", goal),
+    )
+}
+
 fn summarize_task_title(task_goal: &str) -> String {
     let trimmed = task_goal.trim();
     if trimmed.is_empty() {
@@ -4155,37 +4231,7 @@ fn workspace_root() -> std::path::PathBuf {
 }
 
 fn default_llm_registry() -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
-    let provider_id = env::var("HC_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_owned());
-    let api_key = env::var("HC_LLM_API_KEY").ok().or_else(|| {
-        match provider_id.trim().to_ascii_lowercase().as_str() {
-            "minimax" => env::var("MINIMAX_API_KEY").ok(),
-            _ => env::var("OPENAI_API_KEY").ok(),
-        }
-    });
-    let base_url = env::var("HC_LLM_BASE_URL")
-        .ok()
-        .or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {
-            "minimax" => env::var("MINIMAX_BASE_URL").ok(),
-            _ => env::var("OPENAI_BASE_URL").ok(),
-        })
-        .unwrap_or_else(|| match provider_id.trim().to_ascii_lowercase().as_str() {
-            "minimax" => "https://api.minimaxi.com/v1".to_owned(),
-            _ => "https://api.openai.com/v1".to_owned(),
-        });
-
-    if let Some(api_key) = api_key {
-        if let Ok(provider) = OpenAiCompatibleProvider::new(
-            provider_id.clone(),
-            format!("{provider_id} compatible"),
-            base_url,
-            api_key,
-        ) {
-            registry.register(provider);
-        }
-    }
-
-    registry
+    default_registry_from_env()
 }
 
 fn default_reply_backend() -> RegistryReplyBackend {

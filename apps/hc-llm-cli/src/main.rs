@@ -9,19 +9,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_llm::{
-    ChatMessage, GenerateRequest, GenerateResponse, MessageRole, ModelRef,
-    OpenAiCompatibleProvider, ProviderRegistry, StreamChunk,
+    ChatMessage, GenerateRequest, GenerateResponse, MessageRole, ModelRef, ProviderRegistry,
+    StreamChunk, default_base_url_for_provider, default_model_for_provider, default_model_from_env,
+    default_provider_from_env, default_registry_from_env, provider_api_key_from_env,
+    provider_api_key_var_name, provider_base_url_var_name, provider_preset, provider_presets,
 };
-
-#[derive(Debug, Clone, Copy)]
-struct ProviderPreset {
-    id: &'static str,
-    display_name: &'static str,
-    default_base_url: &'static str,
-    balanced_model: &'static str,
-    fast_model: &'static str,
-    coding_model: &'static str,
-}
+use hc_log::CliLogger;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestMode {
@@ -35,8 +29,26 @@ struct OutputStyle {
     typewriter_delay_ms: u64,
 }
 
+static CLI_LOGGER: OnceLock<CliLogger> = OnceLock::new();
+
+fn init_cli_log() {
+    let logger = CliLogger::init_for_local_workspace_run(
+        PathBuf::from("workspace"),
+        "hc-llm-cli",
+        "hc-llm-cli",
+    );
+    let _ = CLI_LOGGER.set(logger);
+}
+
+fn cli_logger() -> &'static CliLogger {
+    CLI_LOGGER
+        .get()
+        .expect("cli log should be initialized before use")
+}
+
 fn main() -> Result<()> {
     load_local_env_file()?;
+    init_cli_log();
     let args: Vec<String> = env::args().skip(1).collect();
     let mut configured_before = is_llm_configured();
 
@@ -70,23 +82,7 @@ fn main() -> Result<()> {
 }
 
 fn default_registry() -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
-    let provider_id = default_provider();
-    let api_key = provider_api_key(&provider_id);
-    let base_url = provider_base_url(&provider_id);
-
-    if let Some(api_key) = api_key {
-        if let Ok(provider) = OpenAiCompatibleProvider::new(
-            provider_id.clone(),
-            format!("{provider_id} compatible"),
-            base_url,
-            api_key,
-        ) {
-            registry.register(provider);
-        }
-    }
-
-    registry
+    default_registry_from_env()
 }
 
 fn handle_config(args: &[String]) -> Result<()> {
@@ -205,7 +201,7 @@ fn handle_llm_config(args: &[String]) -> Result<()> {
     let model = model.unwrap_or_else(|| {
         vars.get("HC_LLM_MODEL")
             .cloned()
-            .unwrap_or_else(|| default_model_for(&provider, &model_type))
+            .unwrap_or_else(|| default_model_for_provider(&provider, &model_type))
     });
 
     vars.insert("HC_LLM_PROVIDER".to_owned(), provider);
@@ -294,7 +290,7 @@ fn run_setup_wizard() -> Result<()> {
     };
 
     let base_url = prompt_with_default("Base URL", &current_base_url)?;
-    let recommended_model = default_model_for(&provider, &model_type);
+    let recommended_model = default_model_for_provider(&provider, &model_type);
     let current_model = vars
         .get("HC_LLM_MODEL")
         .cloned()
@@ -628,7 +624,7 @@ fn print_config_help() {
 }
 
 fn is_llm_configured() -> bool {
-    env::var("HC_LLM_API_KEY").is_ok() || env::var("OPENAI_API_KEY").is_ok()
+    provider_api_key_from_env(&default_provider()).is_some()
 }
 
 fn matches_openai_not_configured(error: &hc_llm::LlmError) -> bool {
@@ -636,62 +632,11 @@ fn matches_openai_not_configured(error: &hc_llm::LlmError) -> bool {
 }
 
 fn default_provider() -> String {
-    if let Ok(provider) = env::var("HC_LLM_PROVIDER") {
-        if provider.trim().eq_ignore_ascii_case("mock") {
-            return "openai".to_owned();
-        }
-        return provider;
-    }
-
-    if env::var("HC_LLM_API_KEY").is_ok() || env::var("OPENAI_API_KEY").is_ok() {
-        return "openai".to_owned();
-    }
-
-    if env::var("MINIMAX_API_KEY").is_ok() {
-        return "minimax".to_owned();
-    }
-
-    "openai".to_owned()
-}
-
-fn provider_api_key(provider_id: &str) -> Option<String> {
-    env::var("HC_LLM_API_KEY")
-        .ok()
-        .or_else(|| env::var(provider_api_key_var_name(provider_id)).ok())
-}
-
-fn provider_base_url(provider_id: &str) -> String {
-    env::var("HC_LLM_BASE_URL")
-        .ok()
-        .or_else(|| env::var(provider_base_url_var_name(provider_id)).ok())
-        .unwrap_or_else(|| default_base_url_for_provider(provider_id))
-}
-
-fn provider_api_key_var_name(provider_id: &str) -> &'static str {
-    match provider_id.trim().to_ascii_lowercase().as_str() {
-        "minimax" => "MINIMAX_API_KEY",
-        _ => "OPENAI_API_KEY",
-    }
-}
-
-fn provider_base_url_var_name(provider_id: &str) -> &'static str {
-    match provider_id.trim().to_ascii_lowercase().as_str() {
-        "minimax" => "MINIMAX_BASE_URL",
-        _ => "OPENAI_BASE_URL",
-    }
+    default_provider_from_env()
 }
 
 fn default_model() -> String {
-    let provider = default_provider();
-    if let Ok(model) = env::var("HC_LLM_MODEL") {
-        if !using_legacy_mock_config() {
-            return model;
-        }
-    }
-    {
-        let model_type = env::var("HC_LLM_MODEL_TYPE").unwrap_or_else(|_| "balanced".to_owned());
-        default_model_for(&provider, &model_type)
-    }
+    default_model_from_env()
 }
 
 fn default_request_mode() -> RequestMode {
@@ -798,12 +743,6 @@ fn render_output(text: &str, output_style: OutputStyle) -> Result<()> {
     Ok(())
 }
 
-fn using_legacy_mock_config() -> bool {
-    env::var("HC_LLM_PROVIDER")
-        .map(|provider| provider.trim().eq_ignore_ascii_case("mock"))
-        .unwrap_or(false)
-}
-
 fn env_file_path() -> Result<PathBuf> {
     Ok(env::current_dir()
         .context("failed to read current directory")?
@@ -878,62 +817,16 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String> {
 }
 
 fn prompt_raw(prompt: &str) -> Result<String> {
+    cli_logger().set_active_prompt(prompt);
     print!("{prompt}");
     io::stdout().flush().context("failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin()
+    let result = io::stdin()
         .read_line(&mut input)
-        .context("failed to read stdin")?;
+        .context("failed to read stdin");
+    cli_logger().clear_active_prompt();
+    result?;
     Ok(input)
-}
-
-fn default_base_url_for_provider(provider: &str) -> String {
-    provider_preset(provider)
-        .map(|preset| preset.default_base_url.to_owned())
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_owned())
-}
-
-fn default_model_for(provider: &str, model_type: &str) -> String {
-    if let Some(preset) = provider_preset(provider) {
-        return match model_type {
-            "fast" => preset.fast_model.to_owned(),
-            "coding" => preset.coding_model.to_owned(),
-            _ => preset.balanced_model.to_owned(),
-        };
-    }
-
-    match model_type {
-        "fast" => "gpt-4.1-mini".to_owned(),
-        "coding" => "gpt-4.1".to_owned(),
-        _ => "gpt-4.1-mini".to_owned(),
-    }
-}
-
-fn provider_presets() -> &'static [ProviderPreset] {
-    &[
-        ProviderPreset {
-            id: "openai",
-            display_name: "OpenAI Compatible",
-            default_base_url: "https://api.openai.com/v1",
-            balanced_model: "gpt-4.1-mini",
-            fast_model: "gpt-4.1-mini",
-            coding_model: "gpt-4.1",
-        },
-        ProviderPreset {
-            id: "minimax",
-            display_name: "MiniMax Compatible",
-            default_base_url: "https://api.minimaxi.com/v1",
-            balanced_model: "MiniMax-M2.5",
-            fast_model: "MiniMax-M2.5-HighSpeed",
-            coding_model: "MiniMax-M2.1",
-        },
-    ]
-}
-
-fn provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
-    provider_presets()
-        .iter()
-        .find(|preset| preset.id.eq_ignore_ascii_case(provider))
 }
 
 fn normalize_provider(provider: &str) -> Result<String> {

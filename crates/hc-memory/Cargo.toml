@@ -12,3 +12,4 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 hc-store = { path = "../hc-store" }
 hc-persona = { path = "../hc-persona" }
+hc-trace = { path = "../hc-trace" }

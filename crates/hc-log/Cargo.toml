@@ -1,12 +1,10 @@
 [package]
-name = "hc-trace"
+name = "hc-log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-hc-responder = { path = "../hc-responder" }
 hc-store = { path = "../hc-store" }
+hc-trace = { path = "../hc-trace" }

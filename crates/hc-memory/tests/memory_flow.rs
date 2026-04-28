@@ -538,10 +538,11 @@ fn memory_room_repository_writes_evolution_events_to_timeline() {
         .write_evolution_event(&room, &event)
         .expect("timeline event should be written");
     assert!(path.exists());
-    assert!(path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .ends_with("memory/rooms/project/room.tool.rg/timeline.md"));
+    assert!(
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("memory/rooms/project/room.tool.rg/timeline.md")
+    );
 
     let contents = fs::read_to_string(&path).expect("timeline contents should be readable");
     assert!(contents.contains("event.asset.room.tool.rg.recipe.promoted.1"));
@@ -649,7 +650,10 @@ fn memory_room_asset_can_be_built_from_artifact_draft() {
     assert_eq!(asset.stage, MemoryAssetStage::Compiled);
     assert_eq!(asset.form, MemoryAssetForm::Prompt);
     assert_eq!(asset.visibility, MemoryVisibility::TenantShared);
-    assert_eq!(asset.namespace, MemoryNamespace::new("tenant-demo", "user-demo"));
+    assert_eq!(
+        asset.namespace,
+        MemoryNamespace::new("tenant-demo", "user-demo")
+    );
     assert!(asset.tags.iter().any(|tag| tag == "runtime"));
     assert!(
         asset
@@ -713,9 +717,11 @@ fn memory_room_repository_writes_artifact_drafts() {
         )
         .expect("artifact draft should be written");
     assert!(path.exists());
-    assert!(path.to_string_lossy().replace('\\', "/").contains(
-        "memory/rooms/project/room.project.honeycomb/prompt/prompt.architecture.md"
-    ));
+    assert!(
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .contains("memory/rooms/project/room.project.honeycomb/prompt/prompt.architecture.md")
+    );
 
     let root_relative = path
         .strip_prefix(&root)
@@ -729,7 +735,10 @@ fn memory_room_repository_writes_artifact_drafts() {
         .read_asset(relative)
         .expect("artifact draft should roundtrip through asset loading");
 
-    assert_eq!(loaded.id, "asset.room.project.honeycomb.prompt.architecture");
+    assert_eq!(
+        loaded.id,
+        "asset.room.project.honeycomb.prompt.architecture"
+    );
     assert_eq!(loaded.file_name, "prompt.architecture.md");
     assert_eq!(loaded.stage, MemoryAssetStage::Compiled);
     assert_eq!(loaded.form, MemoryAssetForm::Prompt);

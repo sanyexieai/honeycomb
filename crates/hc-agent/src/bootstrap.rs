@@ -1,8 +1,10 @@
 use anyhow::Result;
 use hc_capability::{CapabilityNamespace, CapabilityProfile, seed_capability_for_role};
+use hc_context::load_agent_responder_system_prompt;
 use hc_core::{RuntimeCommand, RuntimeCommandResult, RuntimeSupervisor};
 use hc_persona::{PersonaNamespace, PersonaProfile, seed_persona_for_role};
 use hc_responder::{LlmResponderConfig, ResponderBinding};
+use hc_store::store::WorkspaceNamespace;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -184,13 +186,16 @@ pub fn materialize_seed(
     binding.persona_ref = Some(persona.id.clone());
     binding.memory_scope_refs = vec![format!("memory_scope.task.{task_id}")];
     binding.responder_binding_ref = Some("responder.default".to_owned());
+    let responder_system_prompt = render_agent_responder_system_prompt(
+        &persona.namespace,
+        &persona.name,
+        &persona.role,
+        &persona.style,
+    )?;
     binding.responder = Some(ResponderBinding::Llm(LlmResponderConfig {
         provider: "openai".to_owned(),
         model: "gpt-4.1-mini".to_owned(),
-        system_prompt: Some(format!(
-            "You are {}. Role: {}. Style: {}.",
-            persona.name, persona.role, persona.style
-        )),
+        system_prompt: Some(responder_system_prompt),
     }));
 
     let allocated_tokens = seed.token_budget_hint.unwrap_or(0);
@@ -217,6 +222,20 @@ pub fn materialize_seed(
         binding,
         runtime_budget,
     })
+}
+
+fn render_agent_responder_system_prompt(
+    namespace: &PersonaNamespace,
+    agent_name: &str,
+    role_name: &str,
+    style: &str,
+) -> Result<String> {
+    let workspace_namespace =
+        WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
+    Ok(load_agent_responder_system_prompt(&workspace_namespace)?
+        .replace("{{agent_name}}", agent_name)
+        .replace("{{role_name}}", role_name)
+        .replace("{{style}}", style))
 }
 
 #[cfg(test)]

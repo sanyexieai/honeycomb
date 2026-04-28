@@ -1,12 +1,13 @@
 [package]
-name = "hc-trace"
+name = "hc-skill"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-hc-responder = { path = "../hc-responder" }
+hc-capability = { path = "../hc-capability" }
 hc-store = { path = "../hc-store" }
+hc-toolchain = { path = "../hc-toolchain" }

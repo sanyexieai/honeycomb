@@ -1,18 +1,22 @@
 {
-  "generated_at_ms": 1777012806132,
+  "generated_at_ms": 1777369278523,
   "namespace": {
     "tenant_id": "local",
     "user_id": "default"
   },
   "documents": [
     {
-      "id": "asset.room.chat.local.default.1777012788269.turn.1.user",
+      "id": "prompt.tool.natural-language-builder",
       "doc_type": "memory_room_asset",
-      "title": "User Message 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777012788269/raw/0001.user-message.md",
+      "title": "Natural Language Tool Builder",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/natural-language-tool-builder.md",
       "tags": [
-        "chat",
-        "user"
+        "managed_prompt",
+        "current",
+        "tool_builder",
+        "tool",
+        "builder",
+        "json"
       ],
       "status": null,
       "visibility": "private",
@@ -21,20 +25,163 @@
       "created_at": null,
       "updated_at": null,
       "relations": [],
-      "owners": [
-        "room.chat.local.default.1777012788269"
-      ],
+      "owners": [],
       "capabilities": [],
-      "body_preview": "你好"
+      "body_preview": "Convert a user's natural-language request into a Honeycomb tool or skill definition. Return only one JSON object. Do not use markdown fences. Schema: ```json { ..."
     },
     {
-      "id": "room.chat.local.default.1777012788269",
-      "doc_type": "memory_room",
-      "title": "Chat Room | local / default",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777012788269/room.md",
+      "id": "prompt.tool.chat-assistant.rev.1777360571831",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Chat Assistant Revision 1777360571831",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777360571831.tool-chat-assistant.md",
       "tags": [
+        "managed_prompt",
+        "revision",
+        "tool_chat",
+        "tool",
         "chat",
-        "interactive"
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+    },
+    {
+      "id": "prompt.tool.chat-assistant.rev.1777360925967",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Chat Assistant Revision 1777360925967",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777360925967.tool-chat-assistant.md",
+      "tags": [
+        "managed_prompt",
+        "revision",
+        "tool_chat",
+        "tool",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+    },
+    {
+      "id": "prompt.tool.chat-assistant.rev.1777361438279",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Chat Assistant Revision 1777361438279",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777361438279.tool-chat-assistant.md",
+      "tags": [
+        "managed_prompt",
+        "revision",
+        "tool_chat",
+        "tool",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+    },
+    {
+      "id": "prompt.tool.chat-assistant.rev.1777366259940",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Chat Assistant Revision 1777366259940",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777366259940.tool-chat-assistant.md",
+      "tags": [
+        "managed_prompt",
+        "revision",
+        "tool_chat",
+        "tool",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+    },
+    {
+      "id": "prompt.tool.chat-assistant",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Chat Assistant",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/tool-chat-assistant.md",
+      "tags": [
+        "managed_prompt",
+        "current",
+        "tool_chat",
+        "tool",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+    },
+    {
+      "id": "prompt.tool.router",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Router",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/tool-router.md",
+      "tags": [
+        "managed_prompt",
+        "current",
+        "tool_router",
+        "tool",
+        "router",
+        "json"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "Route one user turn for Honeycomb's tool-aware chat. Return only one JSON object. Do not use markdown fences. Schema: ```json { \"action\": \"chat|create_tool|crea..."
+    },
+    {
+      "id": "room.project.prompt-library",
+      "doc_type": "memory_room",
+      "title": "Managed Prompt Library",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/room.md",
+      "tags": [
+        "prompt-library",
+        "managed-prompt",
+        "project"
       ],
       "status": "active",
       "visibility": "private",
@@ -45,18 +192,19 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "body_preview": "# Chat Room | local / default Interactive chat transcript and compressed reply memory. ## Manifest - room: room.chat.local.default.1777012788269 - layer: chat -..."
+      "body_preview": "# Managed Prompt Library Managed prompt templates for local.default. ## Manifest - room: room.project.prompt-library - layer: project - status: active ## Object..."
     },
     {
-      "id": "asset.room.chat.local.default.1777012788269.timeline",
+      "id": "asset.room.project.prompt-library.timeline",
       "doc_type": "memory_room_asset",
-      "title": "Chat Room | local / default Timeline",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777012788269/timeline.md",
+      "title": "Managed Prompt Library Timeline",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/timeline.md",
       "tags": [
         "timeline",
         "event",
-        "chat",
-        "user"
+        "managed_prompt",
+        "current",
+        "tool_router"
       ],
       "status": null,
       "visibility": "private",
@@ -67,17 +215,17 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "body_preview": "### Created - event: event.asset.room.chat.local.default.1777012788269.turn.1.user.created.1777012806131 - artifact: asset.room.chat.local.default.1777012788269..."
+      "body_preview": "### Promoted - event: event.prompt.tool.chat-assistant.compiled.1777357260375 - artifact: prompt.tool.chat-assistant - action: Promoted - reason: synced managed..."
     },
     {
-      "id": "prompt.organizer.memory",
+      "id": "prompt.tool.natural-language-builder",
       "doc_type": "prompt_template",
-      "title": "Memory Organizer",
-      "relative_path": "prompts/organizer/memory-organizer.md",
+      "title": "Natural Language Tool Builder",
+      "relative_path": "prompts/tool/natural-language-tool-builder.md",
       "tags": [
-        "memory",
-        "organizer",
-        "routing"
+        "tool",
+        "builder",
+        "json"
       ],
       "status": null,
       "visibility": null,
@@ -88,7 +236,137 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "body_preview": "Decide how to organize this memory write. Honor any explicit `room_id_hint`, `room_layer_hint`, `owner`, `visibility`, and existing `tags` when they are present..."
+      "body_preview": "Convert a user's natural-language request into a Honeycomb tool or skill definition. Return only one JSON object. Do not use markdown fences. Schema: ```json { ..."
+    },
+    {
+      "id": "prompt.tool.chat-assistant",
+      "doc_type": "prompt_template",
+      "title": "Tool Chat Assistant",
+      "relative_path": "prompts/tool/tool-chat-assistant.md",
+      "tags": [
+        "tool",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+    },
+    {
+      "id": "prompt.tool.router",
+      "doc_type": "prompt_template",
+      "title": "Tool Router",
+      "relative_path": "prompts/tool/tool-router.md",
+      "tags": [
+        "tool",
+        "router",
+        "json"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "Route one user turn for Honeycomb's tool-aware chat. Return only one JSON object. Do not use markdown fences. Schema: ```json { \"action\": \"chat|create_tool|crea..."
+    },
+    {
+      "id": "skill.frontend-red-theme",
+      "doc_type": "skill",
+      "title": "前端开发红色系技能",
+      "relative_path": "skills/skill.frontend-red-theme.md",
+      "tags": [
+        "frontend",
+        "red-theme",
+        "css",
+        "ui-design",
+        "skill"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "# 前端开发红色系技能 提供红色系前端开发风格指南和代码规范，涵盖UI设计、组件样式、色彩搭配等最佳实践。 ## Instructions 你是一位精通前端开发且擅长红色系视觉风格的设计师和开发者。在涉及前端开发相关问题时： 1. **红色系色彩规范** - 主色调：使用 #E53935、#D32F2F、#C62828..."
+    },
+    {
+      "id": "tool.local-dir.list",
+      "doc_type": "tool",
+      "title": "Local Directory List",
+      "relative_path": "tools/tool.local-dir.list.md",
+      "tags": [
+        "local-dir",
+        "list",
+        "workspace"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "# Local Directory List Lists entries in an explicit local directory path without recursively reading file contents. Use this tool when the task needs to inspect..."
+    },
+    {
+      "id": "tool.local-file.read",
+      "doc_type": "tool",
+      "title": "Local File Read",
+      "relative_path": "tools/tool.local-file.read.md",
+      "tags": [
+        "local-file",
+        "read",
+        "workspace",
+        "artifact"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "# Local File Read Reads UTF-8 content from an explicit local file path. Use this tool when the task needs to inspect a known local file before answering or befo..."
+    },
+    {
+      "id": "tool.local-file.write",
+      "doc_type": "tool",
+      "title": "Local File Write",
+      "relative_path": "tools/tool.local-file.write.md",
+      "tags": [
+        "local-file",
+        "write",
+        "workspace",
+        "artifact"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "body_preview": "# Local File Write Writes UTF-8 content to an explicit local file path. Use this tool when the user wants a generated artifact, page, document, or code snippet ..."
     }
   ]
 }
