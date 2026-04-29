@@ -15,3 +15,4 @@ hc-memory = { path = "../hc-memory" }
 hc-persona = { path = "../hc-persona" }
 hc-store = { path = "../hc-store" }
 hc-toolchain = { path = "../hc-toolchain" }
+hc-trace = { path = "../hc-trace" }

@@ -255,6 +255,132 @@ Avoid hidden fallback behavior.
 }
 
 #[test]
+fn workspace_store_builds_sqlite_search_index_for_text_queries() {
+    let root = unique_temp_dir("store-search-index");
+    let store = WorkspaceStore::new(&root);
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+
+    let room_doc = r#"---
+id: memory.room.0001
+type: memory_room_asset
+title: Deployment Notes
+tenant_id: tenant-a
+user_id: user-a
+tags: [deploy, qwen]
+status: active
+---
+
+Qwen runtime should use the local vLLM deployment endpoint.
+"#;
+    let other_doc = r#"---
+id: memory.room.0002
+type: memory_room_asset
+title: Review Notes
+tenant_id: tenant-a
+user_id: user-a
+tags: [review]
+status: active
+---
+
+Code review should prefer focused findings.
+"#;
+
+    fs::create_dir_all(store.resolve_in_namespace(&namespace, "memory/rooms/project/room.demo"))
+        .expect("room directory should exist");
+    fs::write(
+        store.resolve_in_namespace(&namespace, "memory/rooms/project/room.demo/deployment.md"),
+        room_doc,
+    )
+    .expect("room doc should be written");
+    fs::write(
+        store.resolve_in_namespace(&namespace, "memory/rooms/project/room.demo/review.md"),
+        other_doc,
+    )
+    .expect("other room doc should be written");
+
+    store
+        .rebuild_markdown_index_in_namespace(&namespace)
+        .expect("index should rebuild");
+
+    assert!(
+        store
+            .markdown_search_index_path_in_namespace(&namespace)
+            .exists()
+    );
+
+    let matches = store
+        .query_markdown_index_in_namespace(
+            &namespace,
+            &MarkdownQuery::default()
+                .with_doc_type("memory_room_asset")
+                .with_path_prefix("memory/rooms")
+                .with_text("How should qwen deployment be configured?")
+                .with_limit(3),
+        )
+        .expect("search query should succeed");
+
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].id, "memory.room.0001");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_store_indexes_room_asset_sidecar_metadata() {
+    let root = unique_temp_dir("store-room-asset-meta");
+    let store = WorkspaceStore::new(&root);
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    let asset_dir =
+        store.resolve_in_namespace(&namespace, "memory/rooms/task/room.task.demo/compressed");
+    fs::create_dir_all(&asset_dir).expect("asset directory should exist");
+    fs::write(
+        asset_dir.join("min.summary.md"),
+        "Persist task plans and assignment decisions together.",
+    )
+    .expect("asset body should be written");
+    fs::write(
+        asset_dir.join("min.summary.meta.json"),
+        r#"{
+  "id": "asset.room.task.demo.summary",
+  "type": "memory_room_asset",
+  "title": "Task Demo Summary",
+  "tenant_id": "tenant-a",
+  "user_id": "user-a",
+  "visibility": "private",
+  "room_id": "room.task.demo",
+  "layer": "task",
+  "asset_kind": "compressed",
+  "memory_kind": "decision",
+  "stage": "generalized",
+  "form": "summary",
+  "file_name": "min.summary.md",
+  "tags": ["runtime"],
+  "owners": [{"kind": "task", "id": "task.demo"}],
+  "derived_from": [],
+  "source_docs": []
+}"#,
+    )
+    .expect("asset sidecar should be written");
+
+    let index = store
+        .rebuild_markdown_index_in_namespace(&namespace)
+        .expect("index should rebuild");
+    let entry = index
+        .documents
+        .iter()
+        .find(|entry| entry.id == "asset.room.task.demo.summary")
+        .expect("asset should be indexed");
+
+    assert_eq!(entry.room_id.as_deref(), Some("room.task.demo"));
+    assert_eq!(entry.layer.as_deref(), Some("task"));
+    assert_eq!(entry.asset_kind.as_deref(), Some("compressed"));
+    assert_eq!(entry.memory_kind.as_deref(), Some("decision"));
+    assert_eq!(entry.owners, vec!["task.demo".to_owned()]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_store_rebuilds_index_when_title_is_missing() {
     let root = unique_temp_dir("store-missing-title");
     let store = WorkspaceStore::new(&root);

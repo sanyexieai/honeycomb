@@ -2,9 +2,11 @@
 
 pub mod store {
     use anyhow::{Context, Result, bail};
+    use rusqlite::{Connection, params};
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
     use serde_yaml::Value;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,6 +59,10 @@ pub mod store {
         pub relations: Vec<String>,
         pub owners: Vec<String>,
         pub capabilities: Vec<String>,
+        pub room_id: Option<String>,
+        pub layer: Option<String>,
+        pub memory_kind: Option<String>,
+        pub asset_kind: Option<String>,
         pub body_preview: String,
     }
 
@@ -115,6 +121,40 @@ pub mod store {
         }
 
         fn matches(&self, entry: &MarkdownIndexEntry) -> bool {
+            if !self.matches_without_text(entry) {
+                return false;
+            }
+
+            if let Some(text) = &self.text {
+                let needle = text.to_ascii_lowercase();
+                let haystacks = [
+                    entry.id.as_str(),
+                    entry.doc_type.as_str(),
+                    entry.title.as_str(),
+                    entry.relative_path.as_str(),
+                    entry.body_preview.as_str(),
+                ];
+                let metadata_match = haystacks
+                    .iter()
+                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle));
+                let tag_match = entry
+                    .tags
+                    .iter()
+                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle));
+                let relation_match = entry
+                    .relations
+                    .iter()
+                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle));
+
+                if !(metadata_match || tag_match || relation_match) {
+                    return false;
+                }
+            }
+
+            true
+        }
+
+        fn matches_without_text(&self, entry: &MarkdownIndexEntry) -> bool {
             if !self.ids.is_empty() && !self.ids.iter().any(|id| id == &entry.id) {
                 return false;
             }
@@ -146,32 +186,6 @@ pub mod store {
             if let Some(path_prefix) = &self.path_prefix {
                 let prefix = normalized_path(path_prefix);
                 if !entry.relative_path.starts_with(&prefix) {
-                    return false;
-                }
-            }
-
-            if let Some(text) = &self.text {
-                let needle = text.to_ascii_lowercase();
-                let haystacks = [
-                    entry.id.as_str(),
-                    entry.doc_type.as_str(),
-                    entry.title.as_str(),
-                    entry.relative_path.as_str(),
-                    entry.body_preview.as_str(),
-                ];
-                let metadata_match = haystacks
-                    .iter()
-                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle));
-                let tag_match = entry
-                    .tags
-                    .iter()
-                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle));
-                let relation_match = entry
-                    .relations
-                    .iter()
-                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle));
-
-                if !(metadata_match || tag_match || relation_match) {
                     return false;
                 }
             }
@@ -304,6 +318,16 @@ pub mod store {
             )
         }
 
+        pub fn markdown_search_index_path_in_namespace(
+            &self,
+            namespace: &WorkspaceNamespace,
+        ) -> PathBuf {
+            self.resolve_in_namespace(
+                namespace,
+                PathBuf::from("indexes").join("markdown-search.sqlite"),
+            )
+        }
+
         pub fn rebuild_markdown_index_in_namespace(
             &self,
             namespace: &WorkspaceNamespace,
@@ -365,7 +389,137 @@ pub mod store {
             fs::write(&index_path, payload)
                 .with_context(|| format!("failed to write index file {}", index_path.display()))?;
 
+            self.rebuild_markdown_search_index_in_namespace(&index)?;
+
             Ok(index)
+        }
+
+        pub fn rebuild_markdown_search_index_in_namespace(
+            &self,
+            index: &MarkdownIndex,
+        ) -> Result<()> {
+            let path = self.markdown_search_index_path_in_namespace(&index.namespace);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create search index directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+
+            let mut conn = Connection::open(&path)
+                .with_context(|| format!("failed to open search index {}", path.display()))?;
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                DROP TABLE IF EXISTS markdown_documents_fts;
+                DROP TABLE IF EXISTS markdown_documents;
+
+                CREATE TABLE markdown_documents (
+                    relative_path TEXT PRIMARY KEY,
+                    id TEXT NOT NULL,
+                    doc_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    tags TEXT NOT NULL,
+                    status TEXT,
+                    relations TEXT NOT NULL,
+                    owners TEXT NOT NULL,
+                    capabilities TEXT NOT NULL,
+                    room_id TEXT,
+                    layer TEXT,
+                    memory_kind TEXT,
+                    asset_kind TEXT,
+                    body_preview TEXT NOT NULL
+                );
+
+                CREATE VIRTUAL TABLE markdown_documents_fts USING fts5(
+                    relative_path UNINDEXED,
+                    id,
+                    doc_type,
+                    title,
+                    tags,
+                    status,
+                    relations,
+                    owners,
+                    capabilities,
+                    room_id,
+                    layer,
+                    memory_kind,
+                    asset_kind,
+                    body_preview
+                );
+                "#,
+            )
+            .with_context(|| format!("failed to initialize search index {}", path.display()))?;
+
+            let tx = conn
+                .transaction()
+                .context("failed to start search index transaction")?;
+            {
+                let mut insert_doc = tx.prepare(
+                    r#"
+                    INSERT INTO markdown_documents (
+                        relative_path, id, doc_type, title, tags, status,
+                        relations, owners, capabilities, room_id, layer,
+                        memory_kind, asset_kind, body_preview
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    "#,
+                )?;
+                let mut insert_fts = tx.prepare(
+                    r#"
+                    INSERT INTO markdown_documents_fts (
+                        relative_path, id, doc_type, title, tags, status,
+                        relations, owners, capabilities, room_id, layer,
+                        memory_kind, asset_kind, body_preview
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    "#,
+                )?;
+
+                for entry in &index.documents {
+                    let tags = entry.tags.join(" ");
+                    let relations = entry.relations.join(" ");
+                    let owners = entry.owners.join(" ");
+                    let capabilities = entry.capabilities.join(" ");
+                    let status = entry.status.clone().unwrap_or_default();
+                    let values = params![
+                        entry.relative_path,
+                        entry.id,
+                        entry.doc_type,
+                        entry.title,
+                        tags,
+                        status,
+                        relations,
+                        owners,
+                        capabilities,
+                        entry.room_id.as_deref(),
+                        entry.layer.as_deref(),
+                        entry.memory_kind.as_deref(),
+                        entry.asset_kind.as_deref(),
+                        entry.body_preview
+                    ];
+                    insert_doc.execute(values)?;
+                    insert_fts.execute(params![
+                        entry.relative_path,
+                        entry.id,
+                        entry.doc_type,
+                        entry.title,
+                        entry.tags.join(" "),
+                        entry.status.clone().unwrap_or_default(),
+                        entry.relations.join(" "),
+                        entry.owners.join(" "),
+                        entry.capabilities.join(" "),
+                        entry.room_id.clone().unwrap_or_default(),
+                        entry.layer.clone().unwrap_or_default(),
+                        entry.memory_kind.clone().unwrap_or_default(),
+                        entry.asset_kind.clone().unwrap_or_default(),
+                        entry.body_preview
+                    ])?;
+                }
+            }
+            tx.commit()
+                .context("failed to commit search index transaction")?;
+            Ok(())
         }
 
         pub fn read_markdown_index_in_namespace(
@@ -379,17 +533,240 @@ pub mod store {
                 .with_context(|| format!("failed to parse index file {}", path.display()))
         }
 
+        pub fn read_or_rebuild_markdown_index_in_namespace(
+            &self,
+            namespace: &WorkspaceNamespace,
+        ) -> Result<MarkdownIndex> {
+            let index = match self.read_markdown_index_in_namespace(namespace) {
+                Ok(index) => index,
+                Err(_) => self.rebuild_markdown_index_in_namespace(namespace)?,
+            };
+            let search_index_path = self.markdown_search_index_path_in_namespace(namespace);
+            if !search_index_path.exists() {
+                self.rebuild_markdown_search_index_in_namespace(&index)?;
+            }
+            Ok(index)
+        }
+
         pub fn query_markdown_index_in_namespace(
             &self,
             namespace: &WorkspaceNamespace,
             query: &MarkdownQuery,
         ) -> Result<Vec<MarkdownIndexEntry>> {
-            let index = match self.read_markdown_index_in_namespace(namespace) {
-                Ok(index) => index,
-                Err(_) => self.rebuild_markdown_index_in_namespace(namespace)?,
-            };
-            Ok(apply_query(index.documents, query))
+            let index = self.read_or_rebuild_markdown_index_in_namespace(namespace)?;
+            query_markdown_index_with_search_index(self, namespace, &index, query)
         }
+    }
+
+    pub fn query_markdown_index_with_search_index(
+        store: &WorkspaceStore,
+        namespace: &WorkspaceNamespace,
+        index: &MarkdownIndex,
+        query: &MarkdownQuery,
+    ) -> Result<Vec<MarkdownIndexEntry>> {
+        if query
+            .text
+            .as_ref()
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            return Ok(query_markdown_index(index, query));
+        }
+
+        let search_index_path = store.markdown_search_index_path_in_namespace(namespace);
+        if !search_index_path.exists() {
+            store.rebuild_markdown_search_index_in_namespace(index)?;
+        }
+
+        let fts_paths = search_markdown_paths(&search_index_path, query, index.documents.len())
+            .unwrap_or_default();
+        if fts_paths.is_empty() {
+            return Ok(query_markdown_index(index, query));
+        }
+
+        let by_path = index
+            .documents
+            .iter()
+            .map(|entry| (entry.relative_path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut seen = BTreeSet::new();
+        let mut matches = Vec::new();
+
+        for path in fts_paths {
+            let Some(entry) = by_path.get(path.as_str()) else {
+                continue;
+            };
+            seen.insert(path);
+            if query.matches_without_text(entry) {
+                matches.push((*entry).clone());
+                if query.limit.is_some_and(|limit| matches.len() >= limit) {
+                    return Ok(matches);
+                }
+            }
+        }
+
+        for entry in &index.documents {
+            if seen.contains(&entry.relative_path) {
+                continue;
+            }
+            if query.matches(entry) {
+                matches.push(entry.clone());
+                if query.limit.is_some_and(|limit| matches.len() >= limit) {
+                    break;
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
+    pub fn query_markdown_index(
+        index: &MarkdownIndex,
+        query: &MarkdownQuery,
+    ) -> Vec<MarkdownIndexEntry> {
+        let mut matches = Vec::new();
+        for entry in &index.documents {
+            if query.matches(entry) {
+                matches.push(entry.clone());
+                if query.limit.is_some_and(|limit| matches.len() >= limit) {
+                    break;
+                }
+            }
+        }
+        matches
+    }
+
+    fn search_markdown_paths(
+        search_index_path: &Path,
+        query: &MarkdownQuery,
+        document_count: usize,
+    ) -> Result<Vec<String>> {
+        let Some(text) = query.text.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let Some(match_query) = fts5_match_query(text) else {
+            return Ok(Vec::new());
+        };
+
+        let conn = Connection::open(search_index_path).with_context(|| {
+            format!(
+                "failed to open markdown search index {}",
+                search_index_path.display()
+            )
+        })?;
+        let limit = query
+            .limit
+            .map(|limit| limit.saturating_mul(8).max(32))
+            .unwrap_or(document_count)
+            .min(document_count.max(1));
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT relative_path
+            FROM markdown_documents_fts
+            WHERE markdown_documents_fts MATCH ?1
+            ORDER BY rank
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![match_query, limit as i64], |row| row.get(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row?);
+        }
+        Ok(paths)
+    }
+
+    fn fts5_match_query(text: &str) -> Option<String> {
+        let mut terms = Vec::<String>::new();
+        let mut current = String::new();
+        for character in text.chars() {
+            if character.is_alphanumeric() || character == '_' || character == '-' {
+                current.push(character.to_ascii_lowercase());
+                continue;
+            }
+
+            push_fts5_term(&mut terms, &mut current);
+            if is_cjk(character) {
+                terms.push(character.to_string());
+            }
+        }
+        push_fts5_term(&mut terms, &mut current);
+
+        let mut unique = BTreeSet::new();
+        let mut quoted = Vec::new();
+        for term in terms {
+            if is_fts5_stopword(&term) {
+                continue;
+            }
+            if unique.insert(term.clone()) {
+                quoted.push(format!("\"{}\"", term.replace('"', "\"\"")));
+            }
+            if quoted.len() >= 12 {
+                break;
+            }
+        }
+
+        if quoted.is_empty() {
+            None
+        } else {
+            Some(quoted.join(" OR "))
+        }
+    }
+
+    fn push_fts5_term(terms: &mut Vec<String>, current: &mut String) {
+        if current.chars().count() >= 2 {
+            terms.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    }
+
+    fn is_fts5_stopword(term: &str) -> bool {
+        matches!(
+            term,
+            "a" | "an"
+                | "and"
+                | "are"
+                | "as"
+                | "be"
+                | "but"
+                | "by"
+                | "can"
+                | "do"
+                | "does"
+                | "for"
+                | "from"
+                | "how"
+                | "i"
+                | "in"
+                | "is"
+                | "it"
+                | "of"
+                | "on"
+                | "or"
+                | "should"
+                | "the"
+                | "this"
+                | "to"
+                | "was"
+                | "what"
+                | "when"
+                | "where"
+                | "with"
+                | "you"
+                | "your"
+        )
+    }
+
+    fn is_cjk(character: char) -> bool {
+        matches!(
+            character as u32,
+            0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0x20000..=0x2A6DF
+                | 0x3000..=0x303F
+                | 0x3040..=0x30FF
+                | 0xAC00..=0xD7AF
+        )
     }
 
     pub fn parse_markdown_document<T: DeserializeOwned>(
@@ -463,6 +840,13 @@ pub mod store {
                     .map(|value| value.replace(['-', '_'], " "))
             })
             .unwrap_or_else(|| id.clone());
+        let room_id = optional_string_field(mapping, "room_id").or_else(|| {
+            if doc_type == "memory_room" {
+                Some(id.clone())
+            } else {
+                None
+            }
+        });
 
         Ok(MarkdownIndexEntry {
             id,
@@ -479,6 +863,10 @@ pub mod store {
             relations: relation_targets_field(mapping, "relations"),
             owners: string_list_field(mapping, "owners"),
             capabilities: string_list_field(mapping, "capabilities"),
+            room_id,
+            layer: optional_string_field(mapping, "layer"),
+            memory_kind: optional_string_field(mapping, "memory_kind"),
+            asset_kind: optional_string_field(mapping, "asset_kind"),
             body_preview: preview_text(body, 160),
         })
     }
@@ -517,6 +905,10 @@ pub mod store {
             relations: Vec::new(),
             owners: json_owner_list_field(&sidecar, "owners").unwrap_or_default(),
             capabilities: Vec::new(),
+            room_id: optional_json_string_field(&sidecar, "room_id"),
+            layer: optional_json_string_field(&sidecar, "layer"),
+            memory_kind: optional_json_string_field(&sidecar, "memory_kind"),
+            asset_kind: optional_json_string_field(&sidecar, "asset_kind"),
             body_preview: preview_text(body, 160),
         })
     }
@@ -582,17 +974,6 @@ pub mod store {
                 })
                 .collect(),
         )
-    }
-
-    fn apply_query(
-        mut documents: Vec<MarkdownIndexEntry>,
-        query: &MarkdownQuery,
-    ) -> Vec<MarkdownIndexEntry> {
-        documents.retain(|entry| query.matches(entry));
-        if let Some(limit) = query.limit {
-            documents.truncate(limit);
-        }
-        documents
     }
 
     fn required_string_field(mapping: &serde_yaml::Mapping, field: &str) -> Result<String> {

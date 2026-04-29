@@ -1,5 +1,5 @@
 {
-  "generated_at_ms": 1777369278523,
+  "generated_at_ms": 1777433177558,
   "namespace": {
     "tenant_id": "local",
     "user_id": "default"
@@ -27,6 +27,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "Convert a user's natural-language request into a Honeycomb tool or skill definition. Return only one JSON object. Do not use markdown fences. Schema: ```json { ..."
     },
     {
@@ -51,6 +55,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
     },
     {
@@ -75,6 +83,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
     },
     {
@@ -99,6 +111,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
     },
     {
@@ -123,6 +139,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
     },
     {
@@ -147,6 +167,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
     },
     {
@@ -171,6 +195,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
       "body_preview": "Route one user turn for Honeycomb's tool-aware chat. Return only one JSON object. Do not use markdown fences. Schema: ```json { \"action\": \"chat|create_tool|crea..."
     },
     {
@@ -192,6 +220,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "# Managed Prompt Library Managed prompt templates for local.default. ## Manifest - room: room.project.prompt-library - layer: project - status: active ## Object..."
     },
     {
@@ -215,6 +247,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "workflow_memory",
+      "asset_kind": "timeline",
       "body_preview": "### Promoted - event: event.prompt.tool.chat-assistant.compiled.1777357260375 - artifact: prompt.tool.chat-assistant - action: Promoted - reason: synced managed..."
     },
     {
@@ -236,6 +272,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "Convert a user's natural-language request into a Honeycomb tool or skill definition. Return only one JSON object. Do not use markdown fences. Schema: ```json { ..."
     },
     {
@@ -257,6 +297,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
     },
     {
@@ -278,6 +322,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "Route one user turn for Honeycomb's tool-aware chat. Return only one JSON object. Do not use markdown fences. Schema: ```json { \"action\": \"chat|create_tool|crea..."
     },
     {
@@ -301,6 +349,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "# 前端开发红色系技能 提供红色系前端开发风格指南和代码规范，涵盖UI设计、组件样式、色彩搭配等最佳实践。 ## Instructions 你是一位精通前端开发且擅长红色系视觉风格的设计师和开发者。在涉及前端开发相关问题时： 1. **红色系色彩规范** - 主色调：使用 #E53935、#D32F2F、#C62828..."
     },
     {
@@ -322,6 +374,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "# Local Directory List Lists entries in an explicit local directory path without recursively reading file contents. Use this tool when the task needs to inspect..."
     },
     {
@@ -344,6 +400,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "# Local File Read Reads UTF-8 content from an explicit local file path. Use this tool when the task needs to inspect a known local file before answering or befo..."
     },
     {
@@ -366,6 +426,10 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
       "body_preview": "# Local File Write Writes UTF-8 content to an explicit local file path. Use this tool when the user wants a generated artifact, page, document, or code snippet ..."
     }
   ]
