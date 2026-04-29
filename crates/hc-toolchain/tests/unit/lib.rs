@@ -1,11 +1,13 @@
 use super::{
-    ToolExecutionKind, ToolExecutionOutcome, ToolProvider, ToolRepository, ToolSpec, ToolStability,
-    build_default_tool_execution_plan, builtin_tool, default_tool_catalog, default_tool_command,
-    seed_tool_local_dir_list, seed_tool_local_file_read, seed_tool_rg,
+    McpServerRepository, McpServerSpec, ToolExecutionKind, ToolExecutionOutcome, ToolProvider,
+    ToolRepository, ToolSpec, ToolStability, build_default_tool_execution_plan, builtin_tool,
+    default_tool_catalog, default_tool_command, discover_mcp_tools_with_timeout,
+    is_mcp_tool_command, mcp_tool_id, normalize_mcp_server_id, seed_tool_local_dir_list,
+    seed_tool_local_file_read, seed_tool_rg,
 };
 use hc_capability::ModelDependence;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn default_catalog_exposes_builtin_tools() {
@@ -117,6 +119,61 @@ fn tool_repository_roundtrips_markdown_tool() {
         .cloned()
         .expect("custom tool should be present");
     assert_eq!(loaded, tool);
+}
+
+#[test]
+fn mcp_server_repository_roundtrips_markdown_server() {
+    let root = unique_temp_dir("mcp-server-repo");
+    let repository = McpServerRepository::new(&root);
+    let server = McpServerSpec {
+        id: "mcp.echo".to_owned(),
+        name: "Echo MCP".to_owned(),
+        description: "Exposes echo tools over MCP.".to_owned(),
+        command: vec!["python3".to_owned(), "echo_server.py".to_owned()],
+        tags: vec!["mcp".to_owned(), "echo".to_owned()],
+    };
+
+    let path = repository
+        .write_server(&server)
+        .expect("mcp server should write");
+    assert!(path.ends_with("mcp/servers/mcp.echo.md"));
+
+    let loaded = repository
+        .get_server("echo")
+        .expect("mcp server should load by short id");
+    assert_eq!(loaded, server);
+}
+
+#[test]
+fn mcp_tool_command_identity_is_structural() {
+    assert_eq!(normalize_mcp_server_id("echo"), "mcp.echo");
+    assert_eq!(
+        mcp_tool_id("mcp.echo", "say hello"),
+        "tool.mcp.echo.say-hello"
+    );
+    assert!(is_mcp_tool_command(&[
+        "hc.mcp.call".to_owned(),
+        "mcp.echo".to_owned(),
+        "say hello".to_owned()
+    ]));
+}
+
+#[test]
+fn mcp_discovery_times_out_when_server_does_not_respond() {
+    let server = McpServerSpec {
+        id: "mcp.sleepy".to_owned(),
+        name: "Sleepy MCP".to_owned(),
+        description: "Never responds during discovery.".to_owned(),
+        command: vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
+        tags: vec!["mcp".to_owned()],
+    };
+
+    let started = Instant::now();
+    let error = discover_mcp_tools_with_timeout(&server, Duration::from_millis(50))
+        .expect_err("discovery should time out");
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(error.to_string().contains("timed out"));
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

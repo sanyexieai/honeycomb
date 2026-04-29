@@ -1893,6 +1893,7 @@ dependencies = [
  "hc-capability",
  "hc-store",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

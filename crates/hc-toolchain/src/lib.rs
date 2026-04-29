@@ -4,9 +4,16 @@ use anyhow::{Context, Result, bail};
 use hc_capability::ModelDependence;
 use hc_store::store::{MarkdownQuery, StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +55,15 @@ pub struct ToolSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub command: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ToolFrontmatter {
     id: String,
     r#type: String,
@@ -59,6 +75,17 @@ struct ToolFrontmatter {
     stability: ToolStability,
     model_dependence: ModelDependence,
     default_command: Vec<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct McpServerFrontmatter {
+    id: String,
+    r#type: String,
+    title: String,
+    tenant_id: String,
+    user_id: String,
+    command: Vec<String>,
     tags: Vec<String>,
 }
 
@@ -259,6 +286,12 @@ pub struct ToolRepository {
     namespace: WorkspaceNamespace,
 }
 
+#[derive(Debug, Clone)]
+pub struct McpServerRepository {
+    store: WorkspaceStore,
+    namespace: WorkspaceNamespace,
+}
+
 impl ToolRepository {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self::with_namespace(root, WorkspaceNamespace::local_default())
@@ -320,6 +353,74 @@ impl ToolRepository {
         let mut catalog = ToolCatalog::new();
         catalog.register_many(self.list_tools()?);
         Ok(catalog)
+    }
+}
+
+impl McpServerRepository {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_namespace(root, WorkspaceNamespace::local_default())
+    }
+
+    pub fn with_namespace(root: impl Into<PathBuf>, namespace: WorkspaceNamespace) -> Self {
+        Self {
+            store: WorkspaceStore::new(root),
+            namespace,
+        }
+    }
+
+    pub fn relative_path_for(server: &McpServerSpec) -> PathBuf {
+        PathBuf::from("mcp")
+            .join("servers")
+            .join(format!("{}.md", server.id))
+    }
+
+    pub fn write_server(&self, server: &McpServerSpec) -> Result<PathBuf> {
+        validate_mcp_server_spec(server)?;
+        let frontmatter = McpServerFrontmatter::from_server(server, &self.namespace);
+        let body = render_mcp_server_body(server);
+        let path = self.store.write_markdown_in_namespace(
+            &self.namespace,
+            Self::relative_path_for(server),
+            &frontmatter,
+            &body,
+        )?;
+        let _ = self
+            .store
+            .rebuild_markdown_index_in_namespace(&self.namespace);
+        Ok(path)
+    }
+
+    pub fn read_server(&self, relative_path: impl AsRef<Path>) -> Result<McpServerSpec> {
+        let stored: StoredMarkdown<McpServerFrontmatter> = self
+            .store
+            .read_markdown_in_namespace(&self.namespace, relative_path)?;
+        McpServerSpec::from_document(stored.frontmatter, stored.body)
+    }
+
+    pub fn list_servers(&self) -> Result<Vec<McpServerSpec>> {
+        let _ = self
+            .store
+            .rebuild_markdown_index_in_namespace(&self.namespace);
+        let query = MarkdownQuery::default()
+            .with_path_prefix("mcp/servers/")
+            .with_limit(200);
+        let entries = self
+            .store
+            .query_markdown_index_in_namespace(&self.namespace, &query)?;
+        let mut servers = Vec::new();
+        for entry in entries {
+            servers.push(self.read_server(entry.relative_path)?);
+        }
+        servers.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(servers)
+    }
+
+    pub fn get_server(&self, server_id: &str) -> Result<McpServerSpec> {
+        let normalized = normalize_mcp_server_id(server_id);
+        self.list_servers()?
+            .into_iter()
+            .find(|server| server.id == normalized)
+            .with_context(|| format!("unknown mcp server: {normalized}"))
     }
 }
 
@@ -443,6 +544,42 @@ pub fn validate_tool_spec(tool: &ToolSpec) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_mcp_server_spec(server: &McpServerSpec) -> Result<()> {
+    if server.id.trim().is_empty() {
+        bail!("mcp server id cannot be empty");
+    }
+    if !server.id.starts_with("mcp.") {
+        bail!("mcp server id must start with mcp.");
+    }
+    if server.name.trim().is_empty() {
+        bail!("mcp server name cannot be empty");
+    }
+    if server.command.is_empty() {
+        bail!("mcp server {} does not define a command", server.id);
+    }
+    Ok(())
+}
+
+pub fn normalize_mcp_server_id(value: &str) -> String {
+    if value.starts_with("mcp.") {
+        value.to_owned()
+    } else {
+        format!("mcp.{value}")
+    }
+}
+
+pub fn mcp_tool_id(server_id: &str, tool_name: &str) -> String {
+    format!(
+        "tool.mcp.{}.{}",
+        slugify_tool_segment(server_id.trim_start_matches("mcp.")),
+        slugify_tool_segment(tool_name)
+    )
+}
+
+pub fn is_mcp_tool_command(command: &[String]) -> bool {
+    command.first().is_some_and(|token| token == "hc.mcp.call") && command.len() >= 3
+}
+
 pub fn builtin_tool(tool_id: &str) -> Option<ToolSpec> {
     default_tool_catalog().get_tool(tool_id)
 }
@@ -500,6 +637,21 @@ impl ToolSpec {
     }
 }
 
+impl McpServerSpec {
+    fn from_document(frontmatter: McpServerFrontmatter, body: String) -> Result<Self> {
+        let description = split_tool_body(&body);
+        let server = Self {
+            id: frontmatter.id,
+            name: frontmatter.title,
+            description,
+            command: frontmatter.command,
+            tags: frontmatter.tags,
+        };
+        validate_mcp_server_spec(&server)?;
+        Ok(server)
+    }
+}
+
 impl ToolFrontmatter {
     fn from_tool(tool: &ToolSpec, namespace: &WorkspaceNamespace) -> Self {
         Self {
@@ -518,8 +670,26 @@ impl ToolFrontmatter {
     }
 }
 
+impl McpServerFrontmatter {
+    fn from_server(server: &McpServerSpec, namespace: &WorkspaceNamespace) -> Self {
+        Self {
+            id: server.id.clone(),
+            r#type: "mcp_server".to_owned(),
+            title: server.name.clone(),
+            tenant_id: namespace.tenant_id.clone(),
+            user_id: namespace.user_id.clone(),
+            command: server.command.clone(),
+            tags: server.tags.clone(),
+        }
+    }
+}
+
 fn render_tool_body(tool: &ToolSpec) -> String {
     format!("# {}\n\n{}\n", tool.name, tool.description.trim())
+}
+
+fn render_mcp_server_body(server: &McpServerSpec) -> String {
+    format!("# {}\n\n{}\n", server.name, server.description.trim())
 }
 
 fn split_tool_body(body: &str) -> String {
@@ -589,6 +759,260 @@ fn default_tool_recovery_steps(tool: &ToolSpec) -> Vec<String> {
             vec!["Retry with a project-relative or absolute directory path.".to_owned()]
         }
         _ => vec!["Adjust arguments and rerun the tool if output is not actionable.".to_owned()],
+    }
+}
+
+pub fn discover_mcp_tools(server: &McpServerSpec) -> Result<Vec<ToolSpec>> {
+    discover_mcp_tools_with_timeout(server, DEFAULT_MCP_REQUEST_TIMEOUT)
+}
+
+pub fn discover_mcp_tools_with_timeout(
+    server: &McpServerSpec,
+    timeout: Duration,
+) -> Result<Vec<ToolSpec>> {
+    let mut session = McpStdioSession::start(server, timeout)?;
+    session.initialize()?;
+    let response = session.request("tools/list", json!({}))?;
+    let tools = response
+        .get("tools")
+        .and_then(Value::as_array)
+        .context("mcp tools/list response missed tools array")?;
+    let mut specs = Vec::new();
+    for tool in tools {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("MCP tool exposed by a configured server.");
+        let mut tags = vec![
+            "tool".to_owned(),
+            "mcp".to_owned(),
+            server.id.clone(),
+            slugify_tool_segment(name),
+        ];
+        tags.extend(server.tags.iter().cloned());
+        tags.sort();
+        tags.dedup();
+        specs.push(ToolSpec {
+            id: mcp_tool_id(&server.id, name),
+            name: format!("{} / {}", server.name, name),
+            description: description.to_owned(),
+            execution_kind: ToolExecutionKind::Service,
+            composition: ToolComposition::Atomic,
+            stability: ToolStability::Managed,
+            model_dependence: ModelDependence::Optional,
+            default_command: vec!["hc.mcp.call".to_owned(), server.id.clone(), name.to_owned()],
+            tags,
+        });
+    }
+    specs.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(specs)
+}
+
+pub fn call_mcp_tool(server: &McpServerSpec, tool_name: &str, arguments: Value) -> Result<Value> {
+    call_mcp_tool_with_timeout(server, tool_name, arguments, DEFAULT_MCP_REQUEST_TIMEOUT)
+}
+
+pub fn call_mcp_tool_with_timeout(
+    server: &McpServerSpec,
+    tool_name: &str,
+    arguments: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut session = McpStdioSession::start(server, timeout)?;
+    session.initialize()?;
+    session.request(
+        "tools/call",
+        json!({
+            "name": tool_name,
+            "arguments": arguments,
+        }),
+    )
+}
+
+struct McpStdioSession {
+    child: Child,
+    stdin: ChildStdin,
+    messages: mpsc::Receiver<Result<Value, String>>,
+    next_id: u64,
+    timeout: Duration,
+}
+
+impl McpStdioSession {
+    fn start(server: &McpServerSpec, timeout: Duration) -> Result<Self> {
+        validate_mcp_server_spec(server)?;
+        let program = server
+            .command
+            .first()
+            .context("mcp server command is empty")?;
+        let mut command = Command::new(program);
+        command.args(server.command.iter().skip(1));
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start mcp server command: {program}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("failed to open mcp server stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to open mcp server stdout")?;
+        let messages = spawn_mcp_stdout_reader(stdout);
+        Ok(Self {
+            child,
+            stdin,
+            messages,
+            next_id: 1,
+            timeout,
+        })
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "honeycomb",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        )?;
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(())
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+
+        loop {
+            let message = self.read_message()?;
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                bail!("mcp {method} failed: {error}");
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    fn write_message(&mut self, message: &Value) -> Result<()> {
+        let body = serde_json::to_vec(message).context("failed to serialize mcp message")?;
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())
+            .context("failed to write mcp header")?;
+        self.stdin
+            .write_all(&body)
+            .context("failed to write mcp body")?;
+        self.stdin.flush().context("failed to flush mcp stdin")?;
+        Ok(())
+    }
+
+    fn read_message(&mut self) -> Result<Value> {
+        match self.messages.recv_timeout(self.timeout) {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(message)) => bail!("{message}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("mcp request timed out after {:?}", self.timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("mcp server stdout reader stopped")
+            }
+        }
+    }
+}
+
+fn spawn_mcp_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<Result<Value, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let message =
+                read_mcp_message_from_stdout(&mut stdout).map_err(|error| error.to_string());
+            let should_continue = message.is_ok();
+            if sender.send(message).is_err() || !should_continue {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn read_mcp_message_from_stdout(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let read = stdout
+            .read_line(&mut line)
+            .context("failed to read mcp header")?;
+        if read == 0 {
+            bail!("mcp server closed stdout while reading headers");
+        }
+        let header = line.trim_end_matches(['\r', '\n']);
+        if header.is_empty() {
+            break;
+        }
+        if let Some(value) = header.strip_prefix("Content-Length:") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid mcp content length")?,
+            );
+        }
+    }
+    let content_length = content_length.context("mcp message missed Content-Length header")?;
+    let mut body = vec![0; content_length];
+    stdout
+        .read_exact(&mut body)
+        .context("failed to read mcp body")?;
+    serde_json::from_slice(&body).context("failed to parse mcp message")
+}
+
+impl Drop for McpStdioSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn slugify_tool_segment(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-').to_owned();
+    if trimmed.is_empty() {
+        "tool".to_owned()
+    } else {
+        trimmed
     }
 }
 

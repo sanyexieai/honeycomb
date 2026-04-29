@@ -24,9 +24,10 @@ use hc_llm::{
 use hc_skill::{SkillProfile, SkillRepository};
 use hc_store::store::WorkspaceNamespace;
 use hc_toolchain::{
-    CommandToolExecutor, ToolCatalog, ToolComposition, ToolExecutionKind, ToolExecutionOutcome,
-    ToolExecutor, ToolRepository, ToolSpec, ToolStability, build_default_tool_execution_plan,
-    default_tool_catalog,
+    CommandToolExecutor, McpServerRepository, McpServerSpec, ToolCatalog, ToolComposition,
+    ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository, ToolSpec, ToolStability,
+    build_default_tool_execution_plan, call_mcp_tool, default_tool_catalog, discover_mcp_tools,
+    is_mcp_tool_command, normalize_mcp_server_id,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::Deserialize;
@@ -52,6 +53,16 @@ struct CreateOptions {
     name: String,
     description: String,
     execution_kind: ToolExecutionKind,
+    command: Vec<String>,
+    tags: Vec<String>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct McpAddOptions {
+    id: String,
+    name: String,
+    description: String,
     command: Vec<String>,
     tags: Vec<String>,
     json: bool,
@@ -197,6 +208,7 @@ fn main() -> Result<()> {
         [cmd, rest @ ..] if cmd == "show" => handle_show(rest),
         [cmd, rest @ ..] if cmd == "plan" => handle_plan(rest),
         [cmd, rest @ ..] if cmd == "run" => handle_run(rest),
+        [cmd, rest @ ..] if cmd == "mcp" => handle_mcp(rest),
         [other, ..] => bail!("unknown command: {other}"),
     }
 }
@@ -320,6 +332,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 println!(
                     "/create-tool <id> <name> --description <text> --command <token> [--command <token>] [--tag <tag>]"
                 );
+                println!("/mcp add|list|tools|call ...");
                 println!(
                     "chat options: --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
                 );
@@ -613,6 +626,109 @@ fn handle_create_from_chat(input: &str) -> Result<PathBuf> {
     tool_repository().write_tool(&tool)
 }
 
+fn handle_mcp(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "add" => handle_mcp_add(rest),
+        [cmd, rest @ ..] if cmd == "list" => handle_mcp_list(rest),
+        [cmd, rest @ ..] if cmd == "tools" => handle_mcp_tools(rest),
+        [cmd, rest @ ..] if cmd == "call" => handle_mcp_call(rest),
+        [] => bail!("usage: hc-tool-cli mcp <add|list|tools|call> ..."),
+        [other, ..] => bail!("unknown mcp command: {other}"),
+    }
+}
+
+fn handle_mcp_add(args: &[String]) -> Result<()> {
+    let options = parse_mcp_add_options(args)?;
+    let server = McpServerSpec {
+        id: normalize_mcp_server_id(&options.id),
+        name: options.name,
+        description: options.description,
+        command: options.command,
+        tags: normalized_tags(options.tags, "mcp"),
+    };
+    let path = mcp_server_repository().write_server(&server)?;
+
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "server": server,
+                "path": path,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("mcp> {}", server.id);
+    println!("path> {}", path.display());
+    println!("command> {}", server.command.join(" "));
+    Ok(())
+}
+
+fn handle_mcp_list(args: &[String]) -> Result<()> {
+    let options = parse_common_options(args)?;
+    let servers = mcp_server_repository().list_servers()?;
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&servers)?);
+        return Ok(());
+    }
+    for server in servers {
+        println!(
+            "{} | {} | {}",
+            server.id,
+            server.name,
+            server.command.join(" ")
+        );
+    }
+    Ok(())
+}
+
+fn handle_mcp_tools(args: &[String]) -> Result<()> {
+    let options = parse_common_options(args)?;
+    let servers = mcp_server_repository().list_servers()?;
+    let mut tools = Vec::new();
+    for server in servers {
+        tools.extend(discover_mcp_tools(&server)?);
+    }
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&tools)?);
+        return Ok(());
+    }
+    for tool in tools {
+        println!("{} | {} | {}", tool.id, tool.name, tool.description);
+    }
+    Ok(())
+}
+
+fn handle_mcp_call(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        bail!("usage: hc-tool-cli mcp call <server-id> <tool-name> [key=value ...] [--json]");
+    }
+    let mut json_output = false;
+    let server_id = args[0].clone();
+    let tool_name = args[1].clone();
+    let mut call_args = Vec::new();
+    for arg in &args[2..] {
+        if arg == "--json" {
+            json_output = true;
+        } else {
+            call_args.push(arg.clone());
+        }
+    }
+    let server = mcp_server_repository().get_server(&server_id)?;
+    let result = call_mcp_tool(
+        &server,
+        &tool_name,
+        serde_json::Value::Object(arguments_from_run_args(&call_args, None)?),
+    )?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_mcp_result(&result);
+    }
+    Ok(())
+}
+
 fn handle_natural_language_tool_create(
     registry: &ProviderRegistry,
     provider: &str,
@@ -827,7 +943,9 @@ fn execute_resolved_tool(
         validation_steps: plan.validation_steps.clone(),
         recovery_steps: plan.recovery_steps.clone(),
     };
-    let atomic_outcome =
+    let atomic_outcome = if is_mcp_tool_command(&delegated_tool.default_command) {
+        execute_mcp_tool(&delegated_tool, &delegated_plan, &options, &goal)?
+    } else {
         match execute_builtin_tool(&delegated_tool, &delegated_plan, &options, &goal)? {
             Some(outcome) => outcome,
             None => {
@@ -837,7 +955,8 @@ fn execute_resolved_tool(
                 };
                 executor.execute(&delegated_plan, &goal)?
             }
-        };
+        }
+    };
     let outcome = if delegated_tool.id != tool.id {
         atomic_outcome.wrapped_by(tool.id.clone())
     } else {
@@ -956,6 +1075,46 @@ fn execute_builtin_tool(
         "hc.local-dir.list" => execute_local_dir_list(plan, options, goal).map(Some),
         _ => bail!("unsupported builtin tool command: {token}"),
     }
+}
+
+fn execute_mcp_tool(
+    tool: &ToolSpec,
+    plan: &hc_toolchain::ToolExecutionPlan,
+    options: &RunOptions,
+    goal: &str,
+) -> Result<ToolExecutionOutcome> {
+    let server_id = tool
+        .default_command
+        .get(1)
+        .context("mcp tool command missed server id")?;
+    let tool_name = tool
+        .default_command
+        .get(2)
+        .context("mcp tool command missed tool name")?;
+    let server = mcp_server_repository().get_server(server_id)?;
+    let arguments = serde_json::Value::Object(arguments_from_run_args(
+        &options.args,
+        options.content.as_deref(),
+    )?);
+    let result = call_mcp_tool(&server, tool_name, arguments)?;
+    let success = !result
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(ToolExecutionOutcome {
+        tool_id: plan.tool_id.clone(),
+        parent_tool_id: None,
+        invoked_tool_ids: Vec::new(),
+        goal: goal.to_owned(),
+        command: plan.suggested_command.clone(),
+        success,
+        summary: if success {
+            "mcp tool call completed".to_owned()
+        } else {
+            "mcp tool call returned an error result".to_owned()
+        },
+        observations: mcp_result_observations(&result),
+    })
 }
 
 fn execute_local_file_read(
@@ -1108,6 +1267,60 @@ fn resolve_run_file_path(base: Option<&Path>, path_arg: &str) -> Result<PathBuf>
     Ok(base.join(path))
 }
 
+fn arguments_from_run_args(
+    args: &[String],
+    content: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut arguments = serde_json::Map::new();
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            bail!("mcp arguments must use key=value form: {arg}");
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("mcp argument key cannot be empty");
+        }
+        arguments.insert(key.to_owned(), parse_jsonish_argument_value(value));
+    }
+    if let Some(content) = content {
+        arguments.insert(
+            "content".to_owned(),
+            serde_json::Value::String(content.to_owned()),
+        );
+    }
+    Ok(arguments)
+}
+
+fn parse_jsonish_argument_value(value: &str) -> serde_json::Value {
+    serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_owned()))
+}
+
+fn mcp_result_observations(result: &serde_json::Value) -> Vec<String> {
+    let mut observations = Vec::new();
+    if let Some(content) = result.get("content").and_then(serde_json::Value::as_array) {
+        for item in content.iter().take(40) {
+            if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                observations.push(format!("text: {text}"));
+            } else {
+                observations.push(format!("content: {item}"));
+            }
+        }
+        if content.len() > 40 {
+            observations.push("content: ... truncated".to_owned());
+        }
+    }
+    if observations.is_empty() {
+        observations.push(format!("result: {result}"));
+    }
+    observations
+}
+
+fn print_mcp_result(result: &serde_json::Value) {
+    for observation in mcp_result_observations(result) {
+        println!("mcp> {observation}");
+    }
+}
+
 fn parse_create_options(args: &[String]) -> Result<CreateOptions> {
     if args.len() < 2 {
         bail!(
@@ -1185,11 +1398,62 @@ fn parse_create_options(args: &[String]) -> Result<CreateOptions> {
     })
 }
 
-fn tool_from_create_options(options: &CreateOptions) -> Result<ToolSpec> {
-    let mut tags = options.tags.clone();
-    if !tags.iter().any(|tag| tag == "tool") {
-        tags.push("tool".to_owned());
+fn parse_mcp_add_options(args: &[String]) -> Result<McpAddOptions> {
+    if args.len() < 2 {
+        bail!(
+            "usage: hc-tool-cli mcp add <server-id> <name> --description <text> --command <token> [--command <token>] [--tag <tag>] [--json]"
+        );
     }
+
+    let mut options = McpAddOptions {
+        id: args[0].clone(),
+        name: args[1].clone(),
+        ..McpAddOptions::default()
+    };
+    let mut index = 2usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--description" => {
+                options.description = args
+                    .get(index + 1)
+                    .cloned()
+                    .context("missing value for --description")?;
+                index += 2;
+            }
+            "--command" => {
+                options.command.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --command")?,
+                );
+                index += 2;
+            }
+            "--tag" => {
+                options.tags.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tag")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                options.json = true;
+                index += 1;
+            }
+            other => bail!("unexpected argument for mcp add: {other}"),
+        }
+    }
+    if options.description.trim().is_empty() {
+        bail!("missing --description for mcp add");
+    }
+    if options.command.is_empty() {
+        bail!("missing --command for mcp add");
+    }
+    Ok(options)
+}
+
+fn tool_from_create_options(options: &CreateOptions) -> Result<ToolSpec> {
+    let tags = normalized_tags(options.tags.clone(), "tool");
 
     let tool = ToolSpec {
         id: options.id.clone(),
@@ -1204,6 +1468,15 @@ fn tool_from_create_options(options: &CreateOptions) -> Result<ToolSpec> {
     };
     hc_toolchain::validate_tool_spec(&tool)?;
     Ok(tool)
+}
+
+fn normalized_tags(mut tags: Vec<String>, required: &str) -> Vec<String> {
+    if !tags.iter().any(|tag| tag == required) {
+        tags.push(required.to_owned());
+    }
+    tags.sort();
+    tags.dedup();
+    tags
 }
 
 fn tool_from_natural_language_draft(draft: NaturalLanguageToolDraft) -> Result<ToolSpec> {
@@ -1736,6 +2009,14 @@ fn load_cli_tool_catalog() -> Result<ToolCatalog> {
     if let Ok(custom_catalog) = tool_repository().load_catalog() {
         catalog.register_provider(&custom_catalog);
     }
+    if let Ok(servers) = mcp_server_repository().list_servers() {
+        for server in servers {
+            match discover_mcp_tools(&server) {
+                Ok(tools) => catalog.register_many(tools),
+                Err(error) => eprintln!("warning> mcp discovery skipped {}: {error}", server.id),
+            }
+        }
+    }
     if let Ok(skill_catalog) = skill_repository().load_catalog() {
         catalog.register_provider(&skill_catalog);
     }
@@ -1744,6 +2025,10 @@ fn load_cli_tool_catalog() -> Result<ToolCatalog> {
 
 fn tool_repository() -> ToolRepository {
     ToolRepository::with_namespace(workspace_root(), runtime_namespace())
+}
+
+fn mcp_server_repository() -> McpServerRepository {
+    McpServerRepository::with_namespace(workspace_root(), runtime_namespace())
 }
 
 fn skill_repository() -> SkillRepository {
@@ -2393,6 +2678,12 @@ fn print_help() {
         "hc-tool-cli create <tool-id> <name> --description <text> --command <token> [--command <token>] [--kind <cli|builtin|script|workflow|service>] [--tag <tag>] [--json]"
     );
     println!("hc-tool-cli list [--json]");
+    println!(
+        "hc-tool-cli mcp add <server-id> <name> --description <text> --command <token> [--command <token>] [--tag <tag>] [--json]"
+    );
+    println!("hc-tool-cli mcp list [--json]");
+    println!("hc-tool-cli mcp tools [--json]");
+    println!("hc-tool-cli mcp call <server-id> <tool-name> [key=value ...] [--json]");
     println!("hc-tool-cli show <rg|cargo-test|tool-id> [--json]");
     println!("hc-tool-cli plan <auto|rg|cargo-test|tool-id> <goal...> [--json]");
     println!(
