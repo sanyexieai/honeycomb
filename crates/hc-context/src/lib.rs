@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1243,7 +1244,14 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             if !entry.relative_path.starts_with("memory/") || entry.doc_type != "memory" {
                 continue;
             }
-            let record = repository.read_record(&entry.relative_path)?;
+            let record = match repository.read_record(&entry.relative_path) {
+                Ok(record) => record,
+                Err(error) if is_not_found_error(&error) => {
+                    trace_stats.record_entry_missing += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             trace_stats.record_reads += 1;
             catalog.insert(record);
         }
@@ -1280,7 +1288,14 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
                 trace_stats.room_entry_prefiltered += 1;
                 continue;
             }
-            let asset = room_repository.read_asset(&entry.relative_path)?;
+            let asset = match room_repository.read_asset(&entry.relative_path) {
+                Ok(asset) => asset,
+                Err(error) if is_not_found_error(&error) => {
+                    trace_stats.room_entry_missing += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             trace_stats.room_asset_reads += 1;
             let mut retrieved = RetrievedMemory::from(&asset);
             if let Some(boost) = room_candidate_boosts.get(&asset.room_id) {
@@ -1292,6 +1307,26 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             if room_asset_matches_query(query, &asset, &retrieved) {
                 seen_match_ids.insert(retrieved.id.clone());
                 matches.push(retrieved);
+            }
+        }
+
+        if should_auto_include_global_preferences(query) {
+            for entry in global_preference_room_asset_entries(&markdown_index) {
+                if seen_match_ids.contains(&entry.id) {
+                    continue;
+                }
+                let asset = match room_repository.read_asset(&entry.relative_path) {
+                    Ok(asset) => asset,
+                    Err(error) if is_not_found_error(&error) => {
+                        trace_stats.room_entry_missing += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let retrieved = RetrievedMemory::from(&asset);
+                seen_match_ids.insert(retrieved.id.clone());
+                matches.push(retrieved);
+                trace_stats.global_preference_reads += 1;
             }
         }
 
@@ -1353,10 +1388,13 @@ struct MemoryRecallTraceStats {
     index_documents: usize,
     room_candidate_count: usize,
     record_entry_candidates: usize,
+    record_entry_missing: usize,
     record_reads: usize,
     room_entry_candidates: usize,
     room_entry_prefiltered: usize,
+    room_entry_missing: usize,
     room_asset_reads: usize,
+    global_preference_reads: usize,
     anchor_room_asset_reads: usize,
     returned_count: usize,
     cache_hit: bool,
@@ -1385,6 +1423,10 @@ fn emit_memory_recall_trace(
             "record_entry_candidates",
             stats.record_entry_candidates.to_string(),
         )
+        .with_field(
+            "record_entry_missing",
+            stats.record_entry_missing.to_string(),
+        )
         .with_field("record_reads", stats.record_reads.to_string())
         .with_field(
             "room_entry_candidates",
@@ -1394,7 +1436,12 @@ fn emit_memory_recall_trace(
             "room_entry_prefiltered",
             stats.room_entry_prefiltered.to_string(),
         )
+        .with_field("room_entry_missing", stats.room_entry_missing.to_string())
         .with_field("room_asset_reads", stats.room_asset_reads.to_string())
+        .with_field(
+            "global_preference_reads",
+            stats.global_preference_reads.to_string(),
+        )
         .with_field(
             "anchor_room_asset_reads",
             stats.anchor_room_asset_reads.to_string(),
@@ -1409,6 +1456,54 @@ fn emit_memory_recall_trace(
         .with_field("limit", query.limit.unwrap_or_default().to_string())
         .with_field("room_anchor_count", query.room_anchor_ids.len().to_string()),
     );
+}
+
+fn global_preference_room_asset_entries(markdown_index: &MarkdownIndex) -> Vec<MarkdownIndexEntry> {
+    let mut entries = markdown_index
+        .documents
+        .iter()
+        .filter(|entry| {
+            entry.relative_path.starts_with("memory/rooms/")
+                && entry.doc_type == "memory_room_asset"
+                && entry.layer.as_deref() == Some("global")
+                && entry.memory_kind.as_deref() == Some("preference")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.relative_path
+            .cmp(&right.relative_path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entries
+}
+
+fn should_auto_include_global_preferences(query: &ContextMemoryQuery) -> bool {
+    let scope_allows = query
+        .memory_query
+        .scope
+        .as_ref()
+        .is_none_or(|scope| matches!(scope, MemoryScope::Global));
+    let kind_allows = query
+        .memory_query
+        .kind
+        .as_ref()
+        .is_none_or(|kind| matches!(kind, MemoryKind::Preference));
+    let tag_allows = query.memory_query.tag.as_ref().is_none_or(|tag| {
+        matches!(
+            tag.as_str(),
+            "global" | "preference" | "identity" | "assistant-name"
+        )
+    });
+    scope_allows && kind_allows && tag_allows
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::NotFound)
+    })
 }
 
 const MEMORY_RECALL_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -4046,9 +4141,11 @@ pub fn persist_global_preference_from_chat_input(
             .with_owner(MemoryOwnerRef::session(chat_room_id.to_owned()));
     }
 
-    let Some((summary, memory_kind)) =
-        summarize_global_preference_with_llm(registry, model, &input)?
-    else {
+    let Some((summary, memory_kind)) = summarize_global_preference(&input).or_else(|| {
+        summarize_global_preference_with_llm(registry, model, &input)
+            .ok()
+            .flatten()
+    }) else {
         return Ok(Vec::new());
     };
     if memory_kind != MemoryKind::Preference {
@@ -4061,6 +4158,7 @@ pub fn persist_global_preference_from_chat_input(
     if file_slug.is_empty() {
         return Ok(Vec::new());
     }
+    let is_assistant_name_preference = is_assistant_name_preference_summary(&summary);
     let mut write_request = RoomMemoryWriteRequest::new(
         room_id.clone(),
         MemoryLayer::Global,
@@ -4074,6 +4172,11 @@ pub fn persist_global_preference_from_chat_input(
     .with_tag("preference")
     .with_file_name(format!("pref.{}.md", file_slug))
     .with_asset_id(format!("asset.{}.{}", room_id, file_slug));
+    if is_assistant_name_preference {
+        write_request = write_request
+            .with_tag("identity")
+            .with_tag("assistant-name");
+    }
 
     if let Some(chat_room_id) = chat_room_id {
         write_request = write_request.with_derived_from(chat_room_id);
@@ -4084,6 +4187,18 @@ pub fn persist_global_preference_from_chat_input(
         workspace_namespace,
         &write_request,
     )?])
+}
+
+fn is_assistant_name_preference_summary(summary: &str) -> bool {
+    let lowered = summary.to_ascii_lowercase();
+    contains_any(
+        &lowered,
+        &[
+            "assistant to be called",
+            "assistant's name",
+            "call the assistant",
+        ],
+    )
 }
 
 #[derive(Debug, Clone)]

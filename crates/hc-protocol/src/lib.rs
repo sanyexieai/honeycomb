@@ -1,5 +1,7 @@
 //! Shared protocol types and traits for Honeycomb.
 
+use serde::{Deserialize, Serialize};
+
 pub mod protocol {
     //! Stable schemas shared across runtime, storage, and UI layers.
 
@@ -7,4 +9,116 @@ pub mod protocol {
     pub trait RecordId {
         fn id(&self) -> &str;
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiMessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiChatMessage {
+    pub role: ApiMessageRole,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiNamespace {
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
+    #[serde(default = "default_user_id")]
+    pub user_id: String,
+}
+
+impl Default for ApiNamespace {
+    fn default() -> Self {
+        Self {
+            tenant_id: default_tenant_id(),
+            user_id: default_user_id(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ApiMemoryQuery {
+    #[serde(default)]
+    pub namespace: ApiNamespace,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<ApiChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub memory: ApiMemoryQuery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryRef {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub scope: String,
+    pub kind: String,
+    pub source_kind: String,
+    pub confidence_milli: u16,
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatResponse {
+    pub message: ApiChatMessage,
+    pub model: String,
+    pub provider: String,
+    pub recalled_memories: Vec<MemoryRef>,
+    pub synthesized_prompt_asset_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthResponse {
+    pub status: String,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+fn default_tenant_id() -> String {
+    "local".to_owned()
+}
+
+fn default_user_id() -> String {
+    "default".to_owned()
 }

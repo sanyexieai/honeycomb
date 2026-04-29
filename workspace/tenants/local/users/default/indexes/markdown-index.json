@@ -1,15 +1,69 @@
 {
-  "generated_at_ms": 1777445628084,
+  "generated_at_ms": 1777449088469,
   "namespace": {
     "tenant_id": "local",
     "user_id": "default"
   },
   "documents": [
     {
-      "id": "asset.room.chat.local.default.1777445542412.turn.1.assistant",
+      "id": "asset.room.chat.local.default.1777447903807.turn.1.assistant.wenyan",
+      "doc_type": "memory_room_asset",
+      "title": "Assistant Wenyan 1",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/literary/0001.assistant-wenyan.md",
+      "tags": [
+        "chat",
+        "assistant",
+        "wenyan"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [
+        "room.chat.local.default.1777447903807"
+      ],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777447903807",
+      "layer": "chat",
+      "memory_kind": "summary",
+      "asset_kind": "literary",
+      "body_preview": "余乃DeepSeek，深度求索所创。幸会！有何见教？"
+    },
+    {
+      "id": "asset.room.chat.local.default.1777447903807.turn.2.assistant.wenyan",
+      "doc_type": "memory_room_asset",
+      "title": "Assistant Wenyan 2",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/literary/0002.assistant-wenyan.md",
+      "tags": [
+        "chat",
+        "assistant",
+        "wenyan"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [
+        "room.chat.local.default.1777447903807"
+      ],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777447903807",
+      "layer": "chat",
+      "memory_kind": "summary",
+      "asset_kind": "literary",
+      "body_preview": "诺，吾记之。自今呼为小八。有事但令，小八常侍。"
+    },
+    {
+      "id": "asset.room.chat.local.default.1777447903807.turn.1.assistant",
       "doc_type": "memory_room_asset",
       "title": "Assistant Reply 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/raw/0001.assistant.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/raw/0001.assistant.md",
       "tags": [
         "chat",
         "assistant"
@@ -22,20 +76,20 @@
       "updated_at": null,
       "relations": [],
       "owners": [
-        "room.chat.local.default.1777445542412"
+        "room.chat.local.default.1777447903807"
       ],
       "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
+      "room_id": "room.chat.local.default.1777447903807",
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "我叫 Honeycomb，是你的工具助手！有什么可以帮你的吗？😊"
+      "body_preview": "你好！我是DeepSeek，由深度求索公司创造的AI助手。很高兴认识你！有什么可以帮助你的吗？😊"
     },
     {
-      "id": "asset.room.chat.local.default.1777445542412.turn.1.user",
+      "id": "asset.room.chat.local.default.1777447903807.turn.1.user",
       "doc_type": "memory_room_asset",
       "title": "User Message 1",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/raw/0001.user.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/raw/0001.user.md",
       "tags": [
         "chat",
         "user"
@@ -48,20 +102,20 @@
       "updated_at": null,
       "relations": [],
       "owners": [
-        "room.chat.local.default.1777445542412"
+        "room.chat.local.default.1777447903807"
       ],
       "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
+      "room_id": "room.chat.local.default.1777447903807",
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
       "body_preview": "你叫什么"
     },
     {
-      "id": "asset.room.chat.local.default.1777445542412.turn.2.assistant",
+      "id": "asset.room.chat.local.default.1777447903807.turn.2.assistant",
       "doc_type": "memory_room_asset",
       "title": "Assistant Reply 2",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/raw/0002.assistant.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/raw/0002.assistant.md",
       "tags": [
         "chat",
         "assistant"
@@ -74,20 +128,20 @@
       "updated_at": null,
       "relations": [],
       "owners": [
-        "room.chat.local.default.1777445542412"
+        "room.chat.local.default.1777447903807"
       ],
       "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
+      "room_id": "room.chat.local.default.1777447903807",
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "好的，以后我就叫**小八**了！有什么需要帮忙的尽管说～ 😊"
+      "body_preview": "好的，我记住了！以后我就叫小八啦～有什么事情随时吩咐，小八随时在线！🐙✨"
     },
     {
-      "id": "asset.room.chat.local.default.1777445542412.turn.2.user",
+      "id": "asset.room.chat.local.default.1777447903807.turn.2.user",
       "doc_type": "memory_room_asset",
       "title": "User Message 2",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/raw/0002.user.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/raw/0002.user.md",
       "tags": [
         "chat",
         "user"
@@ -100,46 +154,20 @@
       "updated_at": null,
       "relations": [],
       "owners": [
-        "room.chat.local.default.1777445542412"
+        "room.chat.local.default.1777447903807"
       ],
       "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
+      "room_id": "room.chat.local.default.1777447903807",
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "你以后叫小八"
+      "body_preview": "以后你叫小八 记住了吗"
     },
     {
-      "id": "asset.room.chat.local.default.1777445542412.turn.3.user",
-      "doc_type": "memory_room_asset",
-      "title": "User Message 3",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/raw/0003.user.md",
-      "tags": [
-        "chat",
-        "user"
-      ],
-      "status": null,
-      "visibility": "private",
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [
-        "room.chat.local.default.1777445542412"
-      ],
-      "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
-      "layer": "chat",
-      "memory_kind": "summary",
-      "asset_kind": "raw",
-      "body_preview": "你叫什么"
-    },
-    {
-      "id": "room.chat.local.default.1777445542412",
+      "id": "room.chat.local.default.1777447903807",
       "doc_type": "memory_room",
       "title": "Chat Session",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/room.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/room.md",
       "tags": [
         "chat",
         "session"
@@ -153,22 +181,23 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
+      "room_id": "room.chat.local.default.1777447903807",
       "layer": "chat",
       "memory_kind": null,
       "asset_kind": null,
-      "body_preview": "# Chat Session Captured chat turns for context recall. ## Manifest - room: room.chat.local.default.1777445542412 - layer: chat - status: active ## Objects - sou..."
+      "body_preview": "# Chat Session Captured chat turns for context recall. ## Manifest - room: room.chat.local.default.1777447903807 - layer: chat - status: active ## Objects - sou..."
     },
     {
-      "id": "asset.room.chat.local.default.1777445542412.timeline",
+      "id": "asset.room.chat.local.default.1777447903807.timeline",
       "doc_type": "memory_room_asset",
       "title": "Chat Session Timeline",
-      "relative_path": "memory/rooms/chat/room.chat.local.default.1777445542412/timeline.md",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777447903807/timeline.md",
       "tags": [
         "timeline",
         "event",
         "chat",
-        "user"
+        "assistant",
+        "wenyan"
       ],
       "status": null,
       "visibility": "private",
@@ -179,17 +208,143 @@
       "relations": [],
       "owners": [],
       "capabilities": [],
-      "room_id": "room.chat.local.default.1777445542412",
+      "room_id": "room.chat.local.default.1777447903807",
       "layer": "chat",
       "memory_kind": "workflow_memory",
       "asset_kind": "timeline",
-      "body_preview": "### Created - event: event.asset.room.chat.local.default.1777445542412.turn.1.user.created.1777445567406 - artifact: asset.room.chat.local.default.1777445542412..."
+      "body_preview": "### Created - event: event.asset.room.chat.local.default.1777447903807.turn.1.user.created.1777447949032 - artifact: asset.room.chat.local.default.1777447903807..."
     },
     {
-      "id": "asset.room.global.local.default.user.prefers.the.assistant.to.be.called",
+      "id": "asset.room.chat.local.default.1777448613720.turn.1.assistant",
+      "doc_type": "memory_room_asset",
+      "title": "Assistant Reply 1",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777448613720/raw/0001.assistant.md",
+      "tags": [
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [
+        "room.chat.local.default.1777448613720"
+      ],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777448613720",
+      "layer": "chat",
+      "memory_kind": "summary",
+      "asset_kind": "raw",
+      "body_preview": "我叫 Honeycomb 助手，你可以叫我 Honey。有什么需要帮忙的吗？"
+    },
+    {
+      "id": "asset.room.chat.local.default.1777448613720.turn.1.user",
+      "doc_type": "memory_room_asset",
+      "title": "User Message 1",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777448613720/raw/0001.user.md",
+      "tags": [
+        "chat",
+        "user"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [
+        "room.chat.local.default.1777448613720"
+      ],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777448613720",
+      "layer": "chat",
+      "memory_kind": "summary",
+      "asset_kind": "raw",
+      "body_preview": "你叫什么"
+    },
+    {
+      "id": "room.chat.local.default.1777448613720",
+      "doc_type": "memory_room",
+      "title": "Chat Session",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777448613720/room.md",
+      "tags": [
+        "chat",
+        "session"
+      ],
+      "status": "active",
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777448613720",
+      "layer": "chat",
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "# Chat Session Captured chat turns for context recall. ## Manifest - room: room.chat.local.default.1777448613720 - layer: chat - status: active ## Objects - sou..."
+    },
+    {
+      "id": "asset.room.chat.local.default.1777448613720.timeline",
+      "doc_type": "memory_room_asset",
+      "title": "Chat Session Timeline",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777448613720/timeline.md",
+      "tags": [
+        "timeline",
+        "event",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777448613720",
+      "layer": "chat",
+      "memory_kind": "workflow_memory",
+      "asset_kind": "timeline",
+      "body_preview": "### Created - event: event.asset.room.chat.local.default.1777448613720.turn.1.user.created.1777448623009 - artifact: asset.room.chat.local.default.1777448613720..."
+    },
+    {
+      "id": "room.chat.local.default.1777449084860",
+      "doc_type": "memory_room",
+      "title": "Chat Session",
+      "relative_path": "memory/rooms/chat/room.chat.local.default.1777449084860/room.md",
+      "tags": [
+        "chat",
+        "session"
+      ],
+      "status": "active",
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "room.chat.local.default.1777449084860",
+      "layer": "chat",
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "# Chat Session Captured chat turns for context recall. ## Manifest - room: room.chat.local.default.1777449084860 - layer: chat - status: active"
+    },
+    {
+      "id": "asset.room.global.local.default.assistant.s.name.is.set.to",
       "doc_type": "memory_room_asset",
       "title": "Global Preference",
-      "relative_path": "memory/rooms/global/room.global.local.default/compressed/pref.user.prefers.the.assistant.to.be.called.md",
+      "relative_path": "memory/rooms/global/room.global.local.default/compressed/pref.assistant.s.name.is.set.to.md",
       "tags": [
         "global",
         "preference"
@@ -209,7 +364,7 @@
       "layer": "global",
       "memory_kind": "preference",
       "asset_kind": "compressed",
-      "body_preview": "User prefers the assistant to be called 小八."
+      "body_preview": "Assistant's name is set to '小八'."
     },
     {
       "id": "room.global.local.default",
@@ -230,7 +385,35 @@
       "layer": "global",
       "memory_kind": null,
       "asset_kind": null,
-      "body_preview": "# Global Preference User prefers the assistant to be called 小八. ## Manifest - room: room.global.local.default - layer: global - status: active ## Objects - deri..."
+      "body_preview": "# Global Preference Assistant's name is set to '小八'. ## Manifest - room: room.global.local.default - layer: global - status: active ## Objects - derived: compre..."
+    },
+    {
+      "id": "prompt.rewrite.assistant-wenyan",
+      "doc_type": "memory_room_asset",
+      "title": "Assistant Wenyan Rewrite",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/assistant-wenyan.md",
+      "tags": [
+        "managed_prompt",
+        "current",
+        "rewrite",
+        "rewrite",
+        "wenyan",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
+      "body_preview": "Translate the assistant answer into concise classical Chinese. Return only the classical Chinese text, with no explanation."
     },
     {
       "id": "prompt.summarize.global-preference",
@@ -289,17 +472,17 @@
       "body_preview": "Follow the provided local prompt asset. Return JSON only."
     },
     {
-      "id": "prompt.tool.natural-language-builder",
+      "id": "prompt.context.lightweight-chat",
       "doc_type": "memory_room_asset",
-      "title": "Natural Language Tool Builder",
-      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/natural-language-tool-builder.md",
+      "title": "Context Lightweight Chat",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/lightweight-chat.md",
       "tags": [
         "managed_prompt",
         "current",
-        "tool_builder",
-        "tool",
-        "builder",
-        "json"
+        "context_lightweight_chat",
+        "context",
+        "chat",
+        "lightweight"
       ],
       "status": null,
       "visibility": "private",
@@ -314,20 +497,20 @@
       "layer": "project",
       "memory_kind": "preference",
       "asset_kind": "compressed",
-      "body_preview": "Convert a user's natural-language request into a Honeycomb tool or skill definition. Return only one JSON object. Do not use markdown fences. Schema: ```json { ..."
+      "body_preview": "For brief greetings, reply warmly and concisely without recalling long-term memory unless the user asks for something substantive."
     },
     {
-      "id": "prompt.tool.chat-assistant.rev.1777360571831",
+      "id": "prompt.organizer.memory",
       "doc_type": "memory_room_asset",
-      "title": "Tool Chat Assistant Revision 1777360571831",
-      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777360571831.tool-chat-assistant.md",
+      "title": "Memory Organizer",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/memory-organizer.md",
       "tags": [
         "managed_prompt",
-        "revision",
-        "tool_chat",
-        "tool",
-        "chat",
-        "assistant"
+        "current",
+        "organizer",
+        "memory",
+        "organizer",
+        "routing"
       ],
       "status": null,
       "visibility": "private",
@@ -342,20 +525,20 @@
       "layer": "project",
       "memory_kind": "preference",
       "asset_kind": "compressed",
-      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+      "body_preview": "Decide how to organize this memory write. Honor any explicit `room_id_hint`, `room_layer_hint`, `owner`, `visibility`, and existing `tags` when they are present..."
     },
     {
-      "id": "prompt.tool.chat-assistant.rev.1777360925967",
+      "id": "prompt.context.memory-system",
       "doc_type": "memory_room_asset",
-      "title": "Tool Chat Assistant Revision 1777360925967",
-      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777360925967.tool-chat-assistant.md",
+      "title": "Context Memory System",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/memory-system.md",
       "tags": [
         "managed_prompt",
-        "revision",
-        "tool_chat",
-        "tool",
-        "chat",
-        "assistant"
+        "current",
+        "context_memory",
+        "context",
+        "memory",
+        "system"
       ],
       "status": null,
       "visibility": "private",
@@ -370,20 +553,20 @@
       "layer": "project",
       "memory_kind": "preference",
       "asset_kind": "compressed",
-      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+      "body_preview": "Use recalled memory when it is relevant, but do not invent facts from memory that are not present."
     },
     {
-      "id": "prompt.tool.chat-assistant.rev.1777361438279",
+      "id": "prompt.context.memory-usage-policy",
       "doc_type": "memory_room_asset",
-      "title": "Tool Chat Assistant Revision 1777361438279",
-      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777361438279.tool-chat-assistant.md",
+      "title": "Context Memory Usage Policy",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/memory-usage-policy.md",
       "tags": [
         "managed_prompt",
-        "revision",
-        "tool_chat",
-        "tool",
-        "chat",
-        "assistant"
+        "current",
+        "context_policy",
+        "context",
+        "memory",
+        "policy"
       ],
       "status": null,
       "visibility": "private",
@@ -398,20 +581,20 @@
       "layer": "project",
       "memory_kind": "preference",
       "asset_kind": "compressed",
-      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+      "body_preview": "Treat recalled memory as supporting context. Prefer direct user intent when they conflict, and do not invent missing facts."
     },
     {
-      "id": "prompt.tool.chat-assistant.rev.1777366259940",
+      "id": "prompt.extract.semantic-tags",
       "doc_type": "memory_room_asset",
-      "title": "Tool Chat Assistant Revision 1777366259940",
-      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777366259940.tool-chat-assistant.md",
+      "title": "Semantic Tag Suggester",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/semantic-tags.md",
       "tags": [
         "managed_prompt",
-        "revision",
-        "tool_chat",
-        "tool",
-        "chat",
-        "assistant"
+        "current",
+        "extract",
+        "memory",
+        "extract",
+        "tags"
       ],
       "status": null,
       "visibility": "private",
@@ -426,7 +609,7 @@
       "layer": "project",
       "memory_kind": "preference",
       "asset_kind": "compressed",
-      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th..."
+      "body_preview": "Infer compact semantic tags that help route and retrieve a memory. Return only durable tags. Prefer room-kind tags and one or two meaningful slugs over long lis..."
     },
     {
       "id": "prompt.tool.chat-assistant",
@@ -519,7 +702,7 @@
         "event",
         "managed_prompt",
         "current",
-        "tool_router"
+        "tool_chat"
       ],
       "status": null,
       "visibility": "private",
@@ -534,7 +717,157 @@
       "layer": "project",
       "memory_kind": "workflow_memory",
       "asset_kind": "timeline",
-      "body_preview": "### Promoted - event: event.prompt.tool.chat-assistant.compiled.1777357260375 - artifact: prompt.tool.chat-assistant - action: Promoted - reason: synced managed..."
+      "body_preview": "### Promoted - event: event.prompt.context.memory-system.compiled.1777447949076 - artifact: prompt.context.memory-system - action: Promoted - reason: synced man..."
+    },
+    {
+      "id": "prompt.context.lightweight-chat",
+      "doc_type": "prompt_template",
+      "title": "Context Lightweight Chat",
+      "relative_path": "prompts/context/lightweight-chat.md",
+      "tags": [
+        "context",
+        "chat",
+        "lightweight"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "For brief greetings, reply warmly and concisely without recalling long-term memory unless the user asks for something substantive."
+    },
+    {
+      "id": "prompt.context.memory-system",
+      "doc_type": "prompt_template",
+      "title": "Context Memory System",
+      "relative_path": "prompts/context/memory-system.md",
+      "tags": [
+        "context",
+        "memory",
+        "system"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "Use recalled memory when it is relevant, but do not invent facts from memory that are not present."
+    },
+    {
+      "id": "prompt.context.memory-usage-policy",
+      "doc_type": "prompt_template",
+      "title": "Context Memory Usage Policy",
+      "relative_path": "prompts/context/memory-usage-policy.md",
+      "tags": [
+        "context",
+        "memory",
+        "policy"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "Treat recalled memory as supporting context. Prefer direct user intent when they conflict, and do not invent missing facts."
+    },
+    {
+      "id": "prompt.extract.semantic-tags",
+      "doc_type": "prompt_template",
+      "title": "Semantic Tag Suggester",
+      "relative_path": "prompts/extract/semantic-tags.md",
+      "tags": [
+        "memory",
+        "extract",
+        "tags"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "Infer compact semantic tags that help route and retrieve a memory. Return only durable tags. Prefer room-kind tags and one or two meaningful slugs over long lis..."
+    },
+    {
+      "id": "prompt.organizer.memory",
+      "doc_type": "prompt_template",
+      "title": "Memory Organizer",
+      "relative_path": "prompts/organizer/memory-organizer.md",
+      "tags": [
+        "memory",
+        "organizer",
+        "routing"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "Decide how to organize this memory write. Honor any explicit `room_id_hint`, `room_layer_hint`, `owner`, `visibility`, and existing `tags` when they are present..."
+    },
+    {
+      "id": "prompt.rewrite.assistant-wenyan",
+      "doc_type": "prompt_template",
+      "title": "Assistant Wenyan Rewrite",
+      "relative_path": "prompts/rewrite/assistant-wenyan.md",
+      "tags": [
+        "rewrite",
+        "wenyan",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": null,
+      "tenant_id": null,
+      "user_id": null,
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": null,
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "Translate the assistant answer into concise classical Chinese. Return only the classical Chinese text, with no explanation."
     },
     {
       "id": "prompt.summarize.global-preference",
@@ -587,31 +920,6 @@
       "body_preview": "Follow the provided local prompt asset. Return JSON only."
     },
     {
-      "id": "prompt.tool.natural-language-builder",
-      "doc_type": "prompt_template",
-      "title": "Natural Language Tool Builder",
-      "relative_path": "prompts/tool/natural-language-tool-builder.md",
-      "tags": [
-        "tool",
-        "builder",
-        "json"
-      ],
-      "status": null,
-      "visibility": null,
-      "tenant_id": null,
-      "user_id": null,
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "room_id": null,
-      "layer": null,
-      "memory_kind": null,
-      "asset_kind": null,
-      "body_preview": "Convert a user's natural-language request into a Honeycomb tool or skill definition. Return only one JSON object. Do not use markdown fences. Schema: ```json { ..."
-    },
-    {
       "id": "prompt.tool.chat-assistant",
       "doc_type": "prompt_template",
       "title": "Tool Chat Assistant",
@@ -660,110 +968,6 @@
       "memory_kind": null,
       "asset_kind": null,
       "body_preview": "Route one user turn for Honeycomb's tool-aware chat. Return only one JSON object. Do not use markdown fences. Schema: ```json { \"action\": \"chat|create_tool|crea..."
-    },
-    {
-      "id": "skill.frontend-red-theme",
-      "doc_type": "skill",
-      "title": "前端开发红色系技能",
-      "relative_path": "skills/skill.frontend-red-theme.md",
-      "tags": [
-        "frontend",
-        "red-theme",
-        "css",
-        "ui-design",
-        "skill"
-      ],
-      "status": null,
-      "visibility": null,
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "room_id": null,
-      "layer": null,
-      "memory_kind": null,
-      "asset_kind": null,
-      "body_preview": "# 前端开发红色系技能 提供红色系前端开发风格指南和代码规范，涵盖UI设计、组件样式、色彩搭配等最佳实践。 ## Instructions 你是一位精通前端开发且擅长红色系视觉风格的设计师和开发者。在涉及前端开发相关问题时： 1. **红色系色彩规范** - 主色调：使用 #E53935、#D32F2F、#C62828..."
-    },
-    {
-      "id": "tool.local-dir.list",
-      "doc_type": "tool",
-      "title": "Local Directory List",
-      "relative_path": "tools/tool.local-dir.list.md",
-      "tags": [
-        "local-dir",
-        "list",
-        "workspace"
-      ],
-      "status": null,
-      "visibility": null,
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "room_id": null,
-      "layer": null,
-      "memory_kind": null,
-      "asset_kind": null,
-      "body_preview": "# Local Directory List Lists entries in an explicit local directory path without recursively reading file contents. Use this tool when the task needs to inspect..."
-    },
-    {
-      "id": "tool.local-file.read",
-      "doc_type": "tool",
-      "title": "Local File Read",
-      "relative_path": "tools/tool.local-file.read.md",
-      "tags": [
-        "local-file",
-        "read",
-        "workspace",
-        "artifact"
-      ],
-      "status": null,
-      "visibility": null,
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "room_id": null,
-      "layer": null,
-      "memory_kind": null,
-      "asset_kind": null,
-      "body_preview": "# Local File Read Reads UTF-8 content from an explicit local file path. Use this tool when the task needs to inspect a known local file before answering or befo..."
-    },
-    {
-      "id": "tool.local-file.write",
-      "doc_type": "tool",
-      "title": "Local File Write",
-      "relative_path": "tools/tool.local-file.write.md",
-      "tags": [
-        "local-file",
-        "write",
-        "workspace",
-        "artifact"
-      ],
-      "status": null,
-      "visibility": null,
-      "tenant_id": "local",
-      "user_id": "default",
-      "created_at": null,
-      "updated_at": null,
-      "relations": [],
-      "owners": [],
-      "capabilities": [],
-      "room_id": null,
-      "layer": null,
-      "memory_kind": null,
-      "asset_kind": null,
-      "body_preview": "# Local File Write Writes UTF-8 content to an explicit local file path. Use this tool when the user wants a generated artifact, page, document, or code snippet ..."
     }
   ]
 }

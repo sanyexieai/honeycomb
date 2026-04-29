@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/hc",
+  "apps/hc-api",
   "apps/hc-context-cli",
   "apps/hc-llm-cli",
   "apps/hc-responder-cli",
@@ -38,3 +39,5 @@ serde_yaml = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustyline = "14"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+axum = "0.7"

@@ -9,6 +9,7 @@ use hc_memory::{
     MemoryRoomRepository, MemoryVisibility,
 };
 use hc_persona::{PersonaKind, PersonaLifecycle, PersonaNamespace, PersonaProfile};
+use hc_store::store::WorkspaceStore;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -358,6 +359,115 @@ fn workspace_retriever_prefers_room_compressed_assets() {
     );
     assert_eq!(matches[0].source_kind, "room_compressed");
     assert_eq!(matches[0].kind, MemoryKind::Decision);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_retriever_skips_stale_room_asset_index_entries() {
+    let root = unique_temp_dir("context-stale-room-asset-index");
+    let namespace = MemoryNamespace::new("tenant-a", "user-a");
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+    let room_repository = MemoryRoomRepository::with_namespace(&root, workspace_namespace.clone());
+    let room = MemoryRoom::new(
+        "room.task.runtime-refactor.0001",
+        MemoryLayer::Task,
+        "Runtime Refactor Task Room",
+        "Tracks planning and execution memory.",
+    )
+    .with_namespace(namespace.clone())
+    .with_tag("runtime");
+    room_repository
+        .write_room(&room)
+        .expect("memory room should be written");
+    let asset = MemoryRoomAsset::new(
+        "asset.room.task.runtime-refactor.0001.summary",
+        room.id.clone(),
+        "min.0001.summary.md",
+        MemoryLayer::Task,
+        MemoryRoomAssetKind::Compressed,
+        "Runtime Refactor Summary",
+        "Persist task plans and assignment decisions together.",
+    )
+    .with_namespace(namespace.clone())
+    .with_memory_kind(MemoryKind::Decision)
+    .with_owner(MemoryOwnerRef::task("task.demo"))
+    .with_tag("runtime")
+    .with_tag("task.demo");
+    let asset_path = room_repository
+        .write_asset(&room, &asset)
+        .expect("compressed room asset should be written");
+
+    WorkspaceStore::new(&root)
+        .rebuild_markdown_index_in_namespace(&workspace_namespace)
+        .expect("markdown index should be built");
+    fs::remove_file(asset_path).expect("asset file should be removed after indexing");
+
+    let retriever = WorkspaceMemoryRetriever::new(&root, workspace_namespace);
+    let matches = retriever
+        .retrieve(
+            &ContextMemoryQuery::default()
+                .for_namespace(namespace)
+                .with_scope(MemoryScope::Task)
+                .with_tag("runtime")
+                .with_text("assignment")
+                .with_limit(5),
+        )
+        .expect("memory retrieval should skip stale room asset entries");
+
+    assert!(matches.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_retriever_includes_global_preferences_for_short_turns() {
+    let root = unique_temp_dir("context-global-preference-recall");
+    let namespace = MemoryNamespace::new("tenant-a", "user-a");
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+    let room_repository = MemoryRoomRepository::with_namespace(&root, workspace_namespace.clone());
+    let room = MemoryRoom::new(
+        "room.global.tenant-a.user-a",
+        MemoryLayer::Global,
+        "Global Preference Room",
+        "Durable user preferences.",
+    )
+    .with_namespace(namespace.clone())
+    .with_tag("global");
+    room_repository
+        .write_room(&room)
+        .expect("global room should be written");
+    let asset = MemoryRoomAsset::new(
+        "asset.room.global.tenant-a.user-a.assistant-name",
+        room.id.clone(),
+        "pref.assistant-name.md",
+        MemoryLayer::Global,
+        MemoryRoomAssetKind::Compressed,
+        "Global Preference",
+        "User prefers the assistant to be called 小八.",
+    )
+    .with_namespace(namespace.clone())
+    .with_memory_kind(MemoryKind::Preference)
+    .with_owner(MemoryOwnerRef::global())
+    .with_tag("global")
+    .with_tag("preference");
+    room_repository
+        .write_asset(&room, &asset)
+        .expect("global preference should be written");
+
+    let retriever = WorkspaceMemoryRetriever::new(&root, workspace_namespace);
+    let matches = retriever
+        .retrieve(
+            &ContextMemoryQuery::default()
+                .for_namespace(namespace)
+                .with_text("你叫什么")
+                .with_limit(5),
+        )
+        .expect("memory retrieval should include global preferences");
+
+    assert!(matches.iter().any(|memory| memory.id
+        == "asset.room.global.tenant-a.user-a.assistant-name"
+        && memory.summary.contains("小八")));
 
     let _ = fs::remove_dir_all(root);
 }

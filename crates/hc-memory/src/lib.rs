@@ -5,6 +5,7 @@ use hc_store::store::{StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
 use hc_trace::TraceEvent;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1373,7 +1374,11 @@ impl MemoryRoomRepository {
                 .strip_prefix(self.store.resolve_in_namespace(&self.namespace, ""))
                 .expect("asset path should live under namespace root")
                 .to_path_buf();
-            assets.push(self.read_asset(relative)?);
+            match self.read_asset(relative) {
+                Ok(asset) => assets.push(asset),
+                Err(error) if is_not_found_error(&error) => continue,
+                Err(error) => return Err(error),
+            }
         }
 
         assets.sort_by(|left, right| left.file_name.cmp(&right.file_name));
@@ -1821,6 +1826,14 @@ fn memory_entity_kind_label(kind: &MemoryEntityKind) -> &'static str {
         MemoryEntityKind::Document => "document",
         MemoryEntityKind::Other => "other",
     }
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::NotFound)
+    })
 }
 
 fn memory_relation_kind_label(kind: &MemoryRelationKind) -> &'static str {
