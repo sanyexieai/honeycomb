@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod chat;
+pub mod scheduler;
 pub mod tool;
 
 use std::path::PathBuf;

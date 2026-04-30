@@ -159,6 +159,8 @@ pub struct McpServerSummary {
     pub id: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub enabled: bool,
     pub transport: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,

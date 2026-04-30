@@ -19,6 +19,7 @@ members = [
   "crates/hc-memory",
   "crates/hc-persona",
   "crates/hc-responder",
+  "crates/hc-scheduler",
   "crates/hc-skill",
   "crates/hc-store",
   "crates/hc-toolchain",

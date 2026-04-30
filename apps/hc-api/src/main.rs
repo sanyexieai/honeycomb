@@ -1,4 +1,4 @@
-use std::{env, fs, net::SocketAddr, path::PathBuf};
+use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -16,6 +16,7 @@ use hc_service::{
     ServiceConfig,
     agent::{list_agents, list_domains, route_agent},
     chat::handle_chat_request,
+    scheduler::dispatch_due_scheduled_runs,
     tool::list_mcp_servers,
 };
 use serde::Deserialize;
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         service: ServiceConfig::new(workspace_root()),
     };
+    start_scheduler_loop_if_enabled(state.service.clone());
     let bind_addr = bind_addr()?;
     let app = Router::new()
         .route("/health", get(health))
@@ -60,6 +62,61 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("api server failed")
+}
+
+fn start_scheduler_loop_if_enabled(service: ServiceConfig) {
+    if !env_flag("HC_SCHEDULER_ENABLED") {
+        return;
+    }
+    let tick_seconds = env::var("HC_SCHEDULER_TICK_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30);
+    let namespace = ApiNamespace {
+        tenant_id: env::var("HC_TENANT_ID").unwrap_or_else(|_| default_tenant_id()),
+        user_id: env::var("HC_USER_ID").unwrap_or_else(|_| default_user_id()),
+    };
+    println!(
+        "hc-api scheduler enabled namespace={}/{} tick_seconds={}",
+        namespace.tenant_id, namespace.user_id, tick_seconds
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(tick_seconds));
+        loop {
+            interval.tick().await;
+            let service = service.clone();
+            let namespace = namespace.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                dispatch_due_scheduled_runs(&service, namespace, None)
+            })
+            .await;
+            match result {
+                Ok(Ok(report)) => {
+                    if !report.receipts.is_empty() {
+                        println!(
+                            "scheduler> dispatched={} queued={}",
+                            report.receipts.len(),
+                            report.queued_count
+                        );
+                    }
+                }
+                Ok(Err(error)) => eprintln!("warning> scheduler tick failed: {error}"),
+                Err(error) => eprintln!("warning> scheduler worker failed: {error}"),
+            }
+        }
+    });
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -628,6 +685,7 @@ fn openapi_document() -> Value {
                         "id": { "type": "string" },
                         "name": { "type": "string" },
                         "description": { "type": "string" },
+                        "enabled": { "type": "boolean" },
                         "transport": { "type": "string" },
                         "url": { "type": "string" },
                         "command": {

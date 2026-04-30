@@ -11,6 +11,8 @@ hc-agent = { path = "../hc-agent" }
 hc-context = { path = "../hc-context" }
 hc-llm = { path = "../hc-llm" }
 hc-protocol = { path = "../hc-protocol" }
+hc-scheduler = { path = "../hc-scheduler" }
 hc-store = { path = "../hc-store" }
 hc-toolchain = { path = "../hc-toolchain" }
+serde.workspace = true
 serde_json.workspace = true

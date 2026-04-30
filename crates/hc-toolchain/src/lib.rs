@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -66,17 +66,25 @@ fn default_mcp_transport_kind() -> McpTransportKind {
     McpTransportKind::Stdio
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerSpec {
     pub id: String,
     pub name: String,
     pub description: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_mcp_transport_kind")]
     pub transport: McpTransportKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub default_args: BTreeMap<String, Value>,
     pub tags: Vec<String>,
 }
 
@@ -102,12 +110,16 @@ struct McpServerFrontmatter {
     title: String,
     tenant_id: String,
     user_id: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     #[serde(default = "default_mcp_transport_kind")]
     transport: McpTransportKind,
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
     command: Vec<String>,
+    #[serde(default)]
+    default_args: BTreeMap<String, Value>,
     tags: Vec<String>,
 }
 
@@ -314,6 +326,25 @@ pub struct McpServerRepository {
     namespace: WorkspaceNamespace,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpToolCache {
+    pub server_id: String,
+    pub refreshed_at_unix: u64,
+    pub tools: Vec<ToolSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct McpToolCacheFrontmatter {
+    id: String,
+    r#type: String,
+    title: String,
+    tenant_id: String,
+    user_id: String,
+    server_id: String,
+    refreshed_at_unix: u64,
+    tools: Vec<ToolSpec>,
+}
+
 impl ToolRepository {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self::with_namespace(root, WorkspaceNamespace::local_default())
@@ -444,6 +475,94 @@ impl McpServerRepository {
             .find(|server| server.id == normalized)
             .with_context(|| format!("unknown mcp server: {normalized}"))
     }
+
+    pub fn cache_relative_path_for(server_id: &str) -> PathBuf {
+        PathBuf::from("mcp")
+            .join("cache")
+            .join(format!("{}.tools.md", normalize_mcp_server_id(server_id)))
+    }
+
+    pub fn read_tool_cache(&self, server_id: &str) -> Result<McpToolCache> {
+        let stored: StoredMarkdown<McpToolCacheFrontmatter> =
+            self.store.read_markdown_in_namespace(
+                &self.namespace,
+                Self::cache_relative_path_for(server_id),
+            )?;
+        Ok(stored.frontmatter.into_cache())
+    }
+
+    pub fn write_tool_cache(&self, server_id: &str, tools: Vec<ToolSpec>) -> Result<PathBuf> {
+        let cache = McpToolCache {
+            server_id: normalize_mcp_server_id(server_id),
+            refreshed_at_unix: current_unix_timestamp(),
+            tools,
+        };
+        let frontmatter = McpToolCacheFrontmatter::from_cache(&cache, &self.namespace);
+        let body = render_mcp_tool_cache_body(&cache);
+        let path = self.store.write_markdown_in_namespace(
+            &self.namespace,
+            Self::cache_relative_path_for(server_id),
+            &frontmatter,
+            &body,
+        )?;
+        let _ = self
+            .store
+            .rebuild_markdown_index_in_namespace(&self.namespace);
+        Ok(path)
+    }
+
+    pub fn refresh_tool_cache(&self, server: &McpServerSpec) -> Result<McpToolCache> {
+        let tools = discover_mcp_tools(server)?;
+        self.write_tool_cache(&server.id, tools.clone())?;
+        Ok(McpToolCache {
+            server_id: server.id.clone(),
+            refreshed_at_unix: current_unix_timestamp(),
+            tools,
+        })
+    }
+}
+
+impl McpToolCacheFrontmatter {
+    fn from_cache(cache: &McpToolCache, namespace: &WorkspaceNamespace) -> Self {
+        Self {
+            id: format!("cache.{}.tools", cache.server_id),
+            r#type: "mcp_tool_cache".to_owned(),
+            title: format!("{} Tool Cache", cache.server_id),
+            tenant_id: namespace.tenant_id.clone(),
+            user_id: namespace.user_id.clone(),
+            server_id: cache.server_id.clone(),
+            refreshed_at_unix: cache.refreshed_at_unix,
+            tools: cache.tools.clone(),
+        }
+    }
+
+    fn into_cache(self) -> McpToolCache {
+        McpToolCache {
+            server_id: self.server_id,
+            refreshed_at_unix: self.refreshed_at_unix,
+            tools: self.tools,
+        }
+    }
+}
+
+fn render_mcp_tool_cache_body(cache: &McpToolCache) -> String {
+    let mut lines = vec![
+        format!("# {} Tool Cache", cache.server_id),
+        String::new(),
+        format!("Refreshed at unix timestamp: {}", cache.refreshed_at_unix),
+        String::new(),
+    ];
+    for tool in &cache.tools {
+        lines.push(format!("- `{}`: {}", tool.id, tool.description));
+    }
+    lines.join("\n")
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 pub fn seed_tool_rg() -> ToolSpec {
@@ -675,9 +794,11 @@ impl McpServerSpec {
             id: frontmatter.id,
             name: frontmatter.title,
             description,
+            enabled: frontmatter.enabled,
             transport: frontmatter.transport,
             url: frontmatter.url,
             command: frontmatter.command,
+            default_args: frontmatter.default_args,
             tags: frontmatter.tags,
         };
         validate_mcp_server_spec(&server)?;
@@ -711,9 +832,11 @@ impl McpServerFrontmatter {
             title: server.name.clone(),
             tenant_id: namespace.tenant_id.clone(),
             user_id: namespace.user_id.clone(),
+            enabled: server.enabled,
             transport: server.transport.clone(),
             url: server.url.clone(),
             command: server.command.clone(),
+            default_args: server.default_args.clone(),
             tags: server.tags.clone(),
         }
     }

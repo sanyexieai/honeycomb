@@ -20,6 +20,7 @@ pub fn list_mcp_servers(
             id: server.id,
             name: server.name,
             description: server.description,
+            enabled: server.enabled,
             transport: format!("{:?}", server.transport),
             url: server.url,
             command: server.command,

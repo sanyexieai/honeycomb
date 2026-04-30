@@ -9,6 +9,7 @@ For product-flow and implementation guardrails, also read:
 - [task-driven-product.md](/d:/code/honeycomb/docs/task-driven-product.md)
 - [working-rules.md](/d:/code/honeycomb/docs/working-rules.md)
 - [channel-conversation.md](/d:/code/honeycomb/docs/channel-conversation.md)
+- [scheduled-tasks.md](/d:/code/honeycomb/docs/scheduled-tasks.md)
 
 The system should avoid becoming a tightly coupled super-app. Each part must be:
 
@@ -115,6 +116,24 @@ Non-goals:
 - low-level runtime ownership
 - provider transport
 - Markdown storage ownership
+
+### `hc-scheduler`
+
+Purpose:
+
+- durable scheduled-task records
+- due-time calculation
+- restart-safe scheduled run records
+- generic dispatch into agents, tools, MCP services, commands, or events
+
+Non-goals:
+
+- business-domain logic
+- agent/tool selection policy
+- direct LLM/provider calls
+- UI ownership
+
+See also: [scheduled-tasks.md](/d:/code/honeycomb/docs/scheduled-tasks.md)
 
 ### `hc-claim`
 

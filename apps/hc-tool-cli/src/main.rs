@@ -1,12 +1,15 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use encoding_rs::GB18030;
 use hc_agent::{AgentProfile, AgentRepository};
 use hc_capability::ModelDependence;
 use hc_context::{
@@ -22,13 +25,17 @@ use hc_llm::{
     default_provider_from_env, default_registry_from_env, is_timeout_error,
     sanitize_assistant_text,
 };
+use hc_scheduler::{
+    ScheduleRepository, ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledRunStatus,
+    ScheduledTarget, ScheduledTargetKind, ScheduledTask, now_unix,
+};
 use hc_skill::{SkillProfile, SkillRepository};
 use hc_store::store::WorkspaceNamespace;
 use hc_toolchain::{
     CommandToolExecutor, McpServerRepository, McpServerSpec, McpTransportKind, ToolCatalog,
     ToolComposition, ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository,
     ToolSpec, ToolStability, build_default_tool_execution_plan, call_mcp_tool,
-    default_tool_catalog, discover_mcp_tools, is_mcp_tool_command, normalize_mcp_server_id,
+    default_tool_catalog, is_mcp_tool_command, normalize_mcp_server_id,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::Deserialize;
@@ -88,6 +95,157 @@ struct ToolSelection {
 struct ToolSelectionCandidate {
     tool: ToolSpec,
     score: i32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolRoutingTags {
+    #[serde(default)]
+    intent_rules: Vec<ToolIntentRoutingRule>,
+    #[serde(default)]
+    tool_weights: Vec<ToolWeightRule>,
+    #[serde(default)]
+    confirmation_hints: Vec<String>,
+    #[serde(default)]
+    argument_rules: Vec<ToolArgumentRule>,
+    #[serde(default)]
+    tool_argument_rules: Vec<ToolScopedArgumentRule>,
+    #[serde(default)]
+    confirmation_flows: Vec<ToolConfirmationFlowRule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolIntentRoutingRule {
+    #[serde(default)]
+    hints: Vec<String>,
+    #[serde(default)]
+    preferred_selectors: Vec<String>,
+    #[serde(default)]
+    weight: i32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolWeightRule {
+    #[serde(default)]
+    selectors: Vec<String>,
+    #[serde(default)]
+    weight: i32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolArgumentRule {
+    #[serde(default)]
+    hints: Vec<String>,
+    #[serde(default)]
+    args: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolScopedArgumentRule {
+    #[serde(default)]
+    selectors: Vec<String>,
+    #[serde(default)]
+    args: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    include_matched_argument_rules: bool,
+    #[serde(default)]
+    context_calls: Vec<ToolContextCallRule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolContextCallRule {
+    arg: String,
+    server_id: String,
+    #[serde(default)]
+    tool_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolConfirmationFlowRule {
+    #[serde(default)]
+    source_selectors: Vec<String>,
+    #[serde(default)]
+    target_selectors: Vec<String>,
+    #[serde(default)]
+    item_paths: Vec<String>,
+    #[serde(default)]
+    target_args: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    item_arg_mappings: Vec<ToolItemArgMapping>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolItemArgMapping {
+    arg: String,
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolResponseRenderingConfig {
+    #[serde(default)]
+    renderers: Vec<ToolResponseRenderer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolResponseRenderer {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    selectors: Vec<String>,
+    #[serde(default)]
+    item_paths: Vec<String>,
+    #[serde(default)]
+    name_keys: Vec<String>,
+    #[serde(default)]
+    primary_fields: Vec<ToolResponseField>,
+    #[serde(default)]
+    alternative_fields: Vec<ToolResponseField>,
+    #[serde(default)]
+    reason_keys: Vec<String>,
+    #[serde(default)]
+    reason_array_keys: Vec<String>,
+    #[serde(default)]
+    context_arg: Option<String>,
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    header_with_context: Option<String>,
+    #[serde(default)]
+    primary_heading: Option<String>,
+    #[serde(default)]
+    alternatives_heading: Option<String>,
+    #[serde(default)]
+    confirmation_prompt: Option<String>,
+    #[serde(default)]
+    empty_reply: Option<String>,
+    #[serde(default)]
+    failure_reply: Option<String>,
+    #[serde(default)]
+    order_success: Option<String>,
+    #[serde(default)]
+    status_labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolResponseField {
+    label: String,
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    max_len: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolConfirmation {
+    tool_id: String,
+    items: Vec<serde_json::Value>,
+    flow: ToolConfirmationFlowRule,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +355,7 @@ struct NaturalLanguageSkillDraft {
 }
 
 fn main() -> Result<()> {
+    configure_console_encoding();
     load_local_env_file()?;
     let args: Vec<String> = env::args().skip(1).collect();
     match args.as_slice() {
@@ -212,7 +371,17 @@ fn main() -> Result<()> {
         [cmd, rest @ ..] if cmd == "plan" => handle_plan(rest),
         [cmd, rest @ ..] if cmd == "run" => handle_run(rest),
         [cmd, rest @ ..] if cmd == "mcp" => handle_mcp(rest),
+        [cmd, rest @ ..] if cmd == "schedule" => handle_schedule(rest),
         [other, ..] => bail!("unknown command: {other}"),
+    }
+}
+
+fn configure_console_encoding() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+        let _ = SetConsoleCP(65001);
+        let _ = SetConsoleOutputCP(65001);
     }
 }
 
@@ -316,6 +485,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
 
     let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
     let mut history = vec![ChatMessage::new(MessageRole::System, tool_prompt)];
+    let mut pending_confirmation: Option<PendingToolConfirmation> = None;
     loop {
         let Some(input) = prompt_raw(&mut editor)? else {
             break;
@@ -423,6 +593,34 @@ fn handle_chat(args: &[String]) -> Result<()> {
         {
             println!("warning> chat memory write skipped: {error}");
         }
+        if let Some(route) = confirmed_pending_route(trimmed, &pending_confirmation) {
+            let (plan, outcome) = execute_routed_tool_outcome(&route)?;
+            let context = render_tool_execution_context(&plan, &outcome);
+            apply_tool_route(&mut selection, &catalog, route)?;
+            let reply = if outcome.success {
+                pending_confirmation = None;
+                render_order_reply(&outcome)
+                    .unwrap_or_else(|| render_unrenderable_tool_reply(&outcome))
+            } else {
+                render_tool_failure_reply(&outcome)
+            };
+            println!("assistant> {reply}");
+            history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+            history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+            if let Some(room) = &chat_room
+                && let Err(error) = persist_chat_turn_assistant_reply(
+                    workspace_root(),
+                    workspace_namespace.clone(),
+                    room,
+                    turn_index,
+                    reply,
+                )
+            {
+                println!("warning> chat memory write skipped: {error}");
+            }
+            let _ = context;
+            continue;
+        }
         let mut tool_execution_context = None;
         if let Some(route) = configured_agent_mcp_route(trimmed, &selection, &catalog)? {
             if route.action != "run_tool" {
@@ -431,9 +629,51 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 }
                 continue;
             }
-            let context = execute_routed_tool(&route)?;
+            let (plan, outcome) = execute_routed_tool_outcome(&route)?;
+            let context = render_tool_execution_context(&plan, &outcome);
             apply_tool_route(&mut selection, &catalog, route)?;
-            tool_execution_context = Some(context);
+            if outcome.success
+                && let Some(reply) = render_grounded_tool_reply(&outcome)
+            {
+                pending_confirmation =
+                    pending_confirmation_from_outcome(&outcome, &catalog).or(pending_confirmation);
+                println!("assistant> {reply}");
+                history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+                if let Some(room) = &chat_room
+                    && let Err(error) = persist_chat_turn_assistant_reply(
+                        workspace_root(),
+                        workspace_namespace.clone(),
+                        room,
+                        turn_index,
+                        reply,
+                    )
+                {
+                    println!("warning> chat memory write skipped: {error}");
+                }
+                continue;
+            }
+            let reply = if outcome.success {
+                render_unrenderable_tool_reply(&outcome)
+            } else {
+                render_tool_failure_reply(&outcome)
+            };
+            println!("assistant> {reply}");
+            history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+            history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+            if let Some(room) = &chat_room
+                && let Err(error) = persist_chat_turn_assistant_reply(
+                    workspace_root(),
+                    workspace_namespace.clone(),
+                    room,
+                    turn_index,
+                    reply,
+                )
+            {
+                println!("warning> chat memory write skipped: {error}");
+            }
+            let _ = context;
+            continue;
         } else {
             match route_tool_turn(
                 &registry,
@@ -502,7 +742,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 let display_content = sanitize_model_response(&response.message.content);
                 match try_execute_create_tool_command_from_response(&display_content) {
                     Ok(Some(path)) => {
-                        println!("已创建> {}", path.display());
+                        println!("created> {}", path.display());
                         let catalog = load_cli_tool_catalog()?;
                         history.clear();
                         history.push(ChatMessage::new(
@@ -655,6 +895,518 @@ fn handle_mcp(args: &[String]) -> Result<()> {
     }
 }
 
+fn handle_schedule(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "add" => handle_schedule_add(rest),
+        [cmd, rest @ ..] if cmd == "list" => handle_schedule_list(rest),
+        [cmd, rest @ ..] if cmd == "run-due" => handle_schedule_run_due(rest),
+        [cmd, rest @ ..] if cmd == "runs" => handle_schedule_runs(rest),
+        [cmd, rest @ ..] if cmd == "pause" => {
+            handle_schedule_set_status(rest, ScheduleStatus::Paused)
+        }
+        [cmd, rest @ ..] if cmd == "resume" => {
+            handle_schedule_set_status(rest, ScheduleStatus::Active)
+        }
+        [cmd, rest @ ..] if cmd == "dispatch-due" => handle_schedule_dispatch_due(rest),
+        [cmd, rest @ ..] if cmd == "dispatch-queued" => handle_schedule_dispatch_queued(rest),
+        [cmd, rest @ ..] if cmd == "watch" => handle_schedule_watch(rest),
+        [] => bail!(
+            "usage: hc-tool-cli schedule <add|list|run-due|runs|pause|resume|dispatch-due|dispatch-queued|watch> ..."
+        ),
+        [other, ..] => bail!("unknown schedule command: {other}"),
+    }
+}
+
+fn handle_schedule_add(args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut title = None;
+    let mut kind = None;
+    let mut run_at_unix = None;
+    let mut interval_seconds = None;
+    let mut target_kind = None;
+    let mut target_ref = None;
+    let mut target_action = None;
+    let mut target_args = serde_json::Map::new();
+    let mut tags = Vec::new();
+    let mut json = false;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--title" => {
+                title = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --title")?,
+                );
+                index += 2;
+            }
+            "--kind" => {
+                kind = Some(parse_schedule_kind(
+                    args.get(index + 1).context("missing value for --kind")?,
+                )?);
+                index += 2;
+            }
+            "--run-at-unix" => {
+                run_at_unix = Some(parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --run-at-unix")?,
+                    "--run-at-unix",
+                )?);
+                index += 2;
+            }
+            "--interval-seconds" => {
+                interval_seconds = Some(parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --interval-seconds")?,
+                    "--interval-seconds",
+                )?);
+                index += 2;
+            }
+            "--target-kind" => {
+                target_kind = Some(parse_scheduled_target_kind(
+                    args.get(index + 1)
+                        .context("missing value for --target-kind")?,
+                )?);
+                index += 2;
+            }
+            "--target-ref" => {
+                target_ref = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --target-ref")?,
+                );
+                index += 2;
+            }
+            "--target-action" => {
+                target_action = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --target-action")?,
+                );
+                index += 2;
+            }
+            "--arg" => {
+                let arg = args.get(index + 1).context("missing value for --arg")?;
+                let (key, value) = arg
+                    .split_once('=')
+                    .with_context(|| format!("schedule --arg must use key=value form: {arg}"))?;
+                target_args.insert(key.to_owned(), parse_jsonish_argument_value(value));
+                index += 2;
+            }
+            "--tag" => {
+                tags.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tag")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule add argument: {other}"),
+        }
+    }
+
+    let task = ScheduledTask::new(
+        id.context("missing --id")?,
+        title.context("missing --title")?,
+        ScheduleSpec {
+            kind: kind.context("missing --kind")?,
+            run_at_unix,
+            interval_seconds,
+        },
+        ScheduledTarget {
+            kind: target_kind.context("missing --target-kind")?,
+            r#ref: target_ref.context("missing --target-ref")?,
+            action: target_action,
+            args: target_args,
+        },
+    );
+    let mut task = task;
+    if !tags.is_empty() {
+        task.tags = normalized_tags(tags, "scheduled");
+    }
+    let path = schedule_repository().write_schedule(&task)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schedule": task,
+                "path": path,
+            }))?
+        );
+    } else {
+        println!("schedule> {}", task.id);
+        println!("path> {}", path.display());
+        println!("next_fire_at_unix> {:?}", task.state.next_fire_at_unix);
+    }
+    Ok(())
+}
+
+fn handle_schedule_list(args: &[String]) -> Result<()> {
+    let options = parse_common_options(args)?;
+    let schedules = schedule_repository().list_schedules()?;
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&schedules)?);
+        return Ok(());
+    }
+    for schedule in schedules {
+        println!(
+            "{} | {:?} | next={:?} | {:?}:{}",
+            schedule.id,
+            schedule.status,
+            schedule.state.next_fire_at_unix,
+            schedule.target.kind,
+            schedule.target.r#ref
+        );
+    }
+    Ok(())
+}
+
+fn handle_schedule_run_due(args: &[String]) -> Result<()> {
+    let mut now = now_unix();
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--now-unix" => {
+                now = parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --now-unix")?,
+                    "--now-unix",
+                )?;
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule run-due argument: {other}"),
+        }
+    }
+    let runs = schedule_repository().queue_due_runs(now)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+    if runs.is_empty() {
+        println!("schedule> no due runs");
+    } else {
+        for run in runs {
+            println!(
+                "run> {} schedule={} target={:?}:{}",
+                run.id, run.schedule_id, run.target.kind, run.target.r#ref
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_schedule_runs(args: &[String]) -> Result<()> {
+    let options = parse_common_options(args)?;
+    let runs = schedule_repository().list_runs()?;
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+    for run in runs {
+        println!(
+            "{} | schedule={} | {:?} | target={:?}:{}",
+            run.id, run.schedule_id, run.status, run.target.kind, run.target.r#ref
+        );
+    }
+    Ok(())
+}
+
+fn handle_schedule_set_status(args: &[String], status: ScheduleStatus) -> Result<()> {
+    let mut id = None;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule status argument: {other}"),
+        }
+    }
+    let task = schedule_repository().set_schedule_status(&id.context("missing --id")?, status)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+    } else {
+        println!("schedule> {} {:?}", task.id, task.status);
+    }
+    Ok(())
+}
+
+fn handle_schedule_dispatch_due(args: &[String]) -> Result<()> {
+    let mut now = now_unix();
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--now-unix" => {
+                now = parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --now-unix")?,
+                    "--now-unix",
+                )?;
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule dispatch-due argument: {other}"),
+        }
+    }
+
+    let receipts = dispatch_due_scheduled_runs(now)?;
+    print_schedule_dispatch_receipts(receipts, json)
+}
+
+fn handle_schedule_watch(args: &[String]) -> Result<()> {
+    let mut tick_seconds = 30u64;
+    let mut max_ticks = None;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--tick-seconds" => {
+                tick_seconds = parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --tick-seconds")?,
+                    "--tick-seconds",
+                )?;
+                index += 2;
+            }
+            "--max-ticks" => {
+                max_ticks = Some(parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --max-ticks")?,
+                    "--max-ticks",
+                )?);
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule watch argument: {other}"),
+        }
+    }
+    if tick_seconds == 0 {
+        bail!("--tick-seconds must be > 0");
+    }
+
+    let mut ticks = 0u64;
+    loop {
+        let now = now_unix();
+        let receipts = dispatch_due_scheduled_runs(now)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "now_unix": now,
+                    "receipts": receipts,
+                }))?
+            );
+        } else if receipts.is_empty() {
+            println!("schedule> tick now={} no due runs", now);
+        } else {
+            println!("schedule> tick now={} dispatched={}", now, receipts.len());
+            for receipt in receipts {
+                println!(
+                    "dispatch> {} status={}",
+                    receipt
+                        .get("run_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    receipt
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                );
+            }
+        }
+        ticks += 1;
+        if max_ticks.is_some_and(|limit| ticks >= limit) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(tick_seconds));
+    }
+    Ok(())
+}
+
+fn dispatch_due_scheduled_runs(now: u64) -> Result<Vec<serde_json::Value>> {
+    let mut receipts = Vec::new();
+    schedule_repository().queue_due_runs(now)?;
+    for run in schedule_repository().queued_runs()? {
+        receipts.push(dispatch_scheduled_run(run, now)?);
+    }
+    Ok(receipts)
+}
+
+fn handle_schedule_dispatch_queued(args: &[String]) -> Result<()> {
+    let mut now = now_unix();
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--now-unix" => {
+                now = parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --now-unix")?,
+                    "--now-unix",
+                )?;
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule dispatch-queued argument: {other}"),
+        }
+    }
+
+    let mut receipts = Vec::new();
+    for run in schedule_repository().queued_runs()? {
+        receipts.push(dispatch_scheduled_run(run, now)?);
+    }
+    print_schedule_dispatch_receipts(receipts, json)
+}
+
+fn print_schedule_dispatch_receipts(receipts: Vec<serde_json::Value>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipts)?);
+        return Ok(());
+    }
+    if receipts.is_empty() {
+        println!("schedule> no due runs");
+    } else {
+        for receipt in receipts {
+            println!(
+                "dispatch> {} target={:?}:{} status={} result={}",
+                receipt
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                receipt
+                    .get("target_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                receipt
+                    .get("target_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                receipt
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                receipt
+                    .get("result_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_scheduled_run(mut run: ScheduledRun, now: u64) -> Result<serde_json::Value> {
+    run.status = ScheduledRunStatus::Running;
+    run.started_at_unix = Some(now);
+    schedule_repository().write_run(&run)?;
+
+    let result = match run.target.kind {
+        ScheduledTargetKind::Mcp => dispatch_scheduled_mcp_run(&run),
+        _ => Err(anyhow!(
+            "scheduled target kind {:?} is not dispatchable by hc-tool-cli yet",
+            run.target.kind
+        )),
+    };
+
+    let finished_at = now_unix();
+    match result {
+        Ok(result_ref) => {
+            run.status = ScheduledRunStatus::Succeeded;
+            run.finished_at_unix = Some(finished_at);
+            run.result_ref = Some(result_ref.clone());
+            run.error = None;
+            schedule_repository().write_run(&run)?;
+            Ok(serde_json::json!({
+                "run_id": run.id,
+                "target_kind": "mcp",
+                "target_ref": run.target.r#ref,
+                "status": "succeeded",
+                "result_ref": result_ref,
+            }))
+        }
+        Err(error) => {
+            run.status = ScheduledRunStatus::Failed;
+            run.finished_at_unix = Some(finished_at);
+            run.error = Some(error.to_string());
+            schedule_repository().write_run(&run)?;
+            Ok(serde_json::json!({
+                "run_id": run.id,
+                "target_kind": format!("{:?}", run.target.kind),
+                "target_ref": run.target.r#ref,
+                "status": "failed",
+                "error": error.to_string(),
+            }))
+        }
+    }
+}
+
+fn dispatch_scheduled_mcp_run(run: &ScheduledRun) -> Result<String> {
+    let tool_name = run
+        .target
+        .action
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("mcp scheduled target requires target.action")?;
+    let server = mcp_server_repository().get_server(&run.target.r#ref)?;
+    let mut arguments = serde_json::Map::new();
+    for (key, value) in &server.default_args {
+        arguments.insert(key.clone(), value.clone());
+    }
+    for (key, value) in &run.target.args {
+        arguments.insert(key.clone(), value.clone());
+    }
+    let result = call_mcp_tool(&server, tool_name, serde_json::Value::Object(arguments))?;
+    if result
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "scheduled mcp call returned an error: {}",
+            compact_single_line(&result.to_string(), 300)
+        );
+    }
+    Ok(format!("mcp:{}:{}", run.target.r#ref, tool_name))
+}
+
 fn handle_mcp_add(args: &[String]) -> Result<()> {
     let options = parse_mcp_add_options(args)?;
     let transport = options.transport.unwrap_or_else(|| {
@@ -668,9 +1420,11 @@ fn handle_mcp_add(args: &[String]) -> Result<()> {
         id: normalize_mcp_server_id(&options.id),
         name: options.name,
         description: options.description,
+        enabled: true,
         transport,
         url: options.url,
         command: options.command,
+        default_args: BTreeMap::new(),
         tags: normalized_tags(options.tags, "mcp"),
     };
     let path = mcp_server_repository().write_server(&server)?;
@@ -711,8 +1465,16 @@ fn handle_mcp_list(args: &[String]) -> Result<()> {
             .clone()
             .unwrap_or_else(|| server.command.join(" "));
         println!(
-            "{} | {} | {:?} | {}",
-            server.id, server.name, server.transport, endpoint
+            "{} | {} | {} | {:?} | {}",
+            server.id,
+            server.name,
+            if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            server.transport,
+            endpoint
         );
     }
     Ok(())
@@ -723,7 +1485,11 @@ fn handle_mcp_tools(args: &[String]) -> Result<()> {
     let servers = mcp_server_repository().list_servers()?;
     let mut tools = Vec::new();
     for server in servers {
-        tools.extend(discover_mcp_tools(&server)?);
+        if !server.enabled {
+            continue;
+        }
+        let cache = mcp_server_repository().refresh_tool_cache(&server)?;
+        tools.extend(cache.tools);
     }
     if options.json {
         println!("{}", serde_json::to_string_pretty(&tools)?);
@@ -787,7 +1553,7 @@ fn handle_natural_language_tool_create(
             println!(
                 "assistant> {}",
                 build.message.unwrap_or_else(|| {
-                    "还缺少工具 id、用途或默认命令，请补充一下。".to_owned()
+                    "I need a little more detail before creating that tool.".to_owned()
                 })
             );
             Ok(true)
@@ -805,7 +1571,7 @@ fn handle_natural_language_tool_create(
             let file_paths = write_generated_tool_files(&generated_files)?;
             let path = tool_repository().write_tool(&tool)?;
             println!(
-                "assistant> 已创建工具 {} ({})，保存到 {}",
+                "assistant> created tool {} ({}) at {}",
                 tool.id,
                 tool.name,
                 path.display()
@@ -824,7 +1590,7 @@ fn handle_natural_language_tool_create(
             let path = SkillRepository::relative_path_for(&skill);
             if skill_repository().read_profile(&path).is_ok() {
                 println!(
-                    "assistant> skill {} ({}) 已存在：{}",
+                    "assistant> skill {} ({}) already exists at {}",
                     skill.id,
                     skill.name,
                     path.display()
@@ -833,7 +1599,7 @@ fn handle_natural_language_tool_create(
             }
             let path = skill_repository().write_profile(&skill)?;
             println!(
-                "assistant> 已创建 skill {} ({})，保存到 {}",
+                "assistant> created skill {} ({}) at {}",
                 skill.id,
                 skill.name,
                 path.display()
@@ -1076,6 +1842,13 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions> {
 }
 
 fn execute_routed_tool(route: &NaturalLanguageToolRoute) -> Result<String> {
+    let (plan, outcome) = execute_routed_tool_outcome(route)?;
+    Ok(render_tool_execution_context(&plan, &outcome))
+}
+
+fn execute_routed_tool_outcome(
+    route: &NaturalLanguageToolRoute,
+) -> Result<(hc_toolchain::ToolExecutionPlan, ToolExecutionOutcome)> {
     let tool_id = route
         .tool_id
         .as_deref()
@@ -1086,8 +1859,7 @@ fn execute_routed_tool(route: &NaturalLanguageToolRoute) -> Result<String> {
         args: route.args.clone(),
         ..RunOptions::default()
     };
-    let (plan, outcome) = execute_tool_by_selector(tool_id, &options)?;
-    Ok(render_tool_execution_context(&plan, &outcome))
+    execute_tool_by_selector(tool_id, &options)
 }
 
 fn configured_agent_mcp_route(
@@ -1096,7 +1868,8 @@ fn configured_agent_mcp_route(
     catalog: &ToolCatalog,
 ) -> Result<Option<NaturalLanguageToolRoute>> {
     let tool = if let Some(agent) = select_agent_by_configured_hints(user_turn)? {
-        match select_mcp_tool_for_agent(&agent, user_turn, catalog) {
+        let agent_catalog = catalog_with_agent_mcp_tools(catalog, &agent)?;
+        match select_mcp_tool_for_agent(&agent, user_turn, &agent_catalog) {
             Some(tool) => Some(tool),
             None => {
                 return Ok(Some(NaturalLanguageToolRoute {
@@ -1104,10 +1877,9 @@ fn configured_agent_mcp_route(
                     tool_id: None,
                     args: Vec::new(),
                     goal: Some(user_turn.trim().to_owned()),
-                    message: Some(format!(
-                        "已匹配到 agent {}，但没有发现它配置的可用 MCP 工具。请确认对应 MCP 服务已在 mcp server 配置的 HTTP/SSE 地址上可访问。",
-                        agent.id
-                    )),
+                    message: Some(
+                        "我找到了对应服务，但暂时没有拿到可用能力。请检查该服务是否在线，或先刷新一次服务能力缓存。".to_owned()
+                    ),
                 }));
             }
         }
@@ -1121,11 +1893,207 @@ fn configured_agent_mcp_route(
     };
     Ok(Some(NaturalLanguageToolRoute {
         action: "run_tool".to_owned(),
-        tool_id: Some(tool.id),
-        args: vec![format!("query={}", user_turn.trim())],
+        tool_id: Some(tool.id.clone()),
+        args: route_args_for_tool(&tool, user_turn),
         goal: Some(user_turn.trim().to_owned()),
         message: None,
     }))
+}
+
+fn route_args_for_tool(tool: &ToolSpec, user_turn: &str) -> Vec<String> {
+    let mut args = vec![format!("query={}", user_turn.trim())];
+    args.extend(mcp_default_run_args(tool));
+    for rule in &tool_routing_tags().tool_argument_rules {
+        if !tool_matches_any_selector(tool, &rule.selectors) {
+            continue;
+        }
+        args.extend(
+            rule.args
+                .iter()
+                .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value))),
+        );
+        if rule.include_matched_argument_rules {
+            args.extend(matched_routing_argument_args(user_turn));
+        }
+        for context_call in &rule.context_calls {
+            if let Some(context) = fetch_tool_context(context_call) {
+                args.push(format!("{}={context}", context_call.arg));
+            }
+        }
+    }
+    args
+}
+
+fn matched_routing_argument_args(user_turn: &str) -> Vec<String> {
+    tool_routing_tags()
+        .argument_rules
+        .iter()
+        .filter(|rule| text_matches_any(user_turn, &rule.hints))
+        .flat_map(|rule| {
+            rule.args
+                .iter()
+                .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn confirmed_pending_route(
+    user_turn: &str,
+    pending: &Option<PendingToolConfirmation>,
+) -> Option<NaturalLanguageToolRoute> {
+    let pending = pending.as_ref()?;
+    if !is_confirmation_turn(user_turn) {
+        return None;
+    }
+    let item = pending.items.first()?;
+    Some(NaturalLanguageToolRoute {
+        action: "run_tool".to_owned(),
+        tool_id: Some(pending.tool_id.clone()),
+        args: pending_order_args(pending, item, user_turn),
+        goal: Some(user_turn.trim().to_owned()),
+        message: None,
+    })
+}
+
+fn is_confirmation_turn(user_turn: &str) -> bool {
+    text_matches_any(user_turn, &tool_routing_tags().confirmation_hints)
+}
+
+fn pending_order_args(
+    pending: &PendingToolConfirmation,
+    item: &serde_json::Value,
+    user_turn: &str,
+) -> Vec<String> {
+    let mut args = vec![format!("query={}", user_turn.trim())];
+    if let Some(server_id) = pending_tool_server_id(&pending.tool_id)
+        && let Ok(server) = mcp_server_repository().get_server(&server_id)
+    {
+        args.extend(mcp_server_default_run_args(&server));
+    }
+    args.extend(
+        pending
+            .flow
+            .target_args
+            .iter()
+            .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value))),
+    );
+    for mapping in &pending.flow.item_arg_mappings {
+        if let Some(value) = value_for_keys(item, &mapping.keys)
+            && let Some(rendered) = render_item_arg_mapping(value, mapping)
+        {
+            args.push(format!("{}={rendered}", mapping.arg));
+        }
+    }
+    args
+}
+
+fn pending_tool_server_id(tool_id: &str) -> Option<String> {
+    load_cli_tool_catalog().ok().and_then(|catalog| {
+        catalog
+            .list()
+            .into_iter()
+            .find(|tool| tool.id == tool_id)
+            .and_then(|tool| tool.default_command.get(1).cloned())
+    })
+}
+
+fn mcp_default_run_args(tool: &ToolSpec) -> Vec<String> {
+    let Some(server_id) = tool.default_command.get(1) else {
+        return Vec::new();
+    };
+    let Ok(server) = mcp_server_repository().get_server(server_id) else {
+        return Vec::new();
+    };
+    mcp_server_default_run_args(&server)
+}
+
+fn mcp_server_default_run_args(server: &McpServerSpec) -> Vec<String> {
+    server
+        .default_args
+        .iter()
+        .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value)))
+        .collect()
+}
+
+fn jsonish_arg_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn pending_confirmation_from_outcome(
+    outcome: &ToolExecutionOutcome,
+    catalog: &ToolCatalog,
+) -> Option<PendingToolConfirmation> {
+    let flow = tool_routing_tags()
+        .confirmation_flows
+        .iter()
+        .find(|flow| outcome_matches_selectors(outcome, &flow.source_selectors))?;
+    let order_tool = catalog
+        .list()
+        .into_iter()
+        .find(|tool| tool_matches_any_selector(tool, &flow.target_selectors))?;
+    let value = extract_tool_json_from_observations(&outcome.observations)?;
+    let items = extract_items_for_paths(&value, &flow.item_paths)
+        .into_iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return None;
+    }
+    Some(PendingToolConfirmation {
+        tool_id: order_tool.id.clone(),
+        items,
+        flow: flow.clone(),
+    })
+}
+
+fn fetch_tool_context(rule: &ToolContextCallRule) -> Option<String> {
+    let repository = mcp_server_repository();
+    let server = repository.get_server(&rule.server_id).ok()?;
+    if !server.enabled {
+        return None;
+    }
+    let mut context = serde_json::Map::new();
+    for tool_name in &rule.tool_names {
+        if let Ok(value) = call_mcp_tool(
+            &server,
+            tool_name,
+            serde_json::Value::Object(server.default_args.clone().into_iter().collect()),
+        ) {
+            context.insert(tool_name.to_owned(), value);
+        }
+    }
+    if context.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(context).to_string())
+    }
+}
+
+fn outcome_matches_selectors(outcome: &ToolExecutionOutcome, selectors: &[String]) -> bool {
+    selectors.iter().any(|selector| {
+        text_contains_selector(&outcome.tool_id, selector)
+            || outcome
+                .command
+                .iter()
+                .any(|part| text_contains_selector(part, selector))
+    })
+}
+
+fn render_item_arg_mapping(
+    value: &serde_json::Value,
+    mapping: &ToolItemArgMapping,
+) -> Option<String> {
+    match mapping.format.as_deref() {
+        Some("single_menu_item") => value
+            .as_i64()
+            .map(|menu_id| serde_json::json!([{ "menu_id": menu_id, "quantity": 1 }]).to_string()),
+        _ => Some(jsonish_arg_value(value)),
+    }
 }
 
 fn select_agent_by_configured_hints(user_turn: &str) -> Result<Option<AgentProfile>> {
@@ -1163,7 +2131,10 @@ fn select_mcp_tool_for_agent(
         .filter(|tool| {
             is_mcp_tool_command(&tool.default_command)
                 && tool.default_command.get(1).is_some_and(|server_id| {
-                    agent.tool_refs.iter().any(|tool_ref| tool_ref == server_id)
+                    agent
+                        .tool_refs
+                        .iter()
+                        .any(|tool_ref| normalize_mcp_server_id(tool_ref) == *server_id)
                 })
         })
         .map(|tool| (tool.clone(), score_tool_for_goal(tool, user_turn)))
@@ -1172,20 +2143,169 @@ fn select_mcp_tool_for_agent(
         right
             .1
             .cmp(&left.1)
+            .then_with(|| {
+                tool_query_preference(&right.0, user_turn)
+                    .cmp(&tool_query_preference(&left.0, user_turn))
+            })
             .then_with(|| left.0.id.cmp(&right.0.id))
     });
     scored
         .into_iter()
-        .find(|(_, score)| *score > 0)
+        .find(|(tool, score)| *score > 0 || tool_query_preference(tool, user_turn) > 0)
         .map(|(tool, _)| tool)
 }
 
+fn catalog_with_agent_mcp_tools(
+    catalog: &ToolCatalog,
+    agent: &AgentProfile,
+) -> Result<ToolCatalog> {
+    let mut scoped = ToolCatalog::new();
+    for tool in catalog.list() {
+        scoped.register(tool.clone());
+    }
+    let repository = mcp_server_repository();
+    for server_id in &agent.tool_refs {
+        let normalized = normalize_mcp_server_id(server_id);
+        if let Ok(cache) = repository.read_tool_cache(&normalized) {
+            scoped.register_many(cache.tools);
+            continue;
+        }
+        let server = repository.get_server(&normalized)?;
+        if !server.enabled {
+            continue;
+        }
+        let cache = repository.refresh_tool_cache(&server)?;
+        scoped.register_many(cache.tools);
+    }
+    Ok(scoped)
+}
+
 fn select_configured_mcp_tool(selection: &ToolSelection) -> Option<ToolSpec> {
-    selection
+    let selected = selection
         .selected
         .as_ref()
-        .filter(|tool| is_mcp_tool_command(&tool.default_command))
-        .cloned()
+        .filter(|tool| is_mcp_tool_command(&tool.default_command))?;
+    let top_score = selection
+        .candidates
+        .iter()
+        .find(|candidate| candidate.tool.id == selected.id)
+        .map(|candidate| candidate.score)?;
+    let tied_servers = selection
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.score == top_score && top_score > 0)
+        .filter_map(|candidate| candidate.tool.default_command.get(1))
+        .collect::<std::collections::BTreeSet<_>>();
+    if tied_servers.len() > 1 {
+        return None;
+    }
+    Some(selected.clone())
+}
+
+fn tool_query_preference(tool: &ToolSpec, user_turn: &str) -> i32 {
+    let mut score = 0;
+    let routing_tags = tool_routing_tags();
+    for rule in &routing_tags.intent_rules {
+        if text_matches_any(user_turn, &rule.hints)
+            && tool_matches_any_selector(tool, &rule.preferred_selectors)
+        {
+            score += rule.weight;
+        }
+    }
+    for rule in &routing_tags.tool_weights {
+        if tool_matches_any_selector(tool, &rule.selectors) {
+            score += rule.weight;
+        }
+    }
+    score
+}
+
+fn tool_routing_tags() -> &'static ToolRoutingTags {
+    static ROUTING_TAGS: OnceLock<ToolRoutingTags> = OnceLock::new();
+    ROUTING_TAGS.get_or_init(|| load_tool_routing_tags().unwrap_or_default())
+}
+
+fn tool_response_rendering() -> &'static ToolResponseRenderingConfig {
+    static RENDERING: OnceLock<ToolResponseRenderingConfig> = OnceLock::new();
+    RENDERING.get_or_init(|| load_tool_response_rendering().unwrap_or_default())
+}
+
+fn load_tool_routing_tags() -> Result<ToolRoutingTags> {
+    let path = workspace_namespace_root()
+        .join("routing")
+        .join("tool-routing-tags.md");
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read tool routing tags: {}", path.display()))?;
+    let frontmatter = markdown_frontmatter(&content)
+        .with_context(|| format!("missing frontmatter in {}", path.display()))?;
+    serde_yaml::from_str(frontmatter)
+        .with_context(|| format!("failed to parse tool routing tags: {}", path.display()))
+}
+
+fn load_tool_response_rendering() -> Result<ToolResponseRenderingConfig> {
+    let path = workspace_namespace_root()
+        .join("rendering")
+        .join("tool-response-rendering.md");
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read tool response rendering: {}", path.display()))?;
+    let frontmatter = markdown_frontmatter(&content)
+        .with_context(|| format!("missing frontmatter in {}", path.display()))?;
+    serde_yaml::from_str(frontmatter).with_context(|| {
+        format!(
+            "failed to parse tool response rendering: {}",
+            path.display()
+        )
+    })
+}
+
+fn markdown_frontmatter(content: &str) -> Option<&str> {
+    let content = content
+        .strip_prefix("---\r\n")
+        .or_else(|| content.strip_prefix("---\n"))?;
+    let (frontmatter, _) = content
+        .split_once("\r\n---")
+        .or_else(|| content.split_once("\n---"))?;
+    Some(frontmatter)
+}
+
+fn text_matches_any(text: &str, selectors: &[String]) -> bool {
+    selectors
+        .iter()
+        .any(|selector| text_contains_selector(text, selector))
+}
+
+fn tool_matches_any_selector(tool: &ToolSpec, selectors: &[String]) -> bool {
+    selectors
+        .iter()
+        .any(|selector| tool_matches_selector(tool, selector))
+}
+
+fn tool_matches_selector(tool: &ToolSpec, selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    tool.tags
+        .iter()
+        .any(|tag| text_contains_selector(tag, selector))
+        || text_contains_selector(&tool.id, selector)
+        || text_contains_selector(&tool.name, selector)
+        || text_contains_selector(&tool.description, selector)
+        || tool
+            .default_command
+            .iter()
+            .any(|part| text_contains_selector(part, selector))
+}
+
+fn text_contains_selector(text: &str, selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    text.contains(selector)
+        || text
+            .to_ascii_lowercase()
+            .contains(&selector.to_ascii_lowercase())
 }
 
 fn hint_matches_user_turn(user_turn: &str, hint: &str) -> bool {
@@ -1451,6 +2571,574 @@ fn mcp_result_observations(result: &serde_json::Value) -> Vec<String> {
         observations.push(format!("result: {result}"));
     }
     observations
+}
+
+fn render_grounded_tool_reply(outcome: &ToolExecutionOutcome) -> Option<String> {
+    let renderer = renderer_for_outcome(outcome, Some("ranked_items"))?;
+    let value = extract_tool_json_from_observations(&outcome.observations)?;
+    let items = extract_ranked_items(&value, Some(renderer));
+    if items.is_empty() {
+        return Some(render_unrenderable_tool_reply(outcome));
+    }
+
+    let mut lines = vec![if outcome_has_configured_context(outcome, renderer) {
+        renderer
+            .header_with_context
+            .as_deref()
+            .or(renderer.header.as_deref())
+            .unwrap_or("I found these available options:")
+            .to_owned()
+    } else {
+        renderer
+            .header
+            .as_deref()
+            .unwrap_or("I found these available options:")
+            .to_owned()
+    }];
+    let mut items = items.into_iter().take(3);
+    if let Some(primary) = items.next() {
+        if let Some(heading) = &renderer.primary_heading {
+            lines.push(heading.clone());
+        }
+        lines.extend(render_configured_primary_item(primary, renderer));
+    }
+    let alternatives = items.collect::<Vec<_>>();
+    if !alternatives.is_empty() {
+        if let Some(heading) = &renderer.alternatives_heading {
+            lines.push(heading.clone());
+        }
+        for (index, item) in alternatives.into_iter().enumerate() {
+            lines.push(render_configured_alternative_item(
+                index + 2,
+                item,
+                renderer,
+            ));
+        }
+    }
+    if let Some(prompt) = &renderer.confirmation_prompt {
+        lines.push(prompt.clone());
+    }
+    Some(lines.join("\n"))
+}
+
+fn render_configured_primary_item(
+    item: &serde_json::Value,
+    renderer: &ToolResponseRenderer,
+) -> Vec<String> {
+    let mut lines = vec![format!("1. {}", configured_item_name(item, renderer))];
+    for field in &renderer.primary_fields {
+        if let Some(value) = render_configured_field(item, field) {
+            lines.push(format!("   {}: {}", field.label, value));
+        }
+    }
+    if let Some(reason) = configured_item_reason(item, renderer) {
+        lines.push(format!("   Reason: {reason}"));
+    }
+    lines
+}
+
+fn render_configured_alternative_item(
+    index: usize,
+    item: &serde_json::Value,
+    renderer: &ToolResponseRenderer,
+) -> String {
+    let details = renderer
+        .alternative_fields
+        .iter()
+        .filter_map(|field| render_configured_field(item, field))
+        .collect::<Vec<_>>();
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" - {}", details.join("; "))
+    };
+    format!("{index}. {}{suffix}", configured_item_name(item, renderer))
+}
+
+fn configured_item_name(item: &serde_json::Value, renderer: &ToolResponseRenderer) -> String {
+    value_for_keys(item, &renderer.name_keys)
+        .and_then(display_json_value)
+        .unwrap_or_else(|| "Unnamed".to_owned())
+}
+
+fn configured_item_reason(
+    item: &serde_json::Value,
+    renderer: &ToolResponseRenderer,
+) -> Option<String> {
+    for key in &renderer.reason_array_keys {
+        if let Some(values) = value_for_key(item, key).and_then(serde_json::Value::as_array) {
+            let rendered = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| is_user_readable_text(value))
+                .take(2)
+                .map(|value| compact_single_line(value, 80))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !rendered.trim().is_empty() {
+                return Some(rendered);
+            }
+        }
+    }
+    for key in &renderer.reason_keys {
+        if let Some(value) = value_for_key(item, key).and_then(serde_json::Value::as_str) {
+            let value = compact_single_line(value, 110);
+            if !value.trim().is_empty() && is_user_readable_text(&value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn render_unrenderable_tool_reply(outcome: &ToolExecutionOutcome) -> String {
+    renderer_for_outcome(outcome, None)
+        .and_then(|renderer| renderer.empty_reply.clone())
+        .unwrap_or_else(|| {
+            "I found a service result, but could not turn it into a clear list yet.".to_owned()
+        })
+}
+
+fn render_tool_failure_reply(outcome: &ToolExecutionOutcome) -> String {
+    renderer_for_outcome(outcome, None)
+        .and_then(|renderer| renderer.failure_reply.clone())
+        .unwrap_or_else(|| "I did not get a usable result, so I will not invent one.".to_owned())
+}
+
+fn render_order_reply(outcome: &ToolExecutionOutcome) -> Option<String> {
+    let renderer = renderer_for_outcome(outcome, Some("order"))?;
+    let value = extract_tool_json_from_observations(&outcome.observations)?;
+    let mut lines = vec![
+        renderer
+            .order_success
+            .as_deref()
+            .unwrap_or("The order has been submitted.")
+            .to_owned(),
+    ];
+    for field in &renderer.primary_fields {
+        if let Some(value) = render_configured_field(&value, field) {
+            lines.push(format!("{}: {}", field.label, value));
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn extract_ranked_items<'a>(
+    value: &'a serde_json::Value,
+    renderer: Option<&ToolResponseRenderer>,
+) -> Vec<&'a serde_json::Value> {
+    if let Some(array) = value.as_array() {
+        return array.iter().filter(|item| item.is_object()).collect();
+    }
+    let Some(renderer) = renderer else {
+        return Vec::new();
+    };
+    for key in &renderer.item_paths {
+        if let Some(array) = value_for_key(value, key).and_then(serde_json::Value::as_array) {
+            return array.iter().filter(|item| item.is_object()).collect();
+        }
+    }
+    Vec::new()
+}
+
+fn extract_items_for_paths<'a>(
+    value: &'a serde_json::Value,
+    paths: &[String],
+) -> Vec<&'a serde_json::Value> {
+    if let Some(array) = value.as_array() {
+        return array.iter().filter(|item| item.is_object()).collect();
+    }
+    for path in paths {
+        if let Some(array) = value_for_key(value, path).and_then(serde_json::Value::as_array) {
+            return array.iter().filter(|item| item.is_object()).collect();
+        }
+    }
+    Vec::new()
+}
+
+fn renderer_for_outcome<'a>(
+    outcome: &ToolExecutionOutcome,
+    kind: Option<&str>,
+) -> Option<&'a ToolResponseRenderer> {
+    tool_response_rendering()
+        .renderers
+        .iter()
+        .filter(|renderer| kind.is_none_or(|kind| renderer.kind == kind))
+        .find(|renderer| renderer_matches_outcome(renderer, outcome))
+}
+
+fn renderer_matches_outcome(
+    renderer: &ToolResponseRenderer,
+    outcome: &ToolExecutionOutcome,
+) -> bool {
+    if renderer.selectors.is_empty() {
+        return false;
+    }
+    renderer.selectors.iter().any(|selector| {
+        text_contains_selector(&renderer.id, selector)
+            || text_contains_selector(&outcome.tool_id, selector)
+            || outcome
+                .command
+                .iter()
+                .any(|part| text_contains_selector(part, selector))
+    })
+}
+
+fn outcome_has_configured_context(
+    outcome: &ToolExecutionOutcome,
+    renderer: &ToolResponseRenderer,
+) -> bool {
+    let Some(context_arg) = renderer.context_arg.as_deref() else {
+        return false;
+    };
+    outcome
+        .command
+        .iter()
+        .any(|part| part.trim_start().starts_with(&format!("{context_arg}=")))
+}
+
+fn render_configured_field(item: &serde_json::Value, field: &ToolResponseField) -> Option<String> {
+    let value = value_for_keys(item, &field.keys)?;
+    let rendered = match field.format.as_deref() {
+        Some("cents_cny") => value
+            .as_i64()
+            .map(|cents| format!("约 {:.2} 元", cents as f64 / 100.0))
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .map(|cents| format!("约 {:.2} 元", cents / 100.0))
+            }),
+        Some("yuan_cny") => value
+            .as_f64()
+            .map(|yuan| format!("约 {:.2} 元", yuan))
+            .or_else(|| value.as_i64().map(|yuan| format!("约 {:.2} 元", yuan))),
+        Some("status_label") => value.as_str().map(|status| {
+            tool_response_rendering()
+                .renderers
+                .iter()
+                .find_map(|renderer| renderer.status_labels.get(status).cloned())
+                .unwrap_or_else(|| status.to_owned())
+        }),
+        _ => display_json_value(value),
+    }?;
+    Some(compact_single_line(&rendered, field.max_len.unwrap_or(120)))
+}
+
+fn value_for_keys<'a>(
+    value: &'a serde_json::Value,
+    keys: &[String],
+) -> Option<&'a serde_json::Value> {
+    keys.iter().find_map(|key| value_for_key(value, key))
+}
+
+fn value_for_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if key == "." {
+        return Some(value);
+    }
+    if key.starts_with('/') {
+        return value.pointer(key);
+    }
+    let mut current = value;
+    for segment in key.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+fn display_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn legacy_render_grounded_tool_reply(outcome: &ToolExecutionOutcome) -> Option<String> {
+    let value = extract_tool_json_from_observations(&outcome.observations)?;
+    let items = legacy_extract_ranked_items(&value);
+    if items.is_empty() {
+        return Some(render_unrenderable_tool_reply(outcome));
+    }
+
+    let mut lines = vec![if outcome_has_health_context(outcome) {
+        "我结合您的健康数据，查到了这些真实可选项：".to_owned()
+    } else {
+        "我查到了这些真实可选项：".to_owned()
+    }];
+    let mut items = items.into_iter().take(3);
+    if let Some(primary) = items.next() {
+        lines.push("默认推荐：".to_owned());
+        lines.extend(render_primary_recommendation(primary));
+    }
+    let alternatives = items.collect::<Vec<_>>();
+    if !alternatives.is_empty() {
+        lines.push("备选：".to_owned());
+        for (index, item) in alternatives.into_iter().enumerate() {
+            lines.push(render_alternative_recommendation(index + 2, item));
+        }
+    }
+    lines.push("如果确认默认推荐，请回复“确认下单”；想换备选，就回复对应序号。".to_owned());
+    Some(lines.join("\n"))
+}
+
+#[allow(dead_code)]
+fn render_primary_recommendation(item: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let name = item_display_name(item);
+    lines.push(format!("1. {name}"));
+    if let Some(provider) = item_provider_name(item) {
+        lines.push(format!("   商家：{provider}"));
+    }
+    if let Some(area) = item_area(item) {
+        lines.push(format!("   位置：{}", compact_single_line(area, 80)));
+    }
+    if let Some(price) = item_price_text(item) {
+        lines.push(format!("   价格：{price}"));
+    }
+    if let Some(reason) = readable_item_reason(item) {
+        lines.push(format!("   推荐理由：{reason}"));
+    }
+    lines
+}
+
+#[allow(dead_code)]
+fn render_alternative_recommendation(index: usize, item: &serde_json::Value) -> String {
+    let mut details = Vec::new();
+    if let Some(provider) = item_provider_name(item) {
+        details.push(provider.to_owned());
+    }
+    if let Some(price) = item_price_text(item) {
+        details.push(price);
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" - {}", details.join("；"))
+    };
+    format!("{index}. {}{suffix}", item_display_name(item))
+}
+
+#[allow(dead_code)]
+fn item_display_name(item: &serde_json::Value) -> &str {
+    item.get("name")
+        .or_else(|| item.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("未命名")
+}
+
+#[allow(dead_code)]
+fn item_provider_name(item: &serde_json::Value) -> Option<&str> {
+    item.get("provider_name")
+        .or_else(|| item.get("restaurant_name"))
+        .or_else(|| item.get("merchant_name"))
+        .and_then(serde_json::Value::as_str)
+}
+
+#[allow(dead_code)]
+fn item_area(item: &serde_json::Value) -> Option<&str> {
+    item.get("coverage_area")
+        .or_else(|| item.get("address"))
+        .and_then(serde_json::Value::as_str)
+}
+
+#[allow(dead_code)]
+fn item_price_cents(item: &serde_json::Value) -> Option<i64> {
+    item.get("average_price_cents")
+        .or_else(|| item.get("price_cents"))
+        .or_else(|| item.get("total_cents"))
+        .and_then(serde_json::Value::as_i64)
+}
+
+#[allow(dead_code)]
+fn item_price_text(item: &serde_json::Value) -> Option<String> {
+    if let Some(price) = item_price_cents(item) {
+        return Some(format!("约 {:.2} 元", price as f64 / 100.0));
+    }
+    item.get("total")
+        .or_else(|| item.get("unit_price"))
+        .and_then(serde_json::Value::as_f64)
+        .map(|price| format!("约 {:.2} 元", price))
+}
+
+#[allow(dead_code)]
+fn item_provider_id(item: &serde_json::Value) -> Option<i64> {
+    item.get("provider_id")
+        .or_else(|| item.get("restaurant_id"))
+        .or_else(|| item.get("backend_provider_id"))
+        .and_then(serde_json::Value::as_i64)
+}
+
+#[allow(dead_code)]
+fn item_menu_id(item: &serde_json::Value) -> Option<i64> {
+    item.get("menu_id")
+        .or_else(|| item.get("id"))
+        .or_else(|| item.get("listing_id"))
+        .or_else(|| item.get("backend_listing_id"))
+        .and_then(serde_json::Value::as_i64)
+}
+
+#[allow(dead_code)]
+fn outcome_has_health_context(outcome: &ToolExecutionOutcome) -> bool {
+    outcome
+        .command
+        .iter()
+        .any(|part| part.trim_start().starts_with("health_context="))
+}
+
+#[allow(dead_code)]
+fn readable_item_reason(item: &serde_json::Value) -> Option<String> {
+    for key in ["recommendation_reasons", "health_advice"] {
+        if let Some(values) = item.get(key).and_then(serde_json::Value::as_array) {
+            let rendered = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| is_user_readable_text(value))
+                .take(2)
+                .map(|value| compact_single_line(value, 80))
+                .collect::<Vec<_>>()
+                .join("；");
+            if !rendered.trim().is_empty() {
+                return Some(rendered);
+            }
+        }
+    }
+    for key in [
+        "recommendation_reason",
+        "health_reason",
+        "reason",
+        "why",
+        "description",
+        "summary",
+    ] {
+        if let Some(value) = item.get(key).and_then(serde_json::Value::as_str) {
+            let value = compact_single_line(value, 110);
+            if !value.trim().is_empty() && is_user_readable_text(&value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn is_user_readable_text(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let has_cjk = trimmed
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    has_cjk || (!trimmed.contains('_') && !trimmed.contains('-'))
+}
+
+#[allow(dead_code)]
+fn legacy_render_unrenderable_tool_reply(outcome: &ToolExecutionOutcome) -> String {
+    let _ = outcome;
+    "我已经查到了服务结果，但暂时不能整理成清晰的候选列表。请稍后再试一次。".to_owned()
+}
+
+#[allow(dead_code)]
+fn legacy_render_tool_failure_reply(outcome: &ToolExecutionOutcome) -> String {
+    let _ = outcome;
+    "我刚才没有查到可用结果，先不编推荐。请稍后再试一次。".to_owned()
+}
+
+#[allow(dead_code)]
+fn legacy_render_order_reply(outcome: &ToolExecutionOutcome) -> Option<String> {
+    let value = extract_tool_json_from_observations(&outcome.observations)?;
+    let order_id = value
+        .get("order_id")
+        .or_else(|| value.get("id"))
+        .or_else(|| value.pointer("/order/id"))
+        .and_then(serde_json::Value::as_i64);
+    let status = value
+        .get("status")
+        .or_else(|| value.pointer("/order/status"))
+        .and_then(serde_json::Value::as_str);
+    let total_cents = value
+        .get("total_cents")
+        .or_else(|| value.get("price_cents"))
+        .or_else(|| value.pointer("/order/total_cents"))
+        .and_then(serde_json::Value::as_i64);
+    let total_yuan = value
+        .get("total")
+        .or_else(|| value.pointer("/order/total"))
+        .and_then(serde_json::Value::as_f64);
+    let message = value.get("message").and_then(serde_json::Value::as_str);
+    let mut lines = vec!["已按默认推荐为您提交订单。".to_owned()];
+    if let Some(order_id) = order_id {
+        lines.push(format!("订单号：{order_id}"));
+    }
+    if let Some(status) = status {
+        lines.push(format!("状态：{}", readable_order_status(status)));
+    }
+    if let Some(total_cents) = total_cents {
+        lines.push(format!("金额：约 {:.2} 元", total_cents as f64 / 100.0));
+    } else if let Some(total_yuan) = total_yuan {
+        lines.push(format!("金额：约 {:.2} 元", total_yuan));
+    }
+    if let Some(message) = message {
+        lines.push(compact_single_line(message, 120));
+    }
+    Some(lines.join("\n"))
+}
+
+#[allow(dead_code)]
+fn readable_order_status(status: &str) -> &str {
+    match status {
+        "pending" => "待确认",
+        "confirmed" => "已确认",
+        "cancelled" => "已取消",
+        "created" => "已创建",
+        _ => status,
+    }
+}
+
+fn extract_tool_json_from_observations(observations: &[String]) -> Option<serde_json::Value> {
+    for observation in observations {
+        let text = observation
+            .strip_prefix("text: ")
+            .or_else(|| observation.strip_prefix("result: "))
+            .or_else(|| observation.strip_prefix("content: "))
+            .unwrap_or(observation);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn legacy_extract_ranked_items(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    if let Some(array) = value.as_array() {
+        return array.iter().filter(|item| item.is_object()).collect();
+    }
+    for key in [
+        "recommended",
+        "restaurants",
+        "items",
+        "results",
+        "products",
+        "orders",
+        "dishes",
+        "meals",
+        "menus",
+        "menu",
+        "combos",
+        "recommendations",
+        "data",
+    ] {
+        if let Some(array) = value.get(key).and_then(serde_json::Value::as_array) {
+            return array.iter().filter(|item| item.is_object()).collect();
+        }
+    }
+    Vec::new()
 }
 
 fn print_mcp_result(result: &serde_json::Value) {
@@ -2147,7 +3835,7 @@ fn render_tool_execution_context(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Executed tool for this user turn:\n- tool_id: {}\n- success: {}\n- summary: {}\n- command: {}\n- planned_tool_id: {}\n- observations:\n{}",
+        "Internal execution record for this user turn. Use it to answer naturally, but do not reveal tool ids, MCP server names, method names, commands, or raw implementation identifiers to the user.\n- tool_id: {}\n- success: {}\n- summary: {}\n- command: {}\n- planned_tool_id: {}\n- observations:\n{}",
         outcome.tool_id,
         outcome.success,
         outcome.summary,
@@ -2161,12 +3849,12 @@ fn render_chat_error(error: &hc_llm::LlmError) -> String {
     let message = error.to_string();
     if message.contains("invalid chat setting") {
         return format!(
-            "error> provider rejected the chat request: invalid chat setting. 已保留当前会话，可继续输入或 /clear 后重试。\nprovider> {message}"
+            "error> provider rejected the chat request: invalid chat setting. Current session is preserved; continue typing or use /clear and retry.\nprovider> {message}"
         );
     }
     if is_timeout_error(error) {
         return format!(
-            "error> provider request timed out. 这是当前 provider 的网络/响应超时，当前会话已保留；可以继续重试、切换 HC_LLM_PROVIDER/HC_LLM_MODEL，或稍后再试。\nprovider> {message}"
+            "error> provider request timed out. Current session is preserved; retry, switch HC_LLM_PROVIDER/HC_LLM_MODEL, or try again later.\nprovider> {message}"
         );
     }
     format!("error> {message}")
@@ -2188,9 +3876,11 @@ fn load_cli_tool_catalog() -> Result<ToolCatalog> {
     }
     if let Ok(servers) = mcp_server_repository().list_servers() {
         for server in servers {
-            match discover_mcp_tools(&server) {
-                Ok(tools) => catalog.register_many(tools),
-                Err(error) => eprintln!("warning> mcp discovery skipped {}: {error}", server.id),
+            if !server.enabled {
+                continue;
+            }
+            if let Ok(cache) = mcp_server_repository().read_tool_cache(&server.id) {
+                catalog.register_many(cache.tools);
             }
         }
     }
@@ -2214,6 +3904,10 @@ fn agent_repository() -> AgentRepository {
 
 fn skill_repository() -> SkillRepository {
     SkillRepository::with_namespace(workspace_root(), runtime_namespace())
+}
+
+fn schedule_repository() -> ScheduleRepository {
+    ScheduleRepository::with_namespace(workspace_root(), runtime_namespace())
 }
 
 fn runtime_namespace() -> WorkspaceNamespace {
@@ -2262,6 +3956,31 @@ fn parse_usize_arg(value: &str, name: &str) -> Result<usize> {
         bail!("{name} must be greater than 0");
     }
     Ok(parsed)
+}
+
+fn parse_u64_arg(value: &str, name: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("invalid value for {name}: {value}"))
+}
+
+fn parse_schedule_kind(value: &str) -> Result<hc_scheduler::ScheduleKind> {
+    match value {
+        "once" => Ok(hc_scheduler::ScheduleKind::Once),
+        "interval" => Ok(hc_scheduler::ScheduleKind::Interval),
+        other => bail!("unsupported schedule kind: {other}"),
+    }
+}
+
+fn parse_scheduled_target_kind(value: &str) -> Result<ScheduledTargetKind> {
+    match value {
+        "agent" => Ok(ScheduledTargetKind::Agent),
+        "tool" => Ok(ScheduledTargetKind::Tool),
+        "mcp" => Ok(ScheduledTargetKind::Mcp),
+        "command" => Ok(ScheduledTargetKind::Command),
+        "event" => Ok(ScheduledTargetKind::Event),
+        other => bail!("unsupported scheduled target kind: {other}"),
+    }
 }
 
 fn split_chat_command(input: &str) -> Vec<String> {
@@ -2595,15 +4314,20 @@ fn render_tool_chat_system_prompt(
     catalog: &ToolCatalog,
     user_system: Option<&str>,
 ) -> Result<String> {
+    let user_guidance = render_optional_guidance(user_system);
+    let guidance = merge_optional_contexts([
+        Some(
+            "User-facing wording rule: never expose internal tool ids, MCP server ids, method names, commands, JSON-RPC details, or implementation identifiers. Describe capabilities in plain user language instead."
+                .to_owned(),
+        ),
+        (!user_guidance.trim().is_empty()).then_some(user_guidance),
+    ]);
     render_prompt_template(
         load_tool_chat_prompt(&runtime_namespace())?,
         &[
             ("available_tools", render_available_tools(catalog)),
             ("selected_tool", String::new()),
-            (
-                "additional_system_guidance",
-                render_optional_guidance(user_system),
-            ),
+            ("additional_system_guidance", guidance.unwrap_or_default()),
         ],
     )
 }
@@ -2696,7 +4420,7 @@ fn render_tool_selection_context(selection: &ToolSelection) -> Option<String> {
     let mut sections = Vec::new();
     if let Some(tool) = &selection.selected {
         sections.push(format!(
-            "Selected tool for this user turn:\n{}",
+            "Internal selected tool for this user turn. Do not reveal these ids, commands, or method names to the user:\n{}",
             render_tool_context(tool)
         ));
     }
@@ -2714,7 +4438,9 @@ fn render_tool_selection_context(selection: &ToolSelection) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     if !candidates.trim().is_empty() {
-        sections.push(format!("Tool candidates for this user turn:\n{candidates}"));
+        sections.push(format!(
+            "Internal tool candidates for this user turn. Do not reveal these ids, commands, or method names to the user:\n{candidates}"
+        ));
     }
 
     Some(sections.join("\n\n"))
@@ -2787,6 +4513,7 @@ fn render_optional_guidance(user_system: Option<&str>) -> String {
 fn prompt_raw(editor: &mut DefaultEditor) -> Result<Option<String>> {
     match editor.readline("you> ") {
         Ok(input) => {
+            let input = repair_console_mojibake(&input);
             if !input.trim().is_empty() {
                 let _ = editor.add_history_entry(input.as_str());
             }
@@ -2796,6 +4523,48 @@ fn prompt_raw(editor: &mut DefaultEditor) -> Result<Option<String>> {
         Err(ReadlineError::Eof) => Ok(None),
         Err(error) => Err(anyhow::Error::new(error)).context("failed to read interactive input"),
     }
+}
+
+fn repair_console_mojibake(input: &str) -> String {
+    if !looks_like_utf8_decoded_as_gbk(input) {
+        return input.to_owned();
+    }
+    let (bytes, _, _) = GB18030.encode(input);
+    let bytes = match bytes {
+        Cow::Borrowed(bytes) => bytes.to_vec(),
+        Cow::Owned(bytes) => bytes,
+    };
+    let Ok(repaired) = String::from_utf8(bytes) else {
+        return input.to_owned();
+    };
+    if repair_score(&repaired) > repair_score(input) {
+        repaired
+    } else {
+        input.to_owned()
+    }
+}
+
+fn looks_like_utf8_decoded_as_gbk(input: &str) -> bool {
+    let suspicious = [
+        "\u{6d93}", "\u{9391}", "\u{937a}", "\u{6d60}", "\u{6d94}", "\u{953b}", "\u{9239}",
+        "\u{99c3}", "\u{20ac}",
+    ];
+    suspicious.iter().any(|marker| input.contains(marker))
+}
+
+fn repair_score(input: &str) -> i32 {
+    let cjk = input
+        .chars()
+        .filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch))
+        .count() as i32;
+    let suspicious = [
+        "\u{6d93}", "\u{9391}", "\u{937a}", "\u{6d60}", "\u{6d94}", "\u{953b}", "\u{9239}",
+        "\u{99c3}", "\u{20ac}",
+    ]
+    .iter()
+    .filter(|marker| input.contains(*marker))
+    .count() as i32;
+    cjk - suspicious * 10
 }
 
 fn env_file_path() -> Result<PathBuf> {
@@ -2865,6 +4634,17 @@ fn print_help() {
     println!("hc-tool-cli mcp list [--json]");
     println!("hc-tool-cli mcp tools [--json]");
     println!("hc-tool-cli mcp call <server-id> <tool-name> [key=value ...] [--json]");
+    println!(
+        "hc-tool-cli schedule add --id <id> --title <text> --kind <once|interval> --run-at-unix <ts> [--interval-seconds <n>] --target-kind <agent|tool|mcp|command|event> --target-ref <id> [--target-action <name>] [--arg key=value] [--json]"
+    );
+    println!("hc-tool-cli schedule list [--json]");
+    println!("hc-tool-cli schedule run-due [--now-unix <ts>] [--json]");
+    println!("hc-tool-cli schedule runs [--json]");
+    println!("hc-tool-cli schedule pause --id <id> [--json]");
+    println!("hc-tool-cli schedule resume --id <id> [--json]");
+    println!("hc-tool-cli schedule dispatch-due [--now-unix <ts>] [--json]");
+    println!("hc-tool-cli schedule dispatch-queued [--now-unix <ts>] [--json]");
+    println!("hc-tool-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]");
     println!("hc-tool-cli show <rg|cargo-test|tool-id> [--json]");
     println!("hc-tool-cli plan <auto|rg|cargo-test|tool-id> <goal...> [--json]");
     println!(
