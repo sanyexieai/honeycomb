@@ -9,6 +9,7 @@ pub mod orchestrator;
 pub mod persistence;
 pub mod planning;
 pub mod profile;
+pub mod routing;
 pub mod task;
 pub mod view;
 pub mod workbench;
@@ -54,6 +55,7 @@ pub use planning::{
     AgentProposal, AgentRuntimeBudget, EvolutionIssue, TaskPlan, TaskPlanStatus, WorkItem,
 };
 pub use profile::{AgentKind, AgentProfile, AgentProfileSummary, AgentRepository};
+pub use routing::{best_phrase_match_score, phrase_match_score, route_match_terms};
 pub use task::{TaskBudget, TaskContext, TaskNamespace, TaskRequest};
 pub use view::{AgentCardView, AssetSummaryView, WorkspaceViewModel, build_workspace_view};
 pub use workbench::{AgentWorkbench, WorkspacePhase, bootstrap_task_workbench};

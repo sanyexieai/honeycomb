@@ -1,5 +1,7 @@
 use anyhow::Result;
-use hc_agent::{AgentProfile, AgentRepository, DomainProfile, DomainRepository};
+use hc_agent::{
+    AgentProfile, AgentRepository, DomainProfile, DomainRepository, best_phrase_match_score,
+};
 use hc_protocol::{
     AgentListResponse, AgentProfileSummary, AgentRouteCandidate, AgentRouteRequest,
     AgentRouteResponse, ApiNamespace, DomainListResponse, DomainProfileSummary,
@@ -26,6 +28,8 @@ pub fn list_agents(config: &ServiceConfig, namespace: ApiNamespace) -> Result<Ag
                 domain_id: summary.domain_id,
                 priority: summary.priority,
                 intent_hints: summary.intent_hints,
+                routing_examples: summary.routing_examples,
+                negative_routing_examples: summary.negative_routing_examples,
                 tool_refs: summary.tool_refs,
                 memory_scope_refs: summary.memory_scope_refs,
                 tags: summary.tags,
@@ -52,6 +56,8 @@ pub fn list_domains(config: &ServiceConfig, namespace: ApiNamespace) -> Result<D
                 project_id: summary.project_id,
                 priority: summary.priority,
                 intent_hints: summary.intent_hints,
+                routing_examples: summary.routing_examples,
+                negative_routing_examples: summary.negative_routing_examples,
                 default_agent_id: summary.default_agent_id,
                 tool_refs: summary.tool_refs,
                 memory_scope_refs: summary.memory_scope_refs,
@@ -148,24 +154,60 @@ fn score_agent(
         }
     }
 
-    for hint in &agent.intent_hints {
-        if contains_hint(input, hint) {
-            score += 50;
-            reasons.push(format!("agent_hint:{hint}"));
-        }
-    }
+    add_route_score(
+        &mut score,
+        &mut reasons,
+        "agent_hint",
+        input,
+        &agent.intent_hints,
+        50,
+    );
+    add_route_score(
+        &mut score,
+        &mut reasons,
+        "agent_example",
+        input,
+        &agent.routing_examples,
+        45,
+    );
+    subtract_route_score(
+        &mut score,
+        &mut reasons,
+        "agent_negative_example",
+        input,
+        &agent.negative_routing_examples,
+        60,
+    );
 
     if let Some(domain) = agent
         .domain_id
         .as_deref()
         .and_then(|domain_id| domains.iter().find(|domain| domain.id == domain_id))
     {
-        for hint in &domain.intent_hints {
-            if contains_hint(input, hint) {
-                score += 30;
-                reasons.push(format!("domain_hint:{hint}"));
-            }
-        }
+        add_route_score(
+            &mut score,
+            &mut reasons,
+            "domain_hint",
+            input,
+            &domain.intent_hints,
+            30,
+        );
+        add_route_score(
+            &mut score,
+            &mut reasons,
+            "domain_example",
+            input,
+            &domain.routing_examples,
+            28,
+        );
+        subtract_route_score(
+            &mut score,
+            &mut reasons,
+            "domain_negative_example",
+            input,
+            &domain.negative_routing_examples,
+            35,
+        );
         if score > 0 {
             score += agent.priority / 10;
             score += domain.priority / 20;
@@ -184,7 +226,32 @@ fn score_agent(
     }
 }
 
-fn contains_hint(input: &str, hint: &str) -> bool {
-    let hint = hint.trim().to_lowercase();
-    !hint.is_empty() && input.contains(&hint)
+fn add_route_score(
+    score: &mut i32,
+    reasons: &mut Vec<String>,
+    reason: &str,
+    input: &str,
+    phrases: &[String],
+    weight: i32,
+) {
+    let matched = best_phrase_match_score(input, phrases);
+    if matched > 0 {
+        *score += weight * matched / 100;
+        reasons.push(format!("{reason}:{matched}"));
+    }
+}
+
+fn subtract_route_score(
+    score: &mut i32,
+    reasons: &mut Vec<String>,
+    reason: &str,
+    input: &str,
+    phrases: &[String],
+    weight: i32,
+) {
+    let matched = best_phrase_match_score(input, phrases);
+    if matched > 0 {
+        *score -= weight * matched / 100;
+        reasons.push(format!("{reason}:{matched}"));
+    }
 }

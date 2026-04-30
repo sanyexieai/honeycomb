@@ -21,6 +21,7 @@ use hc_store::store::WorkspaceNamespace;
 use crate::{ServiceConfig, agent::route_agent};
 
 pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Result<ChatResponse> {
+    let request = normalize_chat_request(request);
     let memory_namespace = memory_namespace_from_api(&request.memory.namespace);
     let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
     let agent_context = resolve_agent_context(config, &request)?;
@@ -60,6 +61,9 @@ pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Resu
         message: api_message_from_llm(response.response.message),
         model: response.response.model.model,
         provider: response.response.model.provider,
+        tenant_id: Some(request.memory.namespace.tenant_id.clone()),
+        user_id: Some(request.memory.namespace.user_id.clone()),
+        session_id: request.session_id.clone(),
         selected_agent_id: agent_context
             .as_ref()
             .map(|context| context.agent.id.clone()),
@@ -73,6 +77,33 @@ pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Resu
             .collect(),
         synthesized_prompt_asset_count: response.synthesized_prompt_assets.len(),
     })
+}
+
+fn normalize_chat_request(mut request: ChatRequest) -> ChatRequest {
+    if let Some(tenant_id) = normalized_optional_string(request.tenant_id.take()) {
+        request.memory.namespace.tenant_id = tenant_id;
+    }
+    if let Some(user_id) = normalized_optional_string(request.user_id.take()) {
+        request.memory.namespace.user_id = user_id;
+    }
+    request.tenant_id = Some(request.memory.namespace.tenant_id.clone());
+    request.user_id = Some(request.memory.namespace.user_id.clone());
+    request.session_id = normalized_optional_string(request.session_id.take())
+        .or_else(|| Some(default_session_id(&request.memory.namespace)));
+    request
+}
+
+fn normalized_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_session_id(namespace: &ApiNamespace) -> String {
+    format!(
+        "session.{}.{}.default",
+        namespace.tenant_id, namespace.user_id
+    )
 }
 
 #[derive(Debug, Clone)]

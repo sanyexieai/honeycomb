@@ -16,6 +16,10 @@ use hc_service::{
     ServiceConfig,
     agent::{list_agents, list_domains, route_agent},
     chat::handle_chat_request,
+    conversation::{
+        conversation_inbox_snapshot, dismiss_agent_turn_proposal, draft_agent_turn_proposal,
+        mark_agent_turn_proposal_sent, process_conversation_inbox, publish_conversation_event,
+    },
     scheduler::dispatch_due_scheduled_runs,
     tool::list_mcp_servers,
 };
@@ -33,6 +37,46 @@ struct NamespaceQuery {
     tenant_id: String,
     #[serde(default = "default_user_id")]
     user_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConversationEventRequest {
+    #[serde(default)]
+    namespace: ApiNamespace,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    kind: String,
+    #[serde(default)]
+    room_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    payload: serde_json::Map<String, Value>,
+    #[serde(default)]
+    due_at_unix: Option<u64>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProposalActionRequest {
+    #[serde(default)]
+    namespace: ApiNamespace,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    proposal_id: String,
 }
 
 #[tokio::main]
@@ -51,6 +95,21 @@ async fn main() -> Result<()> {
         .route("/v1/agents", get(agents))
         .route("/v1/domains", get(domains))
         .route("/v1/mcp/servers", get(mcp_servers))
+        .route("/v1/conversation/inbox", get(conversation_inbox))
+        .route("/v1/conversation/events", post(conversation_event))
+        .route("/v1/conversation/process", post(conversation_process))
+        .route(
+            "/v1/conversation/proposals/draft",
+            post(conversation_proposal_draft),
+        )
+        .route(
+            "/v1/conversation/proposals/sent",
+            post(conversation_proposal_sent),
+        )
+        .route(
+            "/v1/conversation/proposals/dismiss",
+            post(conversation_proposal_dismiss),
+        )
         .route("/v1/agents/route", post(agent_route))
         .route("/v1/chat", post(chat))
         .with_state(state);
@@ -62,6 +121,124 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("api server failed")
+}
+
+async fn conversation_inbox(
+    State(state): State<AppState>,
+    Query(query): Query<NamespaceQuery>,
+) -> Result<Json<hc_service::conversation::ConversationInboxSnapshot>, ApiError> {
+    let namespace = ApiNamespace {
+        tenant_id: query.tenant_id,
+        user_id: query.user_id,
+    };
+    let _session_id = normalized_optional_string(query.session_id)
+        .unwrap_or_else(|| default_session_id(&namespace));
+    let response = tokio::task::spawn_blocking(move || {
+        conversation_inbox_snapshot(&state.service, namespace, None)
+    })
+    .await
+    .map_err(|error| ApiError(anyhow!("conversation inbox worker failed: {error}")))?
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn conversation_event(
+    State(state): State<AppState>,
+    Json(request): Json<ConversationEventRequest>,
+) -> Result<Json<hc_conversation::ConversationEvent>, ApiError> {
+    let namespace =
+        normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let mut event = hc_conversation::ConversationEvent::new(request.kind);
+    event.room_id = normalized_optional_string(request.room_id)
+        .or_else(|| normalized_optional_string(request.session_id))
+        .or_else(|| Some(default_session_id(&namespace)));
+    event.agent_id = request.agent_id;
+    event.payload = request.payload;
+    event.due_at_unix = request.due_at_unix;
+    if !request.tags.is_empty() {
+        event.tags = request.tags;
+    }
+    event.notes = request.notes;
+    let response = tokio::task::spawn_blocking(move || {
+        publish_conversation_event(&state.service, namespace, event)
+    })
+    .await
+    .map_err(|error| ApiError(anyhow!("conversation event worker failed: {error}")))?
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn conversation_process(
+    State(state): State<AppState>,
+    Json(mut namespace): Json<ApiNamespace>,
+) -> Result<Json<hc_service::conversation::ConversationProcessReport>, ApiError> {
+    namespace = normalized_request_namespace(namespace, None, None);
+    let response = tokio::task::spawn_blocking(move || {
+        process_conversation_inbox(&state.service, namespace, None)
+    })
+    .await
+    .map_err(|error| ApiError(anyhow!("conversation process worker failed: {error}")))?
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn conversation_proposal_draft(
+    State(state): State<AppState>,
+    Json(request): Json<ProposalActionRequest>,
+) -> Result<Json<hc_service::conversation::AgentTurnDraft>, ApiError> {
+    let namespace =
+        normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let _session_id = normalized_optional_string(request.session_id)
+        .unwrap_or_else(|| default_session_id(&namespace));
+    let response = tokio::task::spawn_blocking(move || {
+        draft_agent_turn_proposal(&state.service, namespace, &request.proposal_id)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(anyhow!(
+            "conversation proposal draft worker failed: {error}"
+        ))
+    })?
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn conversation_proposal_sent(
+    State(state): State<AppState>,
+    Json(request): Json<ProposalActionRequest>,
+) -> Result<Json<hc_conversation::AgentTurnProposal>, ApiError> {
+    let namespace =
+        normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let _session_id = normalized_optional_string(request.session_id)
+        .unwrap_or_else(|| default_session_id(&namespace));
+    let response = tokio::task::spawn_blocking(move || {
+        mark_agent_turn_proposal_sent(&state.service, namespace, &request.proposal_id)
+    })
+    .await
+    .map_err(|error| ApiError(anyhow!("conversation proposal sent worker failed: {error}")))?
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn conversation_proposal_dismiss(
+    State(state): State<AppState>,
+    Json(request): Json<ProposalActionRequest>,
+) -> Result<Json<hc_conversation::AgentTurnProposal>, ApiError> {
+    let namespace =
+        normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let _session_id = normalized_optional_string(request.session_id)
+        .unwrap_or_else(|| default_session_id(&namespace));
+    let response = tokio::task::spawn_blocking(move || {
+        dismiss_agent_turn_proposal(&state.service, namespace, &request.proposal_id)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(anyhow!(
+            "conversation proposal dismiss worker failed: {error}"
+        ))
+    })?
+    .map_err(ApiError::from)?;
+    Ok(Json(response))
 }
 
 fn start_scheduler_loop_if_enabled(service: ServiceConfig) {
@@ -106,6 +283,39 @@ fn start_scheduler_loop_if_enabled(service: ServiceConfig) {
             }
         }
     });
+}
+
+fn normalized_request_namespace(
+    mut namespace: ApiNamespace,
+    tenant_id: Option<String>,
+    user_id: Option<String>,
+) -> ApiNamespace {
+    if let Some(tenant_id) = normalized_optional_string(tenant_id) {
+        namespace.tenant_id = tenant_id;
+    }
+    if let Some(user_id) = normalized_optional_string(user_id) {
+        namespace.user_id = user_id;
+    }
+    if namespace.tenant_id.trim().is_empty() {
+        namespace.tenant_id = default_tenant_id();
+    }
+    if namespace.user_id.trim().is_empty() {
+        namespace.user_id = default_user_id();
+    }
+    namespace
+}
+
+fn normalized_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_session_id(namespace: &ApiNamespace) -> String {
+    format!(
+        "session.{}.{}.default",
+        namespace.tenant_id, namespace.user_id
+    )
 }
 
 fn env_flag(name: &str) -> bool {
@@ -476,6 +686,20 @@ fn openapi_document() -> Value {
                 "ChatRequest": {
                     "type": "object",
                     "properties": {
+                        "tenant_id": {
+                            "type": "string",
+                            "default": "local",
+                            "description": "Optional tenant id. Empty values use the default tenant."
+                        },
+                        "user_id": {
+                            "type": "string",
+                            "default": "default",
+                            "description": "Optional user id. Empty values use the default user."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional conversation/session id. Empty values use a namespace-scoped default session."
+                        },
                         "input": {
                             "type": "string",
                             "description": "Convenience single-turn user message. Appended after messages when both are present."
@@ -558,6 +782,9 @@ fn openapi_document() -> Value {
                         "message": { "$ref": "#/components/schemas/ApiChatMessage" },
                         "model": { "type": "string" },
                         "provider": { "type": "string" },
+                        "tenant_id": { "type": "string" },
+                        "user_id": { "type": "string" },
+                        "session_id": { "type": "string" },
                         "selected_agent_id": { "type": "string" },
                         "selected_domain_id": { "type": "string" },
                         "recalled_memories": {

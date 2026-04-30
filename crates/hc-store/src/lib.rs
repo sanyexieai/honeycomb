@@ -1,5 +1,7 @@
 //! Markdown-first storage primitives.
 
+pub mod index;
+
 pub mod store {
     use anyhow::{Context, Result, bail};
     use rusqlite::{Connection, params};
@@ -64,6 +66,8 @@ pub mod store {
         pub memory_kind: Option<String>,
         pub asset_kind: Option<String>,
         pub body_preview: String,
+        #[serde(default)]
+        pub semantic_text: String,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +137,7 @@ pub mod store {
                     entry.title.as_str(),
                     entry.relative_path.as_str(),
                     entry.body_preview.as_str(),
+                    entry.semantic_text.as_str(),
                 ];
                 let metadata_match = haystacks
                     .iter()
@@ -430,7 +435,8 @@ pub mod store {
                     layer TEXT,
                     memory_kind TEXT,
                     asset_kind TEXT,
-                    body_preview TEXT NOT NULL
+                    body_preview TEXT NOT NULL,
+                    semantic_text TEXT NOT NULL
                 );
 
                 CREATE VIRTUAL TABLE markdown_documents_fts USING fts5(
@@ -447,7 +453,8 @@ pub mod store {
                     layer,
                     memory_kind,
                     asset_kind,
-                    body_preview
+                    body_preview,
+                    semantic_text
                 );
                 "#,
             )
@@ -462,8 +469,8 @@ pub mod store {
                     INSERT INTO markdown_documents (
                         relative_path, id, doc_type, title, tags, status,
                         relations, owners, capabilities, room_id, layer,
-                        memory_kind, asset_kind, body_preview
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                        memory_kind, asset_kind, body_preview, semantic_text
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                     "#,
                 )?;
                 let mut insert_fts = tx.prepare(
@@ -471,8 +478,8 @@ pub mod store {
                     INSERT INTO markdown_documents_fts (
                         relative_path, id, doc_type, title, tags, status,
                         relations, owners, capabilities, room_id, layer,
-                        memory_kind, asset_kind, body_preview
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                        memory_kind, asset_kind, body_preview, semantic_text
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                     "#,
                 )?;
 
@@ -496,7 +503,8 @@ pub mod store {
                         entry.layer.as_deref(),
                         entry.memory_kind.as_deref(),
                         entry.asset_kind.as_deref(),
-                        entry.body_preview
+                        entry.body_preview,
+                        entry.semantic_text
                     ];
                     insert_doc.execute(values)?;
                     insert_fts.execute(params![
@@ -513,7 +521,8 @@ pub mod store {
                         entry.layer.clone().unwrap_or_default(),
                         entry.memory_kind.clone().unwrap_or_default(),
                         entry.asset_kind.clone().unwrap_or_default(),
-                        entry.body_preview
+                        entry.body_preview,
+                        entry.semantic_text
                     ])?;
                 }
             }
@@ -847,13 +856,15 @@ pub mod store {
                 None
             }
         });
+        let tags = string_list_field(mapping, "tags");
+        let semantic_text = markdown_semantic_text(mapping, body, &title, &tags);
 
         Ok(MarkdownIndexEntry {
             id,
             doc_type,
             title,
             relative_path: normalized_path(relative_path),
-            tags: string_list_field(mapping, "tags"),
+            tags,
             status: optional_string_field(mapping, "status"),
             visibility: optional_string_field(mapping, "visibility"),
             tenant_id: optional_string_field(mapping, "tenant_id"),
@@ -868,6 +879,7 @@ pub mod store {
             memory_kind: optional_string_field(mapping, "memory_kind"),
             asset_kind: optional_string_field(mapping, "asset_kind"),
             body_preview: preview_text(body, 160),
+            semantic_text,
         })
     }
 
@@ -889,13 +901,15 @@ pub mod store {
                     .map(|value| value.replace(['-', '_', '.'], " "))
             })
             .unwrap_or_else(|| id.clone());
+        let tags = json_string_list_field(&sidecar, "tags").unwrap_or_default();
+        let semantic_text = plain_markdown_semantic_text(&sidecar, body, &title, &tags);
 
         Ok(MarkdownIndexEntry {
             id,
             doc_type,
             title,
             relative_path: normalized,
-            tags: json_string_list_field(&sidecar, "tags").unwrap_or_default(),
+            tags,
             status: optional_json_string_field(&sidecar, "status"),
             visibility: optional_json_string_field(&sidecar, "visibility"),
             tenant_id: optional_json_string_field(&sidecar, "tenant_id"),
@@ -910,6 +924,7 @@ pub mod store {
             memory_kind: optional_json_string_field(&sidecar, "memory_kind"),
             asset_kind: optional_json_string_field(&sidecar, "asset_kind"),
             body_preview: preview_text(body, 160),
+            semantic_text,
         })
     }
 
@@ -980,6 +995,70 @@ pub mod store {
         optional_string_field(mapping, field).ok_or_else(|| {
             anyhow::anyhow!("markdown frontmatter is missing required field `{field}`")
         })
+    }
+
+    fn markdown_semantic_text(
+        mapping: &serde_yaml::Mapping,
+        body: &str,
+        title: &str,
+        tags: &[String],
+    ) -> String {
+        let mut parts = vec![title.to_owned(), tags.join(" "), preview_text(body, 1200)];
+        for field in [
+            "intent_hints",
+            "routing_examples",
+            "tool_refs",
+            "memory_scope_refs",
+            "prompt_refs",
+            "preferred_selectors",
+            "selectors",
+            "hints",
+            "examples",
+            "description",
+            "summary",
+        ] {
+            parts.extend(string_list_field(mapping, field));
+            if let Some(value) = optional_string_field(mapping, field) {
+                parts.push(value);
+            }
+        }
+        compact_semantic_parts(parts)
+    }
+
+    fn plain_markdown_semantic_text(
+        sidecar: &serde_json::Value,
+        body: &str,
+        title: &str,
+        tags: &[String],
+    ) -> String {
+        let mut parts = vec![title.to_owned(), tags.join(" "), preview_text(body, 1200)];
+        for field in [
+            "memory_kind",
+            "asset_kind",
+            "stage",
+            "form",
+            "room_id",
+            "layer",
+            "summary",
+            "description",
+        ] {
+            if let Some(value) = optional_json_string_field(sidecar, field) {
+                parts.push(value);
+            }
+            if let Some(values) = json_string_list_field(sidecar, field) {
+                parts.extend(values);
+            }
+        }
+        compact_semantic_parts(parts)
+    }
+
+    fn compact_semantic_parts(parts: Vec<String>) -> String {
+        parts
+            .into_iter()
+            .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn optional_string_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<String> {

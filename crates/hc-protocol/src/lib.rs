@@ -64,6 +64,12 @@ pub struct ApiMemoryQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
     #[serde(default)]
     pub messages: Vec<ApiChatMessage>,
@@ -109,6 +115,12 @@ pub struct ChatResponse {
     pub model: String,
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_domain_id: Option<String>,
@@ -125,6 +137,10 @@ pub struct AgentProfileSummary {
     pub domain_id: Option<String>,
     pub priority: i32,
     pub intent_hints: Vec<String>,
+    #[serde(default)]
+    pub routing_examples: Vec<String>,
+    #[serde(default)]
+    pub negative_routing_examples: Vec<String>,
     pub tool_refs: Vec<String>,
     pub memory_scope_refs: Vec<String>,
     pub tags: Vec<String>,
@@ -143,6 +159,10 @@ pub struct DomainProfileSummary {
     pub project_id: Option<String>,
     pub priority: i32,
     pub intent_hints: Vec<String>,
+    #[serde(default)]
+    pub routing_examples: Vec<String>,
+    #[serde(default)]
+    pub negative_routing_examples: Vec<String>,
     pub default_agent_id: Option<String>,
     pub tool_refs: Vec<String>,
     pub memory_scope_refs: Vec<String>,

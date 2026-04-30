@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use hc_conversation::ConversationPolicy;
 use hc_store::store::{StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,10 @@ pub struct AgentProfile {
     #[serde(default)]
     pub intent_hints: Vec<String>,
     #[serde(default)]
+    pub routing_examples: Vec<String>,
+    #[serde(default)]
+    pub negative_routing_examples: Vec<String>,
+    #[serde(default)]
     pub tool_refs: Vec<String>,
     #[serde(default)]
     pub memory_scope_refs: Vec<String>,
@@ -47,6 +52,8 @@ pub struct AgentProfile {
     pub responder_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_schema_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_policy: ConversationPolicy,
     #[serde(default)]
     pub instructions: String,
     #[serde(default)]
@@ -63,9 +70,12 @@ impl AgentProfile {
             domain_id: self.domain_id.clone(),
             priority: self.priority,
             intent_hints: self.intent_hints.clone(),
+            routing_examples: self.routing_examples.clone(),
+            negative_routing_examples: self.negative_routing_examples.clone(),
             tool_refs: self.tool_refs.clone(),
             memory_scope_refs: self.memory_scope_refs.clone(),
             tags: self.tags.clone(),
+            conversation_policy: self.conversation_policy.clone(),
         }
     }
 }
@@ -79,9 +89,12 @@ pub struct AgentProfileSummary {
     pub domain_id: Option<String>,
     pub priority: i32,
     pub intent_hints: Vec<String>,
+    pub routing_examples: Vec<String>,
+    pub negative_routing_examples: Vec<String>,
     pub tool_refs: Vec<String>,
     pub memory_scope_refs: Vec<String>,
     pub tags: Vec<String>,
+    pub conversation_policy: ConversationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +113,10 @@ struct AgentProfileFrontmatter {
     #[serde(default)]
     intent_hints: Vec<String>,
     #[serde(default)]
+    routing_examples: Vec<String>,
+    #[serde(default)]
+    negative_routing_examples: Vec<String>,
+    #[serde(default)]
     tool_refs: Vec<String>,
     #[serde(default)]
     memory_scope_refs: Vec<String>,
@@ -111,6 +128,8 @@ struct AgentProfileFrontmatter {
     responder_ref: Option<String>,
     #[serde(default)]
     state_schema_ref: Option<String>,
+    #[serde(default)]
+    conversation_policy: ConversationPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -202,12 +221,15 @@ impl AgentProfile {
             domain_id: frontmatter.domain_id,
             priority: frontmatter.priority,
             intent_hints: frontmatter.intent_hints,
+            routing_examples: frontmatter.routing_examples,
+            negative_routing_examples: frontmatter.negative_routing_examples,
             tool_refs: frontmatter.tool_refs,
             memory_scope_refs: frontmatter.memory_scope_refs,
             prompt_refs: frontmatter.prompt_refs,
             tags: frontmatter.tags,
             responder_ref: frontmatter.responder_ref,
             state_schema_ref: frontmatter.state_schema_ref,
+            conversation_policy: frontmatter.conversation_policy,
             instructions: body.trim().to_owned(),
             relative_path: String::new(),
         })
@@ -225,12 +247,15 @@ impl AgentProfileFrontmatter {
             domain_id: profile.domain_id.clone(),
             priority: profile.priority,
             intent_hints: profile.intent_hints.clone(),
+            routing_examples: profile.routing_examples.clone(),
+            negative_routing_examples: profile.negative_routing_examples.clone(),
             tool_refs: profile.tool_refs.clone(),
             memory_scope_refs: profile.memory_scope_refs.clone(),
             prompt_refs: profile.prompt_refs.clone(),
             tags: profile.tags.clone(),
             responder_ref: profile.responder_ref.clone(),
             state_schema_ref: profile.state_schema_ref.clone(),
+            conversation_policy: profile.conversation_policy.clone(),
         }
     }
 }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 hc-agent = { path = "../hc-agent" }
+hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }
 hc-llm = { path = "../hc-llm" }
 hc-protocol = { path = "../hc-protocol" }

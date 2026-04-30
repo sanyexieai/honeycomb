@@ -11,6 +11,7 @@ serde.workspace = true
 hc-core = { path = "../hc-core" }
 hc-capability = { path = "../hc-capability" }
 hc-claim = { path = "../hc-claim" }
+hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }
 hc-memory = { path = "../hc-memory" }
 hc-persona = { path = "../hc-persona" }

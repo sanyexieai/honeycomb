@@ -32,6 +32,10 @@ pub struct DomainProfile {
     pub priority: i32,
     #[serde(default)]
     pub intent_hints: Vec<String>,
+    #[serde(default)]
+    pub routing_examples: Vec<String>,
+    #[serde(default)]
+    pub negative_routing_examples: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent_id: Option<String>,
     #[serde(default)]
@@ -55,6 +59,8 @@ impl DomainProfile {
             project_id: self.project_id.clone(),
             priority: self.priority,
             intent_hints: self.intent_hints.clone(),
+            routing_examples: self.routing_examples.clone(),
+            negative_routing_examples: self.negative_routing_examples.clone(),
             default_agent_id: self.default_agent_id.clone(),
             tool_refs: self.tool_refs.clone(),
             memory_scope_refs: self.memory_scope_refs.clone(),
@@ -71,6 +77,8 @@ pub struct DomainProfileSummary {
     pub project_id: Option<String>,
     pub priority: i32,
     pub intent_hints: Vec<String>,
+    pub routing_examples: Vec<String>,
+    pub negative_routing_examples: Vec<String>,
     pub default_agent_id: Option<String>,
     pub tool_refs: Vec<String>,
     pub memory_scope_refs: Vec<String>,
@@ -90,6 +98,10 @@ struct DomainProfileFrontmatter {
     priority: i32,
     #[serde(default)]
     intent_hints: Vec<String>,
+    #[serde(default)]
+    routing_examples: Vec<String>,
+    #[serde(default)]
+    negative_routing_examples: Vec<String>,
     #[serde(default)]
     default_agent_id: Option<String>,
     #[serde(default)]
@@ -188,6 +200,8 @@ impl DomainProfile {
             project_id: frontmatter.project_id,
             priority: frontmatter.priority,
             intent_hints: frontmatter.intent_hints,
+            routing_examples: frontmatter.routing_examples,
+            negative_routing_examples: frontmatter.negative_routing_examples,
             default_agent_id: frontmatter.default_agent_id,
             tool_refs: frontmatter.tool_refs,
             memory_scope_refs: frontmatter.memory_scope_refs,
@@ -208,6 +222,8 @@ impl DomainProfileFrontmatter {
             project_id: profile.project_id.clone(),
             priority: profile.priority,
             intent_hints: profile.intent_hints.clone(),
+            routing_examples: profile.routing_examples.clone(),
+            negative_routing_examples: profile.negative_routing_examples.clone(),
             default_agent_id: profile.default_agent_id.clone(),
             tool_refs: profile.tool_refs.clone(),
             memory_scope_refs: profile.memory_scope_refs.clone(),

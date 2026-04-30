@@ -1763,6 +1763,7 @@ dependencies = [
  "hc-capability",
  "hc-claim",
  "hc-context",
+ "hc-conversation",
  "hc-core",
  "hc-memory",
  "hc-persona",
@@ -1778,6 +1779,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "hc-conversation",
  "hc-protocol",
  "hc-service",
  "serde",
@@ -1841,6 +1843,16 @@ dependencies = [
  "hc-skill",
  "hc-store",
  "hc-trace",
+ "serde_json",
+]
+
+[[package]]
+name = "hc-conversation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-store",
+ "serde",
  "serde_json",
 ]
 
@@ -1952,6 +1964,7 @@ dependencies = [
  "anyhow",
  "hc-agent",
  "hc-context",
+ "hc-conversation",
  "hc-llm",
  "hc-protocol",
  "hc-scheduler",
@@ -1993,6 +2006,7 @@ dependencies = [
  "hc-agent",
  "hc-capability",
  "hc-context",
+ "hc-conversation",
  "hc-llm",
  "hc-scheduler",
  "hc-skill",

@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod chat;
+pub mod conversation;
 pub mod scheduler;
 pub mod tool;
 

@@ -10,6 +10,7 @@ members = [
   "crates/hc-agent",
   "crates/hc-capability",
   "crates/hc-claim",
+  "crates/hc-conversation",
   "crates/hc-context",
   "crates/hc-protocol",
   "crates/hc-service",

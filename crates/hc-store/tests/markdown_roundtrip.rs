@@ -1,4 +1,11 @@
-use hc_store::store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore, parse_markdown_document};
+use hc_store::{
+    index::{
+        LocalJsonVectorIndex, RebuildableIndex, VectorDocument, VectorIndex, VectorQuery,
+        indexed_documents_from_markdown_index, local_hash_embedding,
+        vector_documents_from_indexed_documents,
+    },
+    store::{MarkdownQuery, WorkspaceNamespace, WorkspaceStore, parse_markdown_document},
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -321,6 +328,102 @@ Code review should prefer focused findings.
 
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].id, "memory.room.0001");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_hash_embedding_is_stable_and_normalized() {
+    let left = local_hash_embedding("中午推荐我吃什么", 64);
+    let right = local_hash_embedding("中午推荐我吃什么", 64);
+    assert_eq!(left, right);
+    let norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 0.001);
+}
+
+#[test]
+fn local_json_vector_index_is_rebuildable_and_filterable() {
+    let root = unique_temp_dir("store-vector-index");
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    let index = LocalJsonVectorIndex::new(&root);
+
+    let mut memory_metadata = std::collections::BTreeMap::new();
+    memory_metadata.insert("doc_type".to_owned(), "memory_room_asset".to_owned());
+    let mut agent_metadata = std::collections::BTreeMap::new();
+    agent_metadata.insert("doc_type".to_owned(), "agent_profile".to_owned());
+
+    let documents = vec![
+        VectorDocument {
+            id: "memory.food".to_owned(),
+            source_path: "memory/rooms/global/food.md".to_owned(),
+            embedding: vec![1.0, 0.0, 0.0],
+            text_preview: "lunch preference".to_owned(),
+            metadata: memory_metadata,
+        },
+        VectorDocument {
+            id: "agent.music".to_owned(),
+            source_path: "agents/music.md".to_owned(),
+            embedding: vec![0.0, 1.0, 0.0],
+            text_preview: "music playback".to_owned(),
+            metadata: agent_metadata,
+        },
+    ];
+    index
+        .rebuild(&namespace, &documents)
+        .expect("vector index should rebuild");
+
+    let mut filters = std::collections::BTreeMap::new();
+    filters.insert("doc_type".to_owned(), "memory_room_asset".to_owned());
+    let hits = index
+        .search(
+            &namespace,
+            &VectorQuery {
+                embedding: vec![1.0, 0.1, 0.0],
+                filters,
+                limit: Some(5),
+            },
+        )
+        .expect("vector search should succeed");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "memory.food");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn markdown_index_can_be_projected_to_vector_documents() {
+    let root = unique_temp_dir("store-vector-projection");
+    let store = WorkspaceStore::new(&root);
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    fs::create_dir_all(store.resolve_in_namespace(&namespace, "agents"))
+        .expect("agents directory should exist");
+    fs::write(
+        store.resolve_in_namespace(&namespace, "agents/demo.md"),
+        r#"---
+id: agent.demo
+type: agent_profile
+title: Demo Agent
+tags: [demo]
+---
+
+Demo agent routing notes.
+"#,
+    )
+    .expect("agent doc should be written");
+
+    let markdown_index = store
+        .rebuild_markdown_index_in_namespace(&namespace)
+        .expect("markdown index should rebuild");
+    let documents = indexed_documents_from_markdown_index(&markdown_index);
+    let vector_documents = vector_documents_from_indexed_documents(&documents, |document| {
+        Ok(vec![document.text.len() as f32, document.tags.len() as f32])
+    })
+    .expect("vector projection should succeed");
+
+    assert_eq!(vector_documents.len(), 1);
+    assert_eq!(vector_documents[0].id, "agent.demo");
+    assert_eq!(vector_documents[0].source_path, "agents/demo.md");
 
     let _ = fs::remove_dir_all(root);
 }

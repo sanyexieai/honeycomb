@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::GB18030;
-use hc_agent::{AgentProfile, AgentRepository};
+use hc_agent::{AgentProfile, AgentRepository, best_phrase_match_score, phrase_match_score};
 use hc_capability::ModelDependence;
 use hc_context::{
     ChatCaptureOptions, ChatMemoryOptions, MemoryRetriever, RetrievedMemory,
@@ -20,6 +20,7 @@ use hc_context::{
     persist_global_preference_from_chat_input, prepare_chat_capture_room,
     render_recalled_memory_context, workspace_namespace_from_memory_namespace,
 };
+use hc_conversation::{ConversationRepository, FollowUpStatus, PendingFollowUp};
 use hc_llm::{
     ChatMessage, GenerateRequest, MessageRole, ModelRef, ProviderRegistry, default_model_from_env,
     default_provider_from_env, default_registry_from_env, is_timeout_error,
@@ -30,7 +31,14 @@ use hc_scheduler::{
     ScheduledTarget, ScheduledTargetKind, ScheduledTask, now_unix,
 };
 use hc_skill::{SkillProfile, SkillRepository};
-use hc_store::store::WorkspaceNamespace;
+use hc_store::{
+    index::{
+        DEFAULT_LOCAL_EMBEDDING_DIMS, LocalJsonVectorIndex, RebuildableIndex, VectorIndex,
+        VectorQuery, indexed_documents_from_markdown_index, local_hash_embedding,
+        vector_documents_from_indexed_documents,
+    },
+    store::{WorkspaceNamespace, WorkspaceStore},
+};
 use hc_toolchain::{
     CommandToolExecutor, McpServerRepository, McpServerSpec, McpTransportKind, ToolCatalog,
     ToolComposition, ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository,
@@ -39,6 +47,13 @@ use hc_toolchain::{
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::Deserialize;
+
+#[derive(Debug, Clone, Default)]
+struct CliRuntimeContext {
+    tenant_id: Option<String>,
+    user_id: Option<String>,
+    session_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 struct CommonOptions {
@@ -111,12 +126,20 @@ struct ToolRoutingTags {
     tool_argument_rules: Vec<ToolScopedArgumentRule>,
     #[serde(default)]
     confirmation_flows: Vec<ToolConfirmationFlowRule>,
+    #[serde(default)]
+    confirmation_retry: ToolConfirmationRetryRule,
+    #[serde(default)]
+    timed_sequence_rules: Vec<TimedSequenceRule>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ToolIntentRoutingRule {
     #[serde(default)]
     hints: Vec<String>,
+    #[serde(default)]
+    examples: Vec<String>,
+    #[serde(default)]
+    negative_examples: Vec<String>,
     #[serde(default)]
     preferred_selectors: Vec<String>,
     #[serde(default)]
@@ -166,11 +189,51 @@ struct ToolConfirmationFlowRule {
     #[serde(default)]
     target_selectors: Vec<String>,
     #[serde(default)]
+    fallback_target_selectors: Vec<Vec<String>>,
+    #[serde(default)]
     item_paths: Vec<String>,
     #[serde(default)]
     target_args: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     item_arg_mappings: Vec<ToolItemArgMapping>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolConfirmationRetryRule {
+    #[serde(default = "default_confirmation_retry_delay_seconds")]
+    delay_seconds: u64,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default = "default_confirmation_retry_trigger")]
+    trigger: String,
+    #[serde(default = "default_confirmation_retry_reply")]
+    reply: String,
+    #[serde(default)]
+    retryable_failure_hints: Vec<String>,
+}
+
+impl Default for ToolConfirmationRetryRule {
+    fn default() -> Self {
+        Self {
+            delay_seconds: default_confirmation_retry_delay_seconds(),
+            agent_id: None,
+            trigger: default_confirmation_retry_trigger(),
+            reply: default_confirmation_retry_reply(),
+            retryable_failure_hints: Vec::new(),
+        }
+    }
+}
+
+fn default_confirmation_retry_delay_seconds() -> u64 {
+    5
+}
+
+fn default_confirmation_retry_trigger() -> String {
+    "tool.confirmation_retry_due".to_owned()
+}
+
+fn default_confirmation_retry_reply() -> String {
+    "我会继续处理这次确认，完成后主动告诉您。".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -180,6 +243,36 @@ struct ToolItemArgMapping {
     keys: Vec<String>,
     #[serde(default)]
     format: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TimedSequenceRule {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    hints: Vec<String>,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    default_end: Option<i64>,
+    #[serde(default = "default_timed_sequence_interval_seconds")]
+    interval_seconds: u64,
+    #[serde(default = "default_timed_sequence_max_items")]
+    max_items: usize,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    trigger: Option<String>,
+    #[serde(default)]
+    scheduled_reply: Option<String>,
+}
+
+fn default_timed_sequence_interval_seconds() -> u64 {
+    1
+}
+
+fn default_timed_sequence_max_items() -> usize {
+    120
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -223,6 +316,7 @@ struct ToolResponseRenderer {
     #[serde(default)]
     empty_reply: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     failure_reply: Option<String>,
     #[serde(default)]
     order_success: Option<String>,
@@ -244,6 +338,7 @@ struct ToolResponseField {
 #[derive(Debug, Clone)]
 struct PendingToolConfirmation {
     tool_id: String,
+    fallback_tool_ids: Vec<String>,
     items: Vec<serde_json::Value>,
     flow: ToolConfirmationFlowRule,
 }
@@ -314,6 +409,8 @@ struct NaturalLanguageToolRoute {
     #[serde(default)]
     tool_id: Option<String>,
     #[serde(default)]
+    fallback_tool_ids: Vec<String>,
+    #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     goal: Option<String>,
@@ -358,6 +455,8 @@ fn main() -> Result<()> {
     configure_console_encoding();
     load_local_env_file()?;
     let args: Vec<String> = env::args().skip(1).collect();
+    let (context, args) = parse_cli_runtime_context(args)?;
+    let _ = CLI_RUNTIME_CONTEXT.set(context);
     match args.as_slice() {
         [] => handle_chat(&[]),
         [cmd] if is_help(cmd) => {
@@ -372,6 +471,7 @@ fn main() -> Result<()> {
         [cmd, rest @ ..] if cmd == "run" => handle_run(rest),
         [cmd, rest @ ..] if cmd == "mcp" => handle_mcp(rest),
         [cmd, rest @ ..] if cmd == "schedule" => handle_schedule(rest),
+        [cmd, rest @ ..] if cmd == "index" => handle_index(rest),
         [other, ..] => bail!("unknown command: {other}"),
     }
 }
@@ -385,12 +485,81 @@ fn configure_console_encoding() {
     }
 }
 
+static CLI_RUNTIME_CONTEXT: OnceLock<CliRuntimeContext> = OnceLock::new();
+
+fn parse_cli_runtime_context(args: Vec<String>) -> Result<(CliRuntimeContext, Vec<String>)> {
+    let mut context = CliRuntimeContext::default();
+    let mut rest = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--tenant-id" => {
+                context.tenant_id = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tenant-id")?,
+                );
+                index += 2;
+            }
+            "--user-id" => {
+                context.user_id = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --user-id")?,
+                );
+                index += 2;
+            }
+            "--session-id" => {
+                context.session_id = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --session-id")?,
+                );
+                index += 2;
+            }
+            _ => {
+                rest.extend(args[index..].iter().cloned());
+                break;
+            }
+        }
+    }
+    Ok((context, rest))
+}
+
+fn normalized_optional_cli_value(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn apply_cli_context_to_chat_options(
+    memory_options: &mut ChatMemoryOptions,
+    capture_options: &mut ChatCaptureOptions,
+) {
+    let context = cli_runtime_context();
+    if let Some(tenant_id) = context.tenant_id {
+        memory_options.namespace.tenant_id = tenant_id.clone();
+        capture_options.namespace.tenant_id = tenant_id;
+    }
+    if let Some(user_id) = context.user_id {
+        memory_options.namespace.user_id = user_id.clone();
+        capture_options.namespace.user_id = user_id;
+    }
+    if let Some(session_id) = context.session_id {
+        capture_options.room_id = Some(session_id);
+    }
+}
+
+fn cli_runtime_context() -> CliRuntimeContext {
+    CLI_RUNTIME_CONTEXT.get().cloned().unwrap_or_default()
+}
+
 fn handle_chat(args: &[String]) -> Result<()> {
     let mut provider = default_provider();
     let mut model = default_model();
     let mut system_message = env::var("HC_LLM_SYSTEM").ok();
     let mut memory_options = ChatMemoryOptions::from_env();
     let mut capture_options = ChatCaptureOptions::from_env();
+    apply_cli_context_to_chat_options(&mut memory_options, &mut capture_options);
     let mut show_memory = false;
 
     let mut index = 0usize;
@@ -415,6 +584,36 @@ fn handle_chat(args: &[String]) -> Result<()> {
                     args.get(index + 1)
                         .cloned()
                         .context("missing value for --system")?,
+                );
+                index += 2;
+            }
+            "--tenant-id" => {
+                if let Some(value) = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tenant-id")?,
+                ) {
+                    memory_options.namespace.tenant_id = value.clone();
+                    capture_options.namespace.tenant_id = value;
+                }
+                index += 2;
+            }
+            "--user-id" => {
+                if let Some(value) = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --user-id")?,
+                ) {
+                    memory_options.namespace.user_id = value.clone();
+                    capture_options.namespace.user_id = value;
+                }
+                index += 2;
+            }
+            "--session-id" => {
+                capture_options.room_id = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --session-id")?,
                 );
                 index += 2;
             }
@@ -459,6 +658,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
             other => bail!("unknown chat option: {other}"),
         }
     }
+    if capture_options.room_id.as_deref().is_none_or(str::is_empty) {
+        capture_options.room_id = Some(default_chat_session_id(
+            &memory_options.namespace.tenant_id,
+            &memory_options.namespace.user_id,
+        ));
+    }
 
     let registry = default_registry();
     let catalog = load_cli_tool_catalog()?;
@@ -475,10 +680,11 @@ fn handle_chat(args: &[String]) -> Result<()> {
     println!("hc-tool chat");
     println!("provider={provider} model={model}");
     println!(
-        "memory={} namespace={}/{} limit={}",
+        "memory={} namespace={}/{} session={} limit={}",
         if memory_options.enabled { "on" } else { "off" },
         memory_options.namespace.tenant_id,
         memory_options.namespace.user_id,
+        capture_options.room_id.as_deref().unwrap_or("default"),
         memory_options.limit
     );
     println!("Type /help for commands, /quit to exit.");
@@ -507,7 +713,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 );
                 println!("/mcp add|list|tools|call ...");
                 println!(
-                    "chat options: --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
+                    "chat options: --tenant-id <id> --user-id <id> --session-id <id> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
                 );
                 println!("/quit");
                 continue;
@@ -596,29 +802,87 @@ fn handle_chat(args: &[String]) -> Result<()> {
         if let Some(route) = confirmed_pending_route(trimmed, &pending_confirmation) {
             let (plan, outcome) = execute_routed_tool_outcome(&route)?;
             let context = render_tool_execution_context(&plan, &outcome);
-            apply_tool_route(&mut selection, &catalog, route)?;
-            let reply = if outcome.success {
+            apply_tool_route(&mut selection, &catalog, route.clone())?;
+            if outcome.success {
                 pending_confirmation = None;
-                render_order_reply(&outcome)
-                    .unwrap_or_else(|| render_unrenderable_tool_reply(&outcome))
-            } else {
-                render_tool_failure_reply(&outcome)
-            };
-            println!("assistant> {reply}");
-            history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-            history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-            if let Some(room) = &chat_room
-                && let Err(error) = persist_chat_turn_assistant_reply(
-                    workspace_root(),
-                    workspace_namespace.clone(),
-                    room,
-                    turn_index,
-                    reply,
-                )
-            {
-                println!("warning> chat memory write skipped: {error}");
+                let reply = render_order_reply(&outcome)
+                    .unwrap_or_else(|| render_unrenderable_tool_reply(&outcome));
+                println!("assistant> {reply}");
+                history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+                if let Some(room) = &chat_room
+                    && let Err(error) = persist_chat_turn_assistant_reply(
+                        workspace_root(),
+                        workspace_namespace.clone(),
+                        room,
+                        turn_index,
+                        reply,
+                    )
+                {
+                    println!("warning> chat memory write skipped: {error}");
+                }
+                let _ = context;
+                continue;
+            }
+
+            record_tool_flow_failure(
+                "pending_confirmation",
+                trimmed,
+                &route,
+                &outcome,
+                &workspace_namespace,
+                chat_room.as_ref().map(|room| room.id.clone()),
+            )?;
+            if is_retryable_tool_failure(&outcome) {
+                let reply = schedule_confirmation_retry(
+                    &route,
+                    &outcome,
+                    &workspace_namespace,
+                    chat_room.as_ref().map(|room| room.id.clone()),
+                )?;
+                println!("assistant> {reply}");
+                history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+                if let Some(room) = &chat_room
+                    && let Err(error) = persist_chat_turn_assistant_reply(
+                        workspace_root(),
+                        workspace_namespace.clone(),
+                        room,
+                        turn_index,
+                        reply,
+                    )
+                {
+                    println!("warning> chat memory write skipped: {error}");
+                }
+                let _ = context;
+                continue;
             }
             let _ = context;
+        }
+        if let Some(reply) = handle_timed_sequence_turn(
+            trimmed,
+            &memory_options.namespace.tenant_id,
+            &memory_options.namespace.user_id,
+            chat_room.as_ref().map(|room| room.id.clone()),
+        )? {
+            if !reply.trim().is_empty() {
+                println!("assistant> {reply}");
+            }
+            history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
+            if !reply.trim().is_empty() {
+                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+                if let Some(room) = &chat_room
+                    && let Err(error) = persist_chat_turn_assistant_reply(
+                        workspace_root(),
+                        workspace_namespace.clone(),
+                        room,
+                        turn_index,
+                        reply,
+                    )
+                {
+                    println!("warning> chat memory write skipped: {error}");
+                }
+            }
             continue;
         }
         let mut tool_execution_context = None;
@@ -631,7 +895,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
             }
             let (plan, outcome) = execute_routed_tool_outcome(&route)?;
             let context = render_tool_execution_context(&plan, &outcome);
-            apply_tool_route(&mut selection, &catalog, route)?;
+            apply_tool_route(&mut selection, &catalog, route.clone())?;
             if outcome.success
                 && let Some(reply) = render_grounded_tool_reply(&outcome)
             {
@@ -653,27 +917,19 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 }
                 continue;
             }
-            let reply = if outcome.success {
-                render_unrenderable_tool_reply(&outcome)
-            } else {
-                render_tool_failure_reply(&outcome)
-            };
-            println!("assistant> {reply}");
-            history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-            history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-            if let Some(room) = &chat_room
-                && let Err(error) = persist_chat_turn_assistant_reply(
-                    workspace_root(),
-                    workspace_namespace.clone(),
-                    room,
-                    turn_index,
-                    reply,
-                )
-            {
-                println!("warning> chat memory write skipped: {error}");
-            }
+            record_tool_flow_failure(
+                "configured_agent_mcp",
+                trimmed,
+                &route,
+                &outcome,
+                &workspace_namespace,
+                chat_room.as_ref().map(|room| room.id.clone()),
+            )?;
             let _ = context;
-            continue;
+            tool_execution_context = Some(
+                "Internal note: a routed tool call did not produce a user-presentable result. Continue with ordinary intent handling. Do not invent concrete tool data, and do not mention internal tool/service failure unless it is directly relevant."
+                    .to_owned(),
+            );
         } else {
             match route_tool_turn(
                 &registry,
@@ -915,6 +1171,279 @@ fn handle_schedule(args: &[String]) -> Result<()> {
         ),
         [other, ..] => bail!("unknown schedule command: {other}"),
     }
+}
+
+fn handle_index(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "rebuild" => handle_index_rebuild(rest),
+        [cmd, rest @ ..] if cmd == "search" => handle_index_search(rest),
+        [] => bail!("usage: hc-tool-cli index <rebuild|search> ..."),
+        [other, ..] => bail!("unknown index command: {other}"),
+    }
+}
+
+fn handle_index_rebuild(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut vector = false;
+    let mut dims = DEFAULT_LOCAL_EMBEDDING_DIMS;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--vector" => {
+                vector = true;
+                index += 1;
+            }
+            "--dims" => {
+                dims = parse_usize_arg(
+                    args.get(index + 1).context("missing value for --dims")?,
+                    "--dims",
+                )?;
+                index += 2;
+            }
+            other => bail!("unexpected argument for index rebuild: {other}"),
+        }
+    }
+
+    let namespace = runtime_namespace();
+    let store = WorkspaceStore::new(workspace_root());
+    let markdown_index = store.rebuild_markdown_index_in_namespace(&namespace)?;
+    let mut vector_path = None;
+    let mut vector_count = 0usize;
+    if vector {
+        let indexed_documents = indexed_documents_from_markdown_index(&markdown_index);
+        let vector_documents =
+            vector_documents_from_indexed_documents(&indexed_documents, |doc| {
+                Ok(local_hash_embedding(
+                    &format!(
+                        "{} {} {} {}",
+                        doc.title,
+                        doc.doc_type,
+                        doc.tags.join(" "),
+                        doc.text
+                    ),
+                    dims,
+                ))
+            })?;
+        vector_count = vector_documents.len();
+        let vector_index = LocalJsonVectorIndex::new(workspace_root());
+        vector_index.rebuild(&namespace, &vector_documents)?;
+        vector_path = Some(vector_index.path_in_namespace(&namespace));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace": namespace,
+                "markdown_documents": markdown_index.documents.len(),
+                "markdown_index_path": store.markdown_index_path_in_namespace(&markdown_index.namespace),
+                "markdown_search_index_path": store.markdown_search_index_path_in_namespace(&markdown_index.namespace),
+                "vector_documents": vector_count,
+                "vector_index_path": vector_path,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "index> markdown documents {}",
+        markdown_index.documents.len()
+    );
+    println!(
+        "index> markdown {}",
+        store
+            .markdown_index_path_in_namespace(&markdown_index.namespace)
+            .display()
+    );
+    println!(
+        "index> search {}",
+        store
+            .markdown_search_index_path_in_namespace(&markdown_index.namespace)
+            .display()
+    );
+    if let Some(path) = vector_path {
+        println!("index> vector documents {vector_count}");
+        println!("index> vector {}", path.display());
+    }
+    Ok(())
+}
+
+fn handle_index_search(args: &[String]) -> Result<()> {
+    let mut text = None;
+    let mut json = false;
+    let mut vector = false;
+    let mut rebuild = false;
+    let mut limit = 10usize;
+    let mut dims = DEFAULT_LOCAL_EMBEDDING_DIMS;
+    let mut filters = BTreeMap::<String, String>::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--text" => {
+                text = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --text")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--vector" => {
+                vector = true;
+                index += 1;
+            }
+            "--rebuild" => {
+                rebuild = true;
+                index += 1;
+            }
+            "--limit" => {
+                limit = parse_usize_arg(
+                    args.get(index + 1).context("missing value for --limit")?,
+                    "--limit",
+                )?;
+                index += 2;
+            }
+            "--dims" => {
+                dims = parse_usize_arg(
+                    args.get(index + 1).context("missing value for --dims")?,
+                    "--dims",
+                )?;
+                index += 2;
+            }
+            "--filter" => {
+                let filter = args.get(index + 1).context("missing value for --filter")?;
+                let (key, value) = parse_key_value(filter)?;
+                filters.insert(key, value);
+                index += 2;
+            }
+            value if text.is_none() => {
+                text = Some(value.to_owned());
+                index += 1;
+            }
+            other => bail!("unexpected argument for index search: {other}"),
+        }
+    }
+
+    let text = text.context("missing search text")?;
+    let namespace = runtime_namespace();
+    let store = WorkspaceStore::new(workspace_root());
+    if rebuild {
+        let markdown_index = store.rebuild_markdown_index_in_namespace(&namespace)?;
+        if vector {
+            rebuild_local_vector_index(&namespace, &markdown_index, dims)?;
+        }
+    }
+
+    if vector {
+        let vector_index = LocalJsonVectorIndex::new(workspace_root());
+        if !vector_index.path_in_namespace(&namespace).exists() {
+            let markdown_index = store.read_or_rebuild_markdown_index_in_namespace(&namespace)?;
+            rebuild_local_vector_index(&namespace, &markdown_index, dims)?;
+        }
+        let hits = vector_index.search(
+            &namespace,
+            &VectorQuery {
+                embedding: local_hash_embedding(&text, dims),
+                filters,
+                limit: Some(limit.saturating_mul(4).max(limit)),
+            },
+        )?;
+        let markdown_index = store.read_or_rebuild_markdown_index_in_namespace(&namespace)?;
+        let hits = rerank_vector_hits_with_markdown_text(hits, &markdown_index, &text, limit);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&hits)?);
+            return Ok(());
+        }
+        for hit in hits {
+            println!("{:.3} | {} | {}", hit.score, hit.id, hit.source_path);
+        }
+        return Ok(());
+    }
+
+    let mut query = hc_store::store::MarkdownQuery::default()
+        .with_text(text)
+        .with_limit(limit);
+    if let Some(doc_type) = filters.get("doc_type") {
+        query = query.with_doc_type(doc_type.clone());
+    }
+    if let Some(status) = filters.get("status") {
+        query = query.with_status(status.clone());
+    }
+    if let Some(tag) = filters.get("tag") {
+        query = query.with_tag(tag.clone());
+    }
+    if let Some(path_prefix) = filters.get("path_prefix") {
+        query = query.with_path_prefix(path_prefix.clone());
+    }
+    let matches = store.query_markdown_index_in_namespace(&namespace, &query)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&matches)?);
+        return Ok(());
+    }
+    for entry in matches {
+        println!(
+            "{} | {} | {}",
+            entry.id, entry.doc_type, entry.relative_path
+        );
+    }
+    Ok(())
+}
+
+fn rebuild_local_vector_index(
+    namespace: &WorkspaceNamespace,
+    markdown_index: &hc_store::store::MarkdownIndex,
+    dims: usize,
+) -> Result<()> {
+    let indexed_documents = indexed_documents_from_markdown_index(markdown_index);
+    let vector_documents = vector_documents_from_indexed_documents(&indexed_documents, |doc| {
+        Ok(local_hash_embedding(
+            &format!(
+                "{} {} {} {}",
+                doc.title,
+                doc.doc_type,
+                doc.tags.join(" "),
+                doc.text
+            ),
+            dims,
+        ))
+    })?;
+    LocalJsonVectorIndex::new(workspace_root()).rebuild(namespace, &vector_documents)
+}
+
+fn rerank_vector_hits_with_markdown_text(
+    mut hits: Vec<hc_store::index::IndexHit>,
+    markdown_index: &hc_store::store::MarkdownIndex,
+    text: &str,
+    limit: usize,
+) -> Vec<hc_store::index::IndexHit> {
+    let by_path = markdown_index
+        .documents
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    for hit in &mut hits {
+        let Some(entry) = by_path.get(hit.source_path.as_str()) else {
+            continue;
+        };
+        let lexical_score = phrase_match_score(text, &entry.semantic_text) as f32 / 100.0;
+        hit.score += lexical_score;
+    }
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    hits.truncate(limit);
+    hits
 }
 
 fn handle_schedule_add(args: &[String]) -> Result<()> {
@@ -1854,12 +2383,34 @@ fn execute_routed_tool_outcome(
         .as_deref()
         .filter(|tool_id| !tool_id.trim().is_empty())
         .context("tool router selected run_tool without tool_id")?;
-    let options = RunOptions {
-        goal: route.goal.clone(),
-        args: route.args.clone(),
-        ..RunOptions::default()
-    };
-    execute_tool_by_selector(tool_id, &options)
+    let mut selectors = vec![tool_id.to_owned()];
+    selectors.extend(
+        route
+            .fallback_tool_ids
+            .iter()
+            .filter(|tool_id| !tool_id.trim().is_empty())
+            .cloned(),
+    );
+    selectors.dedup();
+
+    let mut last_result = None;
+    for selector in selectors {
+        let options = RunOptions {
+            goal: route.goal.clone(),
+            args: route.args.clone(),
+            ..RunOptions::default()
+        };
+        match execute_tool_by_selector(&selector, &options) {
+            Ok((plan, outcome)) if outcome.success => return Ok((plan, outcome)),
+            Ok((plan, outcome)) => {
+                last_result = Some(Ok((plan, outcome)));
+            }
+            Err(error) => {
+                last_result = Some(Err(error));
+            }
+        }
+    }
+    last_result.context("no routed tool candidates were available")?
 }
 
 fn configured_agent_mcp_route(
@@ -1875,6 +2426,7 @@ fn configured_agent_mcp_route(
                 return Ok(Some(NaturalLanguageToolRoute {
                     action: "mcp_unavailable".to_owned(),
                     tool_id: None,
+                    fallback_tool_ids: Vec::new(),
                     args: Vec::new(),
                     goal: Some(user_turn.trim().to_owned()),
                     message: Some(
@@ -1894,6 +2446,7 @@ fn configured_agent_mcp_route(
     Ok(Some(NaturalLanguageToolRoute {
         action: "run_tool".to_owned(),
         tool_id: Some(tool.id.clone()),
+        fallback_tool_ids: Vec::new(),
         args: route_args_for_tool(&tool, user_turn),
         goal: Some(user_turn.trim().to_owned()),
         message: None,
@@ -1950,10 +2503,393 @@ fn confirmed_pending_route(
     Some(NaturalLanguageToolRoute {
         action: "run_tool".to_owned(),
         tool_id: Some(pending.tool_id.clone()),
+        fallback_tool_ids: pending.fallback_tool_ids.clone(),
         args: pending_order_args(pending, item, user_turn),
         goal: Some(user_turn.trim().to_owned()),
         message: None,
     })
+}
+
+fn schedule_confirmation_retry(
+    route: &NaturalLanguageToolRoute,
+    outcome: &ToolExecutionOutcome,
+    namespace: &WorkspaceNamespace,
+    room_id: Option<String>,
+) -> Result<String> {
+    let retry = &tool_routing_tags().confirmation_retry;
+    let repository = ConversationRepository::with_namespace(workspace_root(), namespace.clone());
+    let now = now_unix();
+    let mut followup = PendingFollowUp::new(
+        retry
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "agent.system.tool_retry".to_owned()),
+        retry.trigger.clone(),
+        now.saturating_add(retry.delay_seconds),
+    );
+    followup.id = format!("tool-confirmation-retry.{now}");
+    followup.room_id = room_id;
+    followup.payload.insert(
+        "action".to_owned(),
+        serde_json::Value::String("retry_tool_confirmation".to_owned()),
+    );
+    if let Some(tool_id) = &route.tool_id {
+        followup.payload.insert(
+            "tool_id".to_owned(),
+            serde_json::Value::String(tool_id.clone()),
+        );
+    }
+    followup.payload.insert(
+        "fallback_tool_ids".to_owned(),
+        serde_json::Value::Array(
+            route
+                .fallback_tool_ids
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    followup.payload.insert(
+        "args".to_owned(),
+        serde_json::Value::Array(
+            route
+                .args
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    if let Some(goal) = &route.goal {
+        followup
+            .payload
+            .insert("goal".to_owned(), serde_json::Value::String(goal.clone()));
+    }
+    followup.payload.insert(
+        "last_error".to_owned(),
+        serde_json::Value::String(outcome.summary.clone()),
+    );
+    followup.payload.insert(
+        "last_observations".to_owned(),
+        serde_json::Value::Array(
+            outcome
+                .observations
+                .iter()
+                .take(12)
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    followup.notes = "Retry a confirmed tool action without asking the user to retry.".to_owned();
+    let followup_id = followup.id.clone();
+    repository.write_followup(&followup)?;
+    spawn_confirmation_retry_worker(
+        namespace.clone(),
+        followup_id,
+        route.clone(),
+        retry.delay_seconds,
+    );
+    Ok(retry.reply.clone())
+}
+
+fn is_retryable_tool_failure(outcome: &ToolExecutionOutcome) -> bool {
+    let retry = &tool_routing_tags().confirmation_retry;
+    !retry.retryable_failure_hints.is_empty()
+        && retry.retryable_failure_hints.iter().any(|hint| {
+            text_matches_any(&outcome.summary, std::slice::from_ref(hint))
+                || outcome
+                    .observations
+                    .iter()
+                    .any(|observation| text_matches_any(observation, std::slice::from_ref(hint)))
+        })
+}
+
+fn record_tool_flow_failure(
+    flow: &str,
+    user_turn: &str,
+    route: &NaturalLanguageToolRoute,
+    outcome: &ToolExecutionOutcome,
+    namespace: &WorkspaceNamespace,
+    room_id: Option<String>,
+) -> Result<()> {
+    let now = now_unix();
+    let failure_id = format!("routing.failure.{flow}.{now}");
+    let dir = workspace_root()
+        .join(namespace.scoped_prefix())
+        .join("routing")
+        .join("failures");
+    fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create routing failure directory {}",
+            dir.display()
+        )
+    })?;
+    let path = dir.join(format!("{failure_id}.md"));
+    let frontmatter = serde_json::json!({
+        "id": failure_id,
+        "type": "routing_flow_failure",
+        "title": format!("Routing Flow Failure {flow}"),
+        "tenant_id": namespace.tenant_id.clone(),
+        "user_id": namespace.user_id.clone(),
+        "room_id": room_id,
+        "flow": flow,
+        "tool_id": route.tool_id.clone(),
+        "fallback_tool_ids": route.fallback_tool_ids.clone(),
+        "status": "recorded",
+        "created_at_unix": now,
+        "retryable": is_retryable_tool_failure(outcome),
+    });
+    let content = format!(
+        "---\n{}---\n\n## User Turn\n\n{}\n\n## Route Args\n\n{}\n\n## Outcome\n\n- success: {}\n- summary: {}\n\n## Observations\n\n{}\n",
+        serde_yaml::to_string(&frontmatter)?,
+        user_turn,
+        route.args.join("\n"),
+        outcome.success,
+        outcome.summary,
+        outcome.observations.join("\n")
+    );
+    fs::write(&path, content)
+        .with_context(|| format!("failed to write routing failure {}", path.display()))?;
+    Ok(())
+}
+
+fn spawn_confirmation_retry_worker(
+    namespace: WorkspaceNamespace,
+    followup_id: String,
+    route: NaturalLanguageToolRoute,
+    delay_seconds: u64,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(delay_seconds));
+        let outcome = match execute_routed_tool_outcome(&route) {
+            Ok((_plan, outcome)) => outcome,
+            Err(error) => {
+                mark_confirmation_retry_followup(
+                    &namespace,
+                    &followup_id,
+                    FollowUpStatus::Failed,
+                    format!(
+                        "Confirmation retry failed to execute at {}: {error}",
+                        now_unix()
+                    ),
+                );
+                return;
+            }
+        };
+        if !outcome.success {
+            mark_confirmation_retry_followup(
+                &namespace,
+                &followup_id,
+                FollowUpStatus::Failed,
+                format!(
+                    "Confirmation retry returned failure at {}: {}\n{}",
+                    now_unix(),
+                    outcome.summary,
+                    outcome.observations.join("\n")
+                ),
+            );
+            return;
+        }
+        let reply = render_order_reply(&outcome)
+            .unwrap_or_else(|| render_unrenderable_tool_reply(&outcome));
+        println!("\nassistant> {reply}");
+
+        mark_confirmation_retry_followup(
+            &namespace,
+            &followup_id,
+            FollowUpStatus::Fired,
+            format!("Confirmation retry completed at {}", now_unix()),
+        );
+    });
+}
+
+fn mark_confirmation_retry_followup(
+    namespace: &WorkspaceNamespace,
+    followup_id: &str,
+    status: FollowUpStatus,
+    notes: String,
+) {
+    let repository = ConversationRepository::with_namespace(workspace_root(), namespace.clone());
+    let relative_path = ConversationRepository::followup_relative_path_for(followup_id);
+    if let Ok(mut followup) = repository.read_followup(relative_path) {
+        followup.status = status;
+        followup.notes = notes;
+        let _ = repository.write_followup(&followup);
+    }
+}
+
+fn handle_timed_sequence_turn(
+    user_turn: &str,
+    tenant_id: &str,
+    user_id: &str,
+    room_id: Option<String>,
+) -> Result<Option<String>> {
+    let Some((rule, values)) = timed_sequence_for_turn(user_turn) else {
+        return Ok(None);
+    };
+    let namespace = WorkspaceNamespace::new(tenant_id.to_owned(), user_id.to_owned());
+    let repository = ConversationRepository::with_namespace(workspace_root(), namespace);
+    let now = now_unix();
+    let sequence_prefix = if rule.id.trim().is_empty() {
+        "timed-sequence"
+    } else {
+        rule.id.trim()
+    };
+    let sequence_id = format!("{sequence_prefix}.{now}");
+    let trigger = rule
+        .trigger
+        .clone()
+        .unwrap_or_else(|| "timed_sequence.tick".to_owned());
+    let agent_id = rule
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| "agent.system.timer".to_owned());
+
+    for (index, value) in values.iter().enumerate() {
+        let mut followup = PendingFollowUp::new(
+            agent_id.clone(),
+            trigger.clone(),
+            now.saturating_add(rule.interval_seconds.saturating_mul(index as u64)),
+        );
+        followup.id = format!("{sequence_id}.{index}");
+        followup.room_id = room_id.clone();
+        followup.payload.insert(
+            "sequence_id".to_owned(),
+            serde_json::Value::String(sequence_id.clone()),
+        );
+        followup
+            .payload
+            .insert("index".to_owned(), serde_json::json!(index));
+        followup.payload.insert(
+            "draft_message".to_owned(),
+            serde_json::Value::String(value.to_string()),
+        );
+        followup.notes = format!("Timed sequence tick {index}: {value}");
+        repository.write_followup(&followup)?;
+    }
+
+    let reply = rule
+        .scheduled_reply
+        .clone()
+        .unwrap_or_else(|| "scheduled timed sequence".to_owned());
+    println!("assistant> {reply}");
+    deliver_timed_sequence_followups(&repository, &sequence_id, values.len())?;
+    Ok(Some(String::new()))
+}
+
+fn timed_sequence_for_turn(user_turn: &str) -> Option<(&'static TimedSequenceRule, Vec<i64>)> {
+    tool_routing_tags()
+        .timed_sequence_rules
+        .iter()
+        .find_map(|rule| {
+            if !text_matches_any(user_turn, &rule.hints) {
+                return None;
+            }
+            let numbers = extract_i64_numbers(user_turn);
+            let start = *numbers.first()?;
+            let end = numbers
+                .get(1)
+                .copied()
+                .or(rule.default_end)
+                .unwrap_or(start);
+            let values = build_timed_sequence_values(start, end, rule)?;
+            Some((rule, values))
+        })
+}
+
+fn build_timed_sequence_values(start: i64, end: i64, rule: &TimedSequenceRule) -> Option<Vec<i64>> {
+    let descending = if rule.direction == "countdown" {
+        true
+    } else if rule.direction == "countup" {
+        false
+    } else {
+        start >= end
+    };
+    let mut values = Vec::new();
+    if descending {
+        let mut current = start;
+        while current >= end {
+            values.push(current);
+            if values.len() > rule.max_items {
+                return None;
+            }
+            current -= 1;
+        }
+    } else {
+        let mut current = start;
+        while current <= end {
+            values.push(current);
+            if values.len() > rule.max_items {
+                return None;
+            }
+            current += 1;
+        }
+    }
+    Some(values)
+}
+
+fn extract_i64_numbers(text: &str) -> Vec<i64> {
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || (ch == '-' && current.is_empty()) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<i64>() {
+                numbers.push(value);
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty()
+        && let Ok(value) = current.parse::<i64>()
+    {
+        numbers.push(value);
+    }
+    numbers
+}
+
+fn deliver_timed_sequence_followups(
+    repository: &ConversationRepository,
+    sequence_id: &str,
+    expected_count: usize,
+) -> Result<()> {
+    let mut delivered = 0usize;
+    while delivered < expected_count {
+        let now = now_unix();
+        let due = repository.due_followups(now)?;
+        let mut matched_any = false;
+        for mut followup in due {
+            if followup
+                .payload
+                .get("sequence_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(sequence_id)
+            {
+                continue;
+            }
+            matched_any = true;
+            if let Some(message) = followup
+                .payload
+                .get("draft_message")
+                .and_then(serde_json::Value::as_str)
+            {
+                println!("assistant> {message}");
+            }
+            followup.status = FollowUpStatus::Fired;
+            repository.write_followup(&followup)?;
+            delivered += 1;
+        }
+        if delivered >= expected_count {
+            break;
+        }
+        if !matched_any {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    Ok(())
 }
 
 fn is_confirmation_turn(user_turn: &str) -> bool {
@@ -2034,7 +2970,8 @@ fn pending_confirmation_from_outcome(
     let order_tool = catalog
         .list()
         .into_iter()
-        .find(|tool| tool_matches_any_selector(tool, &flow.target_selectors))?;
+        .find(|tool| tool_matches_all_selectors(tool, &flow.target_selectors))?;
+    let fallback_tool_ids = confirmation_fallback_tool_ids(catalog, flow, &order_tool.id);
     let value = extract_tool_json_from_observations(&outcome.observations)?;
     let items = extract_items_for_paths(&value, &flow.item_paths)
         .into_iter()
@@ -2046,9 +2983,33 @@ fn pending_confirmation_from_outcome(
     }
     Some(PendingToolConfirmation {
         tool_id: order_tool.id.clone(),
+        fallback_tool_ids,
         items,
         flow: flow.clone(),
     })
+}
+
+fn confirmation_fallback_tool_ids(
+    catalog: &ToolCatalog,
+    flow: &ToolConfirmationFlowRule,
+    primary_tool_id: &str,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for selectors in &flow.fallback_target_selectors {
+        if selectors.is_empty() {
+            continue;
+        }
+        if let Some(tool) = catalog
+            .list()
+            .into_iter()
+            .find(|tool| tool_matches_all_selectors(tool, selectors))
+            && tool.id != primary_tool_id
+            && !ids.iter().any(|id| id == &tool.id)
+        {
+            ids.push(tool.id.clone());
+        }
+    }
+    ids
 }
 
 fn fetch_tool_context(rule: &ToolContextCallRule) -> Option<String> {
@@ -2101,11 +3062,14 @@ fn select_agent_by_configured_hints(user_turn: &str) -> Result<Option<AgentProfi
         .list_profiles()?
         .into_iter()
         .map(|agent| {
-            let score = agent
-                .intent_hints
-                .iter()
-                .filter(|hint| hint_matches_user_turn(user_turn, hint))
-                .count();
+            let score = route_phrase_score(user_turn, &agent.intent_hints, 50)
+                + route_phrase_score(user_turn, &agent.routing_examples, 45)
+                - route_phrase_score(user_turn, &agent.negative_routing_examples, 60)
+                + if best_phrase_match_score(user_turn, &agent.routing_examples) > 0 {
+                    agent.priority / 10
+                } else {
+                    0
+                };
             (agent, score)
         })
         .filter(|(_, score)| *score > 0)
@@ -2206,10 +3170,14 @@ fn tool_query_preference(tool: &ToolSpec, user_turn: &str) -> i32 {
     let mut score = 0;
     let routing_tags = tool_routing_tags();
     for rule in &routing_tags.intent_rules {
-        if text_matches_any(user_turn, &rule.hints)
-            && tool_matches_any_selector(tool, &rule.preferred_selectors)
-        {
-            score += rule.weight;
+        let intent_score = best_phrase_match_score(user_turn, &rule.hints)
+            .max(best_phrase_match_score(user_turn, &rule.examples));
+        let negative_score = best_phrase_match_score(user_turn, &rule.negative_examples);
+        if intent_score > 0 && tool_matches_any_selector(tool, &rule.preferred_selectors) {
+            score += rule.weight * intent_score / 100;
+        }
+        if negative_score > 0 && tool_matches_any_selector(tool, &rule.preferred_selectors) {
+            score -= rule.weight.abs() * negative_score / 100;
         }
     }
     for rule in &routing_tags.tool_weights {
@@ -2271,13 +3239,20 @@ fn markdown_frontmatter(content: &str) -> Option<&str> {
 fn text_matches_any(text: &str, selectors: &[String]) -> bool {
     selectors
         .iter()
-        .any(|selector| text_contains_selector(text, selector))
+        .any(|selector| phrase_match_score(text, selector) > 0)
 }
 
 fn tool_matches_any_selector(tool: &ToolSpec, selectors: &[String]) -> bool {
     selectors
         .iter()
         .any(|selector| tool_matches_selector(tool, selector))
+}
+
+fn tool_matches_all_selectors(tool: &ToolSpec, selectors: &[String]) -> bool {
+    !selectors.is_empty()
+        && selectors
+            .iter()
+            .all(|selector| tool_matches_selector(tool, selector))
 }
 
 fn tool_matches_selector(tool: &ToolSpec, selector: &str) -> bool {
@@ -2308,9 +3283,12 @@ fn text_contains_selector(text: &str, selector: &str) -> bool {
             .contains(&selector.to_ascii_lowercase())
 }
 
-fn hint_matches_user_turn(user_turn: &str, hint: &str) -> bool {
-    let hint = hint.trim();
-    !hint.is_empty() && user_turn.contains(hint)
+fn route_phrase_score(user_turn: &str, phrases: &[String], weight: i32) -> i32 {
+    let score = best_phrase_match_score(user_turn, phrases);
+    if score <= 0 {
+        return 0;
+    }
+    weight * score / 100
 }
 
 fn execute_builtin_tool(
@@ -2553,6 +3531,17 @@ fn parse_jsonish_argument_value(value: &str) -> serde_json::Value {
     serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_owned()))
 }
 
+fn parse_key_value(value: &str) -> Result<(String, String)> {
+    let Some((key, value)) = value.split_once('=') else {
+        bail!("expected key=value, got: {value}");
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("key cannot be empty");
+    }
+    Ok((key.to_owned(), value.trim().to_owned()))
+}
+
 fn mcp_result_observations(result: &serde_json::Value) -> Vec<String> {
     let mut observations = Vec::new();
     if let Some(content) = result.get("content").and_then(serde_json::Value::as_array) {
@@ -2578,7 +3567,7 @@ fn render_grounded_tool_reply(outcome: &ToolExecutionOutcome) -> Option<String> 
     let value = extract_tool_json_from_observations(&outcome.observations)?;
     let items = extract_ranked_items(&value, Some(renderer));
     if items.is_empty() {
-        return Some(render_unrenderable_tool_reply(outcome));
+        return None;
     }
 
     let mut lines = vec![if outcome_has_configured_context(outcome, renderer) {
@@ -2699,6 +3688,7 @@ fn render_unrenderable_tool_reply(outcome: &ToolExecutionOutcome) -> String {
         })
 }
 
+#[allow(dead_code)]
 fn render_tool_failure_reply(outcome: &ToolExecutionOutcome) -> String {
     renderer_for_outcome(outcome, None)
         .and_then(|renderer| renderer.failure_reply.clone())
@@ -3598,6 +4588,14 @@ fn auto_select_tool(
 
 fn score_tool_for_goal(tool: &ToolSpec, goal: &str) -> i32 {
     let mut score = 0;
+    score += phrase_match_score(goal, &tool.id) / 25;
+    score += phrase_match_score(goal, &tool.name) / 20;
+    score += phrase_match_score(goal, &tool.description) / 35;
+    score += tool
+        .tags
+        .iter()
+        .map(|tag| phrase_match_score(goal, tag) / 35)
+        .sum::<i32>();
     for token in goal_match_terms(goal) {
         if token.is_empty() {
             continue;
@@ -3742,20 +4740,8 @@ fn merge_optional_contexts<const N: usize>(contexts: [Option<String>; N]) -> Opt
 }
 
 fn selection_input_from_history(history: &[ChatMessage], current_input: &str) -> String {
-    let mut user_messages = history
-        .iter()
-        .filter(|message| message.role == MessageRole::User)
-        .rev()
-        .take(2)
-        .map(|message| message.content.trim().to_owned())
-        .collect::<Vec<_>>();
-    user_messages.reverse();
-    user_messages.push(current_input.trim().to_owned());
-    user_messages
-        .into_iter()
-        .filter(|message| !message.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let _ = history;
+    current_input.trim().to_owned()
 }
 
 fn append_system_context(messages: &mut Vec<ChatMessage>, context: &str) {
@@ -3911,9 +4897,22 @@ fn schedule_repository() -> ScheduleRepository {
 }
 
 fn runtime_namespace() -> WorkspaceNamespace {
-    let tenant_id = env::var("HC_TENANT_ID").unwrap_or_else(|_| "local".to_owned());
-    let user_id = env::var("HC_USER_ID").unwrap_or_else(|_| "default".to_owned());
+    let context = cli_runtime_context();
+    let tenant_id = context
+        .tenant_id
+        .or_else(|| env::var("HC_TENANT_ID").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local".to_owned());
+    let user_id = context
+        .user_id
+        .or_else(|| env::var("HC_USER_ID").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned());
     WorkspaceNamespace::new(tenant_id, user_id)
+}
+
+fn default_chat_session_id(tenant_id: &str, user_id: &str) -> String {
+    format!("session.{tenant_id}.{user_id}.default")
 }
 
 fn workspace_root() -> PathBuf {
@@ -4623,6 +5622,7 @@ fn is_help(value: &str) -> bool {
 
 fn print_help() {
     println!("hc-tool-cli                    # start tool-aware chat");
+    println!("global options: --tenant-id <id> --user-id <id> --session-id <id>");
     println!("hc-tool-cli chat [--provider <id>] [--model <name>] [--system <text>]");
     println!(
         "hc-tool-cli create <tool-id> <name> --description <text> --command <token> [--command <token>] [--kind <cli|builtin|script|workflow|service>] [--tag <tag>] [--json]"
@@ -4645,6 +5645,10 @@ fn print_help() {
     println!("hc-tool-cli schedule dispatch-due [--now-unix <ts>] [--json]");
     println!("hc-tool-cli schedule dispatch-queued [--now-unix <ts>] [--json]");
     println!("hc-tool-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]");
+    println!("hc-tool-cli index rebuild [--vector] [--dims <n>] [--json]");
+    println!(
+        "hc-tool-cli index search <text> [--vector] [--rebuild] [--filter key=value] [--limit <n>] [--json]"
+    );
     println!("hc-tool-cli show <rg|cargo-test|tool-id> [--json]");
     println!("hc-tool-cli plan <auto|rg|cargo-test|tool-id> <goal...> [--json]");
     println!(

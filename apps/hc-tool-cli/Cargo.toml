@@ -15,6 +15,7 @@ encoding_rs = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 hc-capability = { path = "../../crates/hc-capability" }
 hc-agent = { path = "../../crates/hc-agent" }
+hc-conversation = { path = "../../crates/hc-conversation" }
 hc-context = { path = "../../crates/hc-context" }
 hc-llm = { path = "../../crates/hc-llm" }
 hc-scheduler = { path = "../../crates/hc-scheduler" }

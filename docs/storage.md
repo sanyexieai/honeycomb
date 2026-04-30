@@ -96,6 +96,9 @@ Recommended fields:
 
 Tier 2 artifacts must never become the only durable copy of knowledge.
 
+See also: `docs/storage-tiering.md` for the project-level split between files,
+databases, and vector stores.
+
 ## File Naming
 
 Recommended file naming:
