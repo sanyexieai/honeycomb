@@ -6,7 +6,9 @@ use hc_context::{
     ContextMemoryQuery, ContextRequest, DefaultContextComposer, MemoryKind, MemoryNamespace,
     MemoryScope, PromptPolicy, WorkspaceMemoryRetriever, generate_with_context,
     load_context_memory_system_prompt, load_context_memory_usage_policy_prompt, memory_kind_label,
-    memory_scope_label, workspace_namespace_from_memory_namespace,
+    memory_scope_label,
+    runtime::{RuntimeIdentity, default_session_id, runtime_identity_prompt},
+    workspace_namespace_from_memory_namespace,
 };
 use hc_llm::{
     ChatMessage, GenerateRequest, MessageRole, ModelRef, default_model_from_env,
@@ -43,7 +45,10 @@ pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Resu
         Some(system_prompt) if !system_prompt.trim().is_empty() => system_prompt,
         _ => load_context_memory_system_prompt(&workspace_namespace)?,
     };
-    let system_prompt = compose_agent_system_prompt(base_system_prompt, agent_context.as_ref());
+    let system_prompt = compose_agent_system_prompt(
+        append_runtime_identity_prompt(base_system_prompt, &request),
+        agent_context.as_ref(),
+    );
     let context_request = ContextRequest::new(generation)
         .with_memory_query(memory_query)
         .with_system_prompt(system_prompt)
@@ -86,10 +91,20 @@ fn normalize_chat_request(mut request: ChatRequest) -> ChatRequest {
     if let Some(user_id) = normalized_optional_string(request.user_id.take()) {
         request.memory.namespace.user_id = user_id;
     }
+    if request.memory.namespace.tenant_id.trim().is_empty() {
+        request.memory.namespace.tenant_id = hc_context::runtime::DEFAULT_TENANT_ID.to_owned();
+    }
+    if request.memory.namespace.user_id.trim().is_empty() {
+        request.memory.namespace.user_id = hc_context::runtime::DEFAULT_USER_ID.to_owned();
+    }
     request.tenant_id = Some(request.memory.namespace.tenant_id.clone());
     request.user_id = Some(request.memory.namespace.user_id.clone());
-    request.session_id = normalized_optional_string(request.session_id.take())
-        .or_else(|| Some(default_session_id(&request.memory.namespace)));
+    request.session_id = normalized_optional_string(request.session_id.take()).or_else(|| {
+        Some(default_session_id(
+            &request.memory.namespace.tenant_id,
+            &request.memory.namespace.user_id,
+        ))
+    });
     request
 }
 
@@ -99,10 +114,15 @@ fn normalized_optional_string(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn default_session_id(namespace: &ApiNamespace) -> String {
+fn append_runtime_identity_prompt(base_system_prompt: String, request: &ChatRequest) -> String {
+    let identity = RuntimeIdentity::from_optional(
+        Some(request.memory.namespace.tenant_id.clone()),
+        Some(request.memory.namespace.user_id.clone()),
+        request.session_id.clone(),
+    );
     format!(
-        "session.{}.{}.default",
-        namespace.tenant_id, namespace.user_id
+        "{base_system_prompt}\n\n{}",
+        runtime_identity_prompt(&identity)
     )
 }
 

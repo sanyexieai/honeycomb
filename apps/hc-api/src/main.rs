@@ -127,10 +127,11 @@ async fn conversation_inbox(
     State(state): State<AppState>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<hc_service::conversation::ConversationInboxSnapshot>, ApiError> {
-    let namespace = ApiNamespace {
-        tenant_id: query.tenant_id,
-        user_id: query.user_id,
-    };
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
     let _session_id = normalized_optional_string(query.session_id)
         .unwrap_or_else(|| default_session_id(&namespace));
     let response = tokio::task::spawn_blocking(move || {
@@ -360,10 +361,11 @@ async fn agents(
     State(state): State<AppState>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<AgentListResponse>, ApiError> {
-    let namespace = ApiNamespace {
-        tenant_id: query.tenant_id,
-        user_id: query.user_id,
-    };
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
     let response = tokio::task::spawn_blocking(move || list_agents(&state.service, namespace))
         .await
         .map_err(|error| ApiError(anyhow!("agent worker failed: {error}")))?
@@ -375,10 +377,11 @@ async fn domains(
     State(state): State<AppState>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<DomainListResponse>, ApiError> {
-    let namespace = ApiNamespace {
-        tenant_id: query.tenant_id,
-        user_id: query.user_id,
-    };
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
     let response = tokio::task::spawn_blocking(move || list_domains(&state.service, namespace))
         .await
         .map_err(|error| ApiError(anyhow!("domain worker failed: {error}")))?
@@ -390,10 +393,11 @@ async fn mcp_servers(
     State(state): State<AppState>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<McpServerListResponse>, ApiError> {
-    let namespace = ApiNamespace {
-        tenant_id: query.tenant_id,
-        user_id: query.user_id,
-    };
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
     let response = tokio::task::spawn_blocking(move || list_mcp_servers(&state.service, namespace))
         .await
         .map_err(|error| ApiError(anyhow!("mcp server worker failed: {error}")))?

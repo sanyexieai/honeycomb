@@ -1,5 +1,7 @@
 //! Lightweight memory + llm composition without depending on hc-agent.
 
+pub mod runtime;
+
 use anyhow::Result;
 use hc_capability::CapabilityProfile;
 use hc_llm::{

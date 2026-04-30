@@ -1,5 +1,5 @@
 {
-  "generated_at_ms": 1777529959438,
+  "generated_at_ms": 1777532165173,
   "namespace": {
     "tenant_id": "local",
     "user_id": "default"
@@ -179,8 +179,8 @@
       "layer": null,
       "memory_kind": null,
       "asset_kind": null,
-      "body_preview": "你是 CareOS 健康数据助手，负责查询并解释手表采集的健康信息。 优先调用健康数据工具获取实时或历史数据，再回答。先给结论，再给关键数据点和简短建议。严禁编造健康数值，所有数值必须来自工具返回；如果数据缺失，要明确说明并引导用户补充时间范围或稍后重试。",
-      "semantic_text": "CareOS Health Data Agent careos health 你是 CareOS 健康数据助手，负责查询并解释手表采集的健康信息。 优先调用健康数据工具获取实时或历史数据，再回答。先给结论，再给关键数据点和简短建议。严禁编造健康数值，所有数值必须来自工具返回；如果数据缺失，要明确说明并引导用户补充时间范围或稍后重试。 心率 血压 血氧 睡眠 健康数据 手表 health mcp.careos-watch-health memory_scope.global memory_scope.session prompt.careos.health"
+      "body_preview": "你是 CareOS 健康数据助手，负责查询并解释手表采集的健康信息。 优先调用健康数据工具获取实时或历史数据，再回答。先给结论，再给关键数据点和简短建议。严禁编造健康数值，所有数值必须来自工具返回；如果数据缺失，要明确说明数据暂不可用。 运行时上下文和健康服务配置已经提供默认用户身份，后端也可以通过已连接账号定位设备。...",
+      "semantic_text": "CareOS Health Data Agent careos health 你是 CareOS 健康数据助手，负责查询并解释手表采集的健康信息。 优先调用健康数据工具获取实时或历史数据，再回答。先给结论，再给关键数据点和简短建议。严禁编造健康数值，所有数值必须来自工具返回；如果数据缺失，要明确说明数据暂不可用。 运行时上下文和健康服务配置已经提供默认用户身份，后端也可以通过已连接账号定位设备。不要向用户索要用户 ID、设备 ID、租户 ID、MCP 名称、工具名或其他内部标识。需要查询时直接查询；如果连接账号或设备不可用，说明“当前连接账号暂时不可用”，而不是让用户提供内部 ID。 心率 血压 血氧 睡眠 健康数据 手表 health 看一下我的健康数据 查今天心率和血压 最近一周健康趋势怎么样 mcp.careos-watch-health memory_scope.global memory_scope.session prompt.careos.health"
     },
     {
       "id": "agent.careos.housekeeping",
@@ -5018,8 +5018,8 @@
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "已按默认推荐为您提交订单。 订单号: 99 状态: 已确认 金额: 约 32.00 元 备注: 已通知商家接单，商家电话 13800138111，预计 30 分钟送达。本单暂不在线支付，请线下结算。",
-      "semantic_text": "Assistant Reply 2 chat assistant 已按默认推荐为您提交订单。 订单号: 99 状态: 已确认 金额: 约 32.00 元 备注: 已通知商家接单，商家电话 13800138111，预计 30 分钟送达。本单暂不在线支付，请线下结算。 summary raw captured raw_note session.local.default.default chat"
+      "body_preview": "已按默认推荐为您提交订单。 订单号: 101 状态: 已确认 金额: 约 32.00 元 备注: 已通知商家接单，商家电话 13800138111，预计 30 分钟送达。本单暂不在线支付，请线下结算。",
+      "semantic_text": "Assistant Reply 2 chat assistant 已按默认推荐为您提交订单。 订单号: 101 状态: 已确认 金额: 约 32.00 元 备注: 已通知商家接单，商家电话 13800138111，预计 30 分钟送达。本单暂不在线支付，请线下结算。 summary raw captured raw_note session.local.default.default chat"
     },
     {
       "id": "asset.session.local.default.default.turn.2.user",
@@ -5072,8 +5072,8 @@
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "我结合您的健康数据，查到了这些真实可选项： 默认推荐： 1. 清蒸鱼配杂粮饭 商家: 乐龄膳食厨房 价格: 约 32.00 元 Reason: 这套餐品质地更软、更清淡，更适合高龄用户; 这套餐品蛋白质配置更好，整体营养更均衡。 备选： 2. 番茄鸡胸沙拉碗 - 乐龄膳食厨房 3. 山药肉末软食套餐 - 银龄软食食堂 ...",
-      "semantic_text": "Assistant Reply 3 chat assistant 我结合您的健康数据，查到了这些真实可选项： 默认推荐： 1. 清蒸鱼配杂粮饭 商家: 乐龄膳食厨房 价格: 约 32.00 元 Reason: 这套餐品质地更软、更清淡，更适合高龄用户; 这套餐品蛋白质配置更好，整体营养更均衡。 备选： 2. 番茄鸡胸沙拉碗 - 乐龄膳食厨房 3. 山药肉末软食套餐 - 银龄软食食堂 如果确认默认推荐，请回复“确认下单”；想换备选，就回复对应序号。 summary raw captured raw_note session.local.default.default chat"
+      "body_preview": "不客气，小八随时在！有什么需要随时叫我~ 😊",
+      "semantic_text": "Assistant Reply 3 chat assistant 不客气，小八随时在！有什么需要随时叫我~ 😊 summary raw captured raw_note session.local.default.default chat"
     },
     {
       "id": "asset.session.local.default.default.turn.3.user",
@@ -5126,8 +5126,8 @@
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "我刚才没有查到可用结果，先不编推荐。请稍后再试一次。",
-      "semantic_text": "Assistant Reply 4 chat assistant 我刚才没有查到可用结果，先不编推荐。请稍后再试一次。 summary raw captured raw_note session.local.default.default chat"
+      "body_preview": "我结合您的健康数据，查到了这些真实可选项： 默认推荐： 1. 清蒸鱼配杂粮饭 商家: 乐龄膳食厨房 价格: 约 32.00 元 Reason: 这套餐品质地更软、更清淡，更适合高龄用户; 这套餐品蛋白质配置更好，整体营养更均衡。 备选： 2. 番茄鸡胸沙拉碗 - 乐龄膳食厨房 3. 山药肉末软食套餐 - 银龄软食食堂 ...",
+      "semantic_text": "Assistant Reply 4 chat assistant 我结合您的健康数据，查到了这些真实可选项： 默认推荐： 1. 清蒸鱼配杂粮饭 商家: 乐龄膳食厨房 价格: 约 32.00 元 Reason: 这套餐品质地更软、更清淡，更适合高龄用户; 这套餐品蛋白质配置更好，整体营养更均衡。 备选： 2. 番茄鸡胸沙拉碗 - 乐龄膳食厨房 3. 山药肉末软食套餐 - 银龄软食食堂 如果确认默认推荐，请回复“确认下单”；想换备选，就回复对应序号。 summary raw captured raw_note session.local.default.default chat"
     },
     {
       "id": "asset.session.local.default.default.turn.4.user",
@@ -5153,8 +5153,8 @@
       "layer": "chat",
       "memory_kind": "summary",
       "asset_kind": "raw",
-      "body_preview": "you> 好的 谢谢",
-      "semantic_text": "User Message 4 chat user you> 好的 谢谢 summary raw captured raw_note session.local.default.default chat"
+      "body_preview": "你还能干什么",
+      "semantic_text": "User Message 4 chat user 你还能干什么 summary raw captured raw_note session.local.default.default chat"
     },
     {
       "id": "asset.session.local.default.default.turn.5.assistant",
@@ -5287,7 +5287,7 @@
       "memory_kind": null,
       "asset_kind": null,
       "body_preview": "# Chat Session Captured chat turns for context recall. ## Manifest - room: session.local.default.default - layer: chat - status: active ## Objects - source: raw...",
-      "semantic_text": "Chat Session chat session # Chat Session Captured chat turns for context recall. ## Manifest - room: session.local.default.default - layer: chat - status: active ## Objects - source: raw/0001.user.md - source: raw/0001.assistant.md - source: raw/0002.user.md - source: raw/0002.assistant.md - derived: timeline.md"
+      "semantic_text": "Chat Session chat session # Chat Session Captured chat turns for context recall. ## Manifest - room: session.local.default.default - layer: chat - status: active ## Objects - source: raw/0001.user.md - source: raw/0001.assistant.md - source: raw/0002.user.md - source: raw/0002.assistant.md - source: raw/0003.user.md - source: raw/0003.assistant.md - derived: timeline.md"
     },
     {
       "id": "asset.session.local.default.default.timeline",
@@ -5344,6 +5344,33 @@
       "semantic_text": "Global Preference global preference Assistant's name is set to '小八'. preference compressed generalized policy room.global.local.default global"
     },
     {
+      "id": "asset.room.global.local.default.user.prefers.responses.in.chinese",
+      "doc_type": "memory_room_asset",
+      "title": "Global Preference",
+      "relative_path": "memory/rooms/global/room.global.local.default/compressed/pref.user.prefers.responses.in.chinese.md",
+      "tags": [
+        "global",
+        "preference"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [
+        "global"
+      ],
+      "capabilities": [],
+      "room_id": "room.global.local.default",
+      "layer": "global",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
+      "body_preview": "User prefers responses in Chinese.",
+      "semantic_text": "Global Preference global preference User prefers responses in Chinese. preference compressed generalized policy room.global.local.default global"
+    },
+    {
       "id": "room.global.local.default",
       "doc_type": "memory_room",
       "title": "Global Preference",
@@ -5362,8 +5389,8 @@
       "layer": "global",
       "memory_kind": null,
       "asset_kind": null,
-      "body_preview": "# Global Preference Assistant's name is set to '小八'. ## Manifest - room: room.global.local.default - layer: global - status: active ## Objects - derived: compre...",
-      "semantic_text": "Global Preference # Global Preference Assistant's name is set to '小八'. ## Manifest - room: room.global.local.default - layer: global - status: active ## Objects - derived: compressed/pref.assistant.s.name.is.set.to.md"
+      "body_preview": "# Global Preference User prefers responses in Chinese. ## Manifest - room: room.global.local.default - layer: global - status: active ## Objects - derived: comp...",
+      "semantic_text": "Global Preference # Global Preference User prefers responses in Chinese. ## Manifest - room: room.global.local.default - layer: global - status: active ## Objects - derived: compressed/pref.assistant.s.name.is.set.to.md - derived: compressed/pref.user.prefers.responses.in.chinese.md"
     },
     {
       "id": "prompt.rewrite.assistant-wenyan",
@@ -5598,6 +5625,35 @@
       "semantic_text": "Prompt Asset Synthesizer managed_prompt current synthesis prompt synthesis behavior Turn the recalled memories into prompt assets that should shape future model behavior. Only produce assets for durable instruction-like memories such as user preferences, naming, language, style, output constraints, or other long-lived behavior guidance. Prefer zero assets over low-confidence assets. Return strict JSON with this schema: ```json { \"assets\": [ { \"source_memory_id\": \"optional memory id\", \"kind\": \"system_policy|behavior_template|style_guide|output_contract|prompt_memory\", \"title\": \"short title\", \"content\": \"instruction text for the model\", \"tags\": [\"tag\"] } ] } ``` preference compressed compiled prompt room.project.prompt-library project"
     },
     {
+      "id": "prompt.tool.chat-assistant.rev.1777531575342",
+      "doc_type": "memory_room_asset",
+      "title": "Tool Chat Assistant Revision 1777531575342",
+      "relative_path": "memory/rooms/project/room.project.prompt-library/prompt/rev.1777531575342.tool-chat-assistant.md",
+      "tags": [
+        "managed_prompt",
+        "revision",
+        "tool_chat",
+        "tool",
+        "chat",
+        "assistant"
+      ],
+      "status": null,
+      "visibility": "private",
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "room.project.prompt-library",
+      "layer": "project",
+      "memory_kind": "preference",
+      "asset_kind": "compressed",
+      "body_preview": "You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend th...",
+      "semantic_text": "Tool Chat Assistant Revision 1777531575342 managed_prompt revision tool_chat tool chat assistant You are Honeycomb's tool-facing assistant. Help the user choose, plan, create, and run tools while respecting the local tool catalog. Rules: - Do not pretend that a command has been executed. - Do not emit `<tool_call>`, `<minimax:tool_call>`, `<invoke>`, `$SKILL`, function-call XML, or provider-specific tool call markup. - Skills are local guidance, not callable remote functions. To use a skill, silently apply its description/tags/instructions and answer normally. - Only create a new tool/skill when the user explicitly asks for a tool, skill, command, or reusable capability. - Do not treat requests for artifacts such as pages, components, code, apps, websites, documents, or designs as tool creation requests. - Skill creation is handled before normal chat. Never turn a skill request into `/create-tool`. - Only emit `/create-tool` when the user explicitly asks for a concrete executable tool and all arguments are exact. - Do not ask whether to execute a valid creation command. The CLI will execute valid tool creation commands automatically. - If a selected tool is provided for the current turn, use its description and tags as active guidance for the answer. - If no selected tool is p... preference compressed compiled prompt room.project.prompt-library project"
+    },
+    {
       "id": "prompt.extract.semantic-tags",
       "doc_type": "memory_room_asset",
       "title": "Semantic Tag Suggester",
@@ -5708,7 +5764,7 @@
       "memory_kind": null,
       "asset_kind": null,
       "body_preview": "# Managed Prompt Library Managed prompt templates for local.default. ## Manifest - room: room.project.prompt-library - layer: project - status: active ## Object...",
-      "semantic_text": "Managed Prompt Library prompt-library managed-prompt project # Managed Prompt Library Managed prompt templates for local.default. ## Manifest - room: room.project.prompt-library - layer: project - status: active ## Objects - derived: prompt/tool-chat-assistant.md - derived: timeline.md"
+      "semantic_text": "Managed Prompt Library prompt-library managed-prompt project # Managed Prompt Library Managed prompt templates for local.default. ## Manifest - room: room.project.prompt-library - layer: project - status: active ## Objects - derived: prompt/json-guard.md - derived: timeline.md"
     },
     {
       "id": "asset.room.project.prompt-library.timeline",
@@ -5720,7 +5776,7 @@
         "event",
         "managed_prompt",
         "current",
-        "tool_chat"
+        "system_guard"
       ],
       "status": null,
       "visibility": "private",
@@ -5736,7 +5792,7 @@
       "memory_kind": "workflow_memory",
       "asset_kind": "timeline",
       "body_preview": "### Promoted - event: event.prompt.context.memory-system.compiled.1777447949076 - artifact: prompt.context.memory-system - action: Promoted - reason: synced man...",
-      "semantic_text": "Managed Prompt Library Timeline timeline event managed_prompt current tool_chat ### Promoted - event: event.prompt.context.memory-system.compiled.1777447949076 - artifact: prompt.context.memory-system - action: Promoted - reason: synced managed prompt body into prompt library room - created_at_ms: 1777447949076 - tags: managed_prompt, current, context_memory - inputs: - prompts\\context\\memory-system.md - outputs: - prompt/memory-system.md ### Promoted - event: event.prompt.context.memory-usage-policy.compiled.1777447949099 - artifact: prompt.context.memory-usage-policy - action: Promoted - reason: synced managed prompt body into prompt library room - created_at_ms: 1777447949099 - tags: managed_prompt, current, context_policy - inputs: - prompts\\context\\memory-usage-policy.md - outputs: - prompt/memory-usage-policy.md ### Promoted - event: event.prompt.context.lightweight-chat.compiled.1777447949126 - artifact: prompt.context.lightweight-chat - action: Promoted - reason: synced managed prompt body into prompt library room - created_at_ms: 1777447949126 - tags: managed_prompt, current, context_lightweight_chat - inputs: - prompts\\context\\lightweight-chat.md - outputs: - prompt/lightweight-chat.md ### Promoted - event: event.prompt.context.memory-system.compiled... workflow_memory timeline extracted workflow room.project.prompt-library project"
+      "semantic_text": "Managed Prompt Library Timeline timeline event managed_prompt current system_guard ### Promoted - event: event.prompt.context.memory-system.compiled.1777447949076 - artifact: prompt.context.memory-system - action: Promoted - reason: synced managed prompt body into prompt library room - created_at_ms: 1777447949076 - tags: managed_prompt, current, context_memory - inputs: - prompts\\context\\memory-system.md - outputs: - prompt/memory-system.md ### Promoted - event: event.prompt.context.memory-usage-policy.compiled.1777447949099 - artifact: prompt.context.memory-usage-policy - action: Promoted - reason: synced managed prompt body into prompt library room - created_at_ms: 1777447949099 - tags: managed_prompt, current, context_policy - inputs: - prompts\\context\\memory-usage-policy.md - outputs: - prompt/memory-usage-policy.md ### Promoted - event: event.prompt.context.lightweight-chat.compiled.1777447949126 - artifact: prompt.context.lightweight-chat - action: Promoted - reason: synced managed prompt body into prompt library room - created_at_ms: 1777447949126 - tags: managed_prompt, current, context_lightweight_chat - inputs: - prompts\\context\\lightweight-chat.md - outputs: - prompt/lightweight-chat.md ### Promoted - event: event.prompt.context.memory-system.compiled... workflow_memory timeline extracted workflow room.project.prompt-library project"
     },
     {
       "id": "prompt.context.lightweight-chat",
@@ -6045,6 +6101,50 @@
       "asset_kind": null,
       "body_preview": "This file defines how tool execution results become user-readable replies. Rust should only provide generic JSON extraction and formatting. Service-specific fie...",
       "semantic_text": "Tool Response Rendering This file defines how tool execution results become user-readable replies. Rust should only provide generic JSON extraction and formatting. Service-specific field names, user-facing copy, and result array paths belong here."
+    },
+    {
+      "id": "routing.failure.configured_agent_mcp.1777530342",
+      "doc_type": "routing_flow_failure",
+      "title": "Routing Flow Failure configured_agent_mcp",
+      "relative_path": "routing/failures/routing.failure.configured_agent_mcp.1777530342.md",
+      "tags": [],
+      "status": "recorded",
+      "visibility": null,
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "session.local.default.default",
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "## User Turn 给我讲个笑话听 ## Route Args query=给我讲个笑话听 ## Outcome - success: false - summary: mcp tool call returned an error result ## Observations text: 未找到书籍",
+      "semantic_text": "Routing Flow Failure configured_agent_mcp ## User Turn 给我讲个笑话听 ## Route Args query=给我讲个笑话听 ## Outcome - success: false - summary: mcp tool call returned an error result ## Observations text: 未找到书籍"
+    },
+    {
+      "id": "routing.failure.configured_agent_mcp.1777530363",
+      "doc_type": "routing_flow_failure",
+      "title": "Routing Flow Failure configured_agent_mcp",
+      "relative_path": "routing/failures/routing.failure.configured_agent_mcp.1777530363.md",
+      "tags": [],
+      "status": "recorded",
+      "visibility": null,
+      "tenant_id": "local",
+      "user_id": "default",
+      "created_at": null,
+      "updated_at": null,
+      "relations": [],
+      "owners": [],
+      "capabilities": [],
+      "room_id": "session.local.default.default",
+      "layer": null,
+      "memory_kind": null,
+      "asset_kind": null,
+      "body_preview": "## User Turn 我最近身体状态怎么样 ## Route Args query=我最近身体状态怎么样 user_id=1 ## Outcome - success: true - summary: mcp tool call completed ## Observations text: 暂无血压数据",
+      "semantic_text": "Routing Flow Failure configured_agent_mcp ## User Turn 我最近身体状态怎么样 ## Route Args query=我最近身体状态怎么样 user_id=1 ## Outcome - success: true - summary: mcp tool call completed ## Observations text: 暂无血压数据"
     },
     {
       "id": "routing.tool_tags.default",

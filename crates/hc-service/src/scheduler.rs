@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use hc_context::runtime::{RuntimeIdentity, RuntimeVariables};
 use hc_protocol::ApiNamespace;
 use hc_scheduler::{
     ScheduleRepository, ScheduledRun, ScheduledRunStatus, ScheduledTargetKind, now_unix,
@@ -141,6 +142,12 @@ fn dispatch_scheduled_mcp_run(
     for (key, value) in &run.target.args {
         arguments.insert(key.clone(), value.clone());
     }
+    let runtime = RuntimeVariables::new(RuntimeIdentity::from_optional(
+        Some(namespace.tenant_id.clone()),
+        Some(namespace.user_id.clone()),
+        Some(run.schedule_id.clone()),
+    ));
+    runtime.inject_mcp_arguments(&mut arguments);
     let result = call_mcp_tool(&server, tool_name, serde_json::Value::Object(arguments))?;
     if result
         .get("isError")

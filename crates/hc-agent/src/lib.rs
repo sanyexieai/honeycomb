@@ -55,7 +55,10 @@ pub use planning::{
     AgentProposal, AgentRuntimeBudget, EvolutionIssue, TaskPlan, TaskPlanStatus, WorkItem,
 };
 pub use profile::{AgentKind, AgentProfile, AgentProfileSummary, AgentRepository};
-pub use routing::{best_phrase_match_score, phrase_match_score, route_match_terms};
+pub use routing::{
+    best_phrase_match_score, phrase_match_score, phrase_match_score_with_stop_terms,
+    route_match_terms, route_match_terms_with_stop_terms,
+};
 pub use task::{TaskBudget, TaskContext, TaskNamespace, TaskRequest};
 pub use view::{AgentCardView, AssetSummaryView, WorkspaceViewModel, build_workspace_view};
 pub use workbench::{AgentWorkbench, WorkspacePhase, bootstrap_task_workbench};

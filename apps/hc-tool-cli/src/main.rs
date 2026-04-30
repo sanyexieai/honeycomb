@@ -10,15 +10,19 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::GB18030;
-use hc_agent::{AgentProfile, AgentRepository, best_phrase_match_score, phrase_match_score};
+use hc_agent::{
+    AgentProfile, AgentRepository, phrase_match_score, phrase_match_score_with_stop_terms,
+};
 use hc_capability::ModelDependence;
 use hc_context::{
-    ChatCaptureOptions, ChatMemoryOptions, MemoryRetriever, RetrievedMemory,
+    ChatCaptureOptions, ChatMemoryOptions, MemoryNamespace, MemoryRetriever, RetrievedMemory,
     WorkspaceMemoryRetriever, load_tool_chat_prompt, load_tool_natural_language_builder_prompt,
     load_tool_router_prompt, memory_kind_label, memory_scope_label, parse_memory_kind,
     parse_memory_scope, persist_chat_turn_assistant_reply, persist_chat_turn_user_message,
     persist_global_preference_from_chat_input, prepare_chat_capture_room,
-    render_recalled_memory_context, workspace_namespace_from_memory_namespace,
+    render_recalled_memory_context,
+    runtime::{RuntimeIdentity, RuntimeVariableRepository, RuntimeVariables},
+    workspace_namespace_from_memory_namespace,
 };
 use hc_conversation::{ConversationRepository, FollowUpStatus, PendingFollowUp};
 use hc_llm::{
@@ -120,6 +124,8 @@ struct ToolRoutingTags {
     tool_weights: Vec<ToolWeightRule>,
     #[serde(default)]
     confirmation_hints: Vec<String>,
+    #[serde(default)]
+    routing_stop_terms: Vec<String>,
     #[serde(default)]
     argument_rules: Vec<ToolArgumentRule>,
     #[serde(default)]
@@ -667,7 +673,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
 
     let registry = default_registry();
     let catalog = load_cli_tool_catalog()?;
-    let tool_prompt = render_tool_chat_system_prompt(&catalog, system_message.as_deref())?;
+    let tool_prompt = render_tool_chat_system_prompt(
+        &catalog,
+        system_message.as_deref(),
+        &memory_options.namespace,
+        capture_options.room_id.as_deref(),
+    )?;
     let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_options.namespace);
     let memory_retriever =
         WorkspaceMemoryRetriever::new(workspace_root(), workspace_namespace.clone());
@@ -723,7 +734,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 history.clear();
                 history.push(ChatMessage::new(
                     MessageRole::System,
-                    render_tool_chat_system_prompt(&catalog, system_message.as_deref())?,
+                    render_tool_chat_system_prompt(
+                        &catalog,
+                        system_message.as_deref(),
+                        &memory_options.namespace,
+                        capture_options.room_id.as_deref(),
+                    )?,
                 ));
                 println!("history cleared");
                 continue;
@@ -760,7 +776,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
                         history.clear();
                         history.push(ChatMessage::new(
                             MessageRole::System,
-                            render_tool_chat_system_prompt(&catalog, system_message.as_deref())?,
+                            render_tool_chat_system_prompt(
+                                &catalog,
+                                system_message.as_deref(),
+                                &memory_options.namespace,
+                                capture_options.room_id.as_deref(),
+                            )?,
                         ));
                     }
                     Err(error) => println!("error> {error}"),
@@ -799,7 +820,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
         {
             println!("warning> chat memory write skipped: {error}");
         }
-        if let Some(route) = confirmed_pending_route(trimmed, &pending_confirmation) {
+        if let Some(route) = confirmed_pending_route(
+            trimmed,
+            &pending_confirmation,
+            &memory_options.namespace,
+            capture_options.room_id.as_deref(),
+        ) {
             let (plan, outcome) = execute_routed_tool_outcome(&route)?;
             let context = render_tool_execution_context(&plan, &outcome);
             apply_tool_route(&mut selection, &catalog, route.clone())?;
@@ -886,7 +912,13 @@ fn handle_chat(args: &[String]) -> Result<()> {
             continue;
         }
         let mut tool_execution_context = None;
-        if let Some(route) = configured_agent_mcp_route(trimmed, &selection, &catalog)? {
+        if let Some(route) = configured_agent_mcp_route(
+            trimmed,
+            &selection,
+            &catalog,
+            &memory_options.namespace,
+            capture_options.room_id.as_deref(),
+        )? {
             if route.action != "run_tool" {
                 if let Some(message) = route.message {
                     println!("assistant> {message}");
@@ -955,6 +987,8 @@ fn handle_chat(args: &[String]) -> Result<()> {
                                 render_tool_chat_system_prompt(
                                     &catalog,
                                     system_message.as_deref(),
+                                    &memory_options.namespace,
+                                    capture_options.room_id.as_deref(),
                                 )?,
                             ));
                             continue;
@@ -965,7 +999,13 @@ fn handle_chat(args: &[String]) -> Result<()> {
                         }
                     }
                 }
-                Ok(route) if route.action == "run_tool" => {
+                Ok(mut route) if route.action == "run_tool" => {
+                    append_platform_args_to_mcp_route(
+                        &mut route,
+                        &catalog,
+                        &memory_options.namespace,
+                        capture_options.room_id.as_deref(),
+                    );
                     let context = execute_routed_tool(&route)?;
                     apply_tool_route(&mut selection, &catalog, route)?;
                     tool_execution_context = Some(context);
@@ -1003,7 +1043,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
                         history.clear();
                         history.push(ChatMessage::new(
                             MessageRole::System,
-                            render_tool_chat_system_prompt(&catalog, system_message.as_deref())?,
+                            render_tool_chat_system_prompt(
+                                &catalog,
+                                system_message.as_deref(),
+                                &memory_options.namespace,
+                                capture_options.room_id.as_deref(),
+                            )?,
                         ));
                     }
                     Ok(None) => {
@@ -1922,6 +1967,9 @@ fn dispatch_scheduled_mcp_run(run: &ScheduledRun) -> Result<String> {
     for (key, value) in &run.target.args {
         arguments.insert(key.clone(), value.clone());
     }
+    let runtime =
+        runtime_variables_for_workspace_namespace(&runtime_namespace(), Some(&run.schedule_id));
+    runtime.inject_mcp_arguments(&mut arguments);
     let result = call_mcp_tool(&server, tool_name, serde_json::Value::Object(arguments))?;
     if result
         .get("isError")
@@ -2046,11 +2094,9 @@ fn handle_mcp_call(args: &[String]) -> Result<()> {
         }
     }
     let server = mcp_server_repository().get_server(&server_id)?;
-    let result = call_mcp_tool(
-        &server,
-        &tool_name,
-        serde_json::Value::Object(arguments_from_run_args(&call_args, None)?),
-    )?;
+    let mut arguments = arguments_from_run_args(&call_args, None)?;
+    insert_missing_platform_mcp_runtime_arguments(&mut arguments);
+    let result = call_mcp_tool(&server, &tool_name, serde_json::Value::Object(arguments))?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -2406,17 +2452,51 @@ fn execute_routed_tool_outcome(
                 last_result = Some(Ok((plan, outcome)));
             }
             Err(error) => {
-                last_result = Some(Err(error));
+                last_result = Some(Ok(synthetic_routed_tool_error_outcome(
+                    &selector, route, error,
+                )));
             }
         }
     }
     last_result.context("no routed tool candidates were available")?
 }
 
+fn synthetic_routed_tool_error_outcome(
+    selector: &str,
+    route: &NaturalLanguageToolRoute,
+    error: anyhow::Error,
+) -> (hc_toolchain::ToolExecutionPlan, ToolExecutionOutcome) {
+    let summary = format!(
+        "tool call failed: {}",
+        compact_single_line(&error.to_string(), 300)
+    );
+    (
+        hc_toolchain::ToolExecutionPlan {
+            tool_id: selector.to_owned(),
+            suggested_command: Vec::new(),
+            guidance: Vec::new(),
+            validation_steps: Vec::new(),
+            recovery_steps: Vec::new(),
+        },
+        ToolExecutionOutcome {
+            tool_id: selector.to_owned(),
+            parent_tool_id: None,
+            invoked_tool_ids: Vec::new(),
+            goal: route.goal.clone().unwrap_or_default(),
+            command: Vec::new(),
+            success: false,
+            summary: summary.clone(),
+            observations: vec![summary],
+        },
+    )
+}
+
 fn configured_agent_mcp_route(
     user_turn: &str,
     selection: &ToolSelection,
     catalog: &ToolCatalog,
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
 ) -> Result<Option<NaturalLanguageToolRoute>> {
     let tool = if let Some(agent) = select_agent_by_configured_hints(user_turn)? {
         let agent_catalog = catalog_with_agent_mcp_tools(catalog, &agent)?;
@@ -2438,7 +2518,7 @@ fn configured_agent_mcp_route(
     } else {
         None
     }
-    .or_else(|| select_configured_mcp_tool(selection));
+    .or_else(|| select_configured_mcp_tool(selection, user_turn));
 
     let Some(tool) = tool else {
         return Ok(None);
@@ -2447,14 +2527,20 @@ fn configured_agent_mcp_route(
         action: "run_tool".to_owned(),
         tool_id: Some(tool.id.clone()),
         fallback_tool_ids: Vec::new(),
-        args: route_args_for_tool(&tool, user_turn),
+        args: route_args_for_tool(&tool, user_turn, namespace, session_id),
         goal: Some(user_turn.trim().to_owned()),
         message: None,
     }))
 }
 
-fn route_args_for_tool(tool: &ToolSpec, user_turn: &str) -> Vec<String> {
+fn route_args_for_tool(
+    tool: &ToolSpec,
+    user_turn: &str,
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![format!("query={}", user_turn.trim())];
+    args.extend(platform_mcp_runtime_run_args(namespace, session_id));
     args.extend(mcp_default_run_args(tool));
     for rule in &tool_routing_tags().tool_argument_rules {
         if !tool_matches_any_selector(tool, &rule.selectors) {
@@ -2494,6 +2580,8 @@ fn matched_routing_argument_args(user_turn: &str) -> Vec<String> {
 fn confirmed_pending_route(
     user_turn: &str,
     pending: &Option<PendingToolConfirmation>,
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
 ) -> Option<NaturalLanguageToolRoute> {
     let pending = pending.as_ref()?;
     if !is_confirmation_turn(user_turn) {
@@ -2504,7 +2592,7 @@ fn confirmed_pending_route(
         action: "run_tool".to_owned(),
         tool_id: Some(pending.tool_id.clone()),
         fallback_tool_ids: pending.fallback_tool_ids.clone(),
-        args: pending_order_args(pending, item, user_turn),
+        args: pending_order_args(pending, item, user_turn, namespace, session_id),
         goal: Some(user_turn.trim().to_owned()),
         message: None,
     })
@@ -2900,8 +2988,11 @@ fn pending_order_args(
     pending: &PendingToolConfirmation,
     item: &serde_json::Value,
     user_turn: &str,
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![format!("query={}", user_turn.trim())];
+    args.extend(platform_mcp_runtime_run_args(namespace, session_id));
     if let Some(server_id) = pending_tool_server_id(&pending.tool_id)
         && let Ok(server) = mcp_server_repository().get_server(&server_id)
     {
@@ -2950,6 +3041,83 @@ fn mcp_server_default_run_args(server: &McpServerSpec) -> Vec<String> {
         .iter()
         .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value)))
         .collect()
+}
+
+fn platform_mcp_runtime_run_args(
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
+) -> Vec<String> {
+    let runtime = runtime_variables_for_namespace(namespace, session_id);
+    vec![
+        format!("tenant_id={}", runtime.identity.tenant_id),
+        format!("user_id={}", runtime.identity.user_id),
+        format!("session_id={}", runtime.identity.session_id),
+        format!(
+            "runtime={}",
+            serde_json::Value::Object(runtime.values).to_string()
+        ),
+    ]
+}
+
+fn append_platform_args_to_mcp_route(
+    route: &mut NaturalLanguageToolRoute,
+    catalog: &ToolCatalog,
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
+) {
+    let Some(tool_id) = route.tool_id.as_deref() else {
+        return;
+    };
+    let Some(tool) = catalog.list().into_iter().find(|tool| tool.id == tool_id) else {
+        return;
+    };
+    if !is_mcp_tool_command(&tool.default_command) {
+        return;
+    }
+    route
+        .args
+        .splice(0..0, platform_mcp_runtime_run_args(namespace, session_id));
+}
+
+fn insert_missing_platform_mcp_runtime_arguments(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let namespace = runtime_namespace();
+    let runtime = runtime_variables_for_workspace_namespace(
+        &namespace,
+        cli_runtime_context().session_id.as_deref(),
+    );
+    runtime.inject_mcp_arguments(arguments);
+}
+
+fn runtime_variables_for_namespace(
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
+) -> RuntimeVariables {
+    let identity = RuntimeIdentity::from_optional(
+        Some(namespace.tenant_id.clone()),
+        Some(namespace.user_id.clone()),
+        session_id.map(ToOwned::to_owned),
+    );
+    load_runtime_variables(identity)
+}
+
+fn runtime_variables_for_workspace_namespace(
+    namespace: &WorkspaceNamespace,
+    session_id: Option<&str>,
+) -> RuntimeVariables {
+    let identity = RuntimeIdentity::from_optional(
+        Some(namespace.tenant_id.clone()),
+        Some(namespace.user_id.clone()),
+        session_id.map(ToOwned::to_owned),
+    );
+    load_runtime_variables(identity)
+}
+
+fn load_runtime_variables(identity: RuntimeIdentity) -> RuntimeVariables {
+    RuntimeVariableRepository::new(workspace_root())
+        .load(identity.clone(), None)
+        .unwrap_or_else(|_| RuntimeVariables::new(identity))
 }
 
 fn jsonish_arg_value(value: &serde_json::Value) -> String {
@@ -3065,7 +3233,7 @@ fn select_agent_by_configured_hints(user_turn: &str) -> Result<Option<AgentProfi
             let score = route_phrase_score(user_turn, &agent.intent_hints, 50)
                 + route_phrase_score(user_turn, &agent.routing_examples, 45)
                 - route_phrase_score(user_turn, &agent.negative_routing_examples, 60)
-                + if best_phrase_match_score(user_turn, &agent.routing_examples) > 0 {
+                + if best_routing_phrase_match_score(user_turn, &agent.routing_examples) > 0 {
                     agent.priority / 10
                 } else {
                     0
@@ -3144,11 +3312,14 @@ fn catalog_with_agent_mcp_tools(
     Ok(scoped)
 }
 
-fn select_configured_mcp_tool(selection: &ToolSelection) -> Option<ToolSpec> {
+fn select_configured_mcp_tool(selection: &ToolSelection, user_turn: &str) -> Option<ToolSpec> {
     let selected = selection
         .selected
         .as_ref()
         .filter(|tool| is_mcp_tool_command(&tool.default_command))?;
+    if tool_intent_preference(selected, user_turn) <= 0 {
+        return None;
+    }
     let top_score = selection
         .candidates
         .iter()
@@ -3168,21 +3339,27 @@ fn select_configured_mcp_tool(selection: &ToolSelection) -> Option<ToolSpec> {
 
 fn tool_query_preference(tool: &ToolSpec, user_turn: &str) -> i32 {
     let mut score = 0;
+    score += tool_intent_preference(tool, user_turn);
+    for rule in &tool_routing_tags().tool_weights {
+        if tool_matches_any_selector(tool, &rule.selectors) {
+            score += rule.weight;
+        }
+    }
+    score
+}
+
+fn tool_intent_preference(tool: &ToolSpec, user_turn: &str) -> i32 {
+    let mut score = 0;
     let routing_tags = tool_routing_tags();
     for rule in &routing_tags.intent_rules {
-        let intent_score = best_phrase_match_score(user_turn, &rule.hints)
-            .max(best_phrase_match_score(user_turn, &rule.examples));
-        let negative_score = best_phrase_match_score(user_turn, &rule.negative_examples);
+        let intent_score = best_routing_phrase_match_score(user_turn, &rule.hints)
+            .max(best_routing_phrase_match_score(user_turn, &rule.examples));
+        let negative_score = best_routing_phrase_match_score(user_turn, &rule.negative_examples);
         if intent_score > 0 && tool_matches_any_selector(tool, &rule.preferred_selectors) {
             score += rule.weight * intent_score / 100;
         }
         if negative_score > 0 && tool_matches_any_selector(tool, &rule.preferred_selectors) {
             score -= rule.weight.abs() * negative_score / 100;
-        }
-    }
-    for rule in &routing_tags.tool_weights {
-        if tool_matches_any_selector(tool, &rule.selectors) {
-            score += rule.weight;
         }
     }
     score
@@ -3284,11 +3461,23 @@ fn text_contains_selector(text: &str, selector: &str) -> bool {
 }
 
 fn route_phrase_score(user_turn: &str, phrases: &[String], weight: i32) -> i32 {
-    let score = best_phrase_match_score(user_turn, phrases);
+    let score = best_routing_phrase_match_score(user_turn, phrases);
     if score <= 0 {
         return 0;
     }
     weight * score / 100
+}
+
+fn best_routing_phrase_match_score(user_turn: &str, phrases: &[String]) -> i32 {
+    phrases
+        .iter()
+        .map(|phrase| routing_phrase_match_score(user_turn, phrase))
+        .max()
+        .unwrap_or(0)
+}
+
+fn routing_phrase_match_score(user_turn: &str, phrase: &str) -> i32 {
+    phrase_match_score_with_stop_terms(user_turn, phrase, &tool_routing_tags().routing_stop_terms)
 }
 
 fn execute_builtin_tool(
@@ -3328,10 +3517,9 @@ fn execute_mcp_tool(
         .get(2)
         .context("mcp tool command missed tool name")?;
     let server = mcp_server_repository().get_server(server_id)?;
-    let arguments = serde_json::Value::Object(arguments_from_run_args(
-        &options.args,
-        options.content.as_deref(),
-    )?);
+    let mut arguments = arguments_from_run_args(&options.args, options.content.as_deref())?;
+    insert_missing_platform_mcp_runtime_arguments(&mut arguments);
+    let arguments = serde_json::Value::Object(arguments);
     let result = call_mcp_tool(&server, tool_name, arguments)?;
     let success = !result
         .get("isError")
@@ -5312,13 +5500,17 @@ fn default_registry() -> ProviderRegistry {
 fn render_tool_chat_system_prompt(
     catalog: &ToolCatalog,
     user_system: Option<&str>,
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
 ) -> Result<String> {
     let user_guidance = render_optional_guidance(user_system);
+    let runtime = runtime_variables_for_namespace(namespace, session_id);
     let guidance = merge_optional_contexts([
         Some(
             "User-facing wording rule: never expose internal tool ids, MCP server ids, method names, commands, JSON-RPC details, or implementation identifiers. Describe capabilities in plain user language instead."
                 .to_owned(),
         ),
+        Some(hc_context::runtime::runtime_identity_prompt(&runtime.identity)),
         (!user_guidance.trim().is_empty()).then_some(user_guidance),
     ]);
     render_prompt_template(

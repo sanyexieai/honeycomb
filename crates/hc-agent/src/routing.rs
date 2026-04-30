@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 
 pub fn phrase_match_score(input: &str, phrase: &str) -> i32 {
+    phrase_match_score_with_stop_terms(input, phrase, &[])
+}
+
+pub fn phrase_match_score_with_stop_terms(input: &str, phrase: &str, stop_terms: &[String]) -> i32 {
     let input = input.trim();
     let phrase = phrase.trim();
     if input.is_empty() || phrase.is_empty() {
@@ -13,8 +17,8 @@ pub fn phrase_match_score(input: &str, phrase: &str) -> i32 {
         return 100;
     }
 
-    let input_terms = route_match_terms(input);
-    let phrase_terms = route_match_terms(phrase);
+    let input_terms = route_match_terms_with_stop_terms(input, stop_terms);
+    let phrase_terms = route_match_terms_with_stop_terms(phrase, stop_terms);
     if input_terms.is_empty() || phrase_terms.is_empty() {
         return 0;
     }
@@ -46,10 +50,19 @@ pub fn best_phrase_match_score<'a>(
 }
 
 pub fn route_match_terms(text: &str) -> BTreeSet<String> {
+    route_match_terms_with_stop_terms(text, &[])
+}
+
+pub fn route_match_terms_with_stop_terms(text: &str, stop_terms: &[String]) -> BTreeSet<String> {
     let mut terms = BTreeSet::new();
+    let stop_terms = stop_terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect::<BTreeSet<_>>();
     let lowered = text.to_lowercase();
     for token in lowered.split(|ch: char| !ch.is_alphanumeric()) {
-        if token.chars().count() > 1 {
+        if token.chars().count() > 1 && !stop_terms.contains(token) {
             terms.insert(token.to_owned());
         }
     }
@@ -60,11 +73,17 @@ pub fn route_match_terms(text: &str) -> BTreeSet<String> {
     {
         let chars: Vec<char> = run.chars().collect();
         if chars.len() > 1 {
-            terms.insert(chars.iter().collect::<String>().to_lowercase());
+            let term = chars.iter().collect::<String>().to_lowercase();
+            if !stop_terms.contains(&term) {
+                terms.insert(term);
+            }
         }
         for size in [2usize, 3usize] {
             for window in chars.windows(size) {
-                terms.insert(window.iter().collect::<String>().to_lowercase());
+                let term = window.iter().collect::<String>().to_lowercase();
+                if !stop_terms.contains(&term) {
+                    terms.insert(term);
+                }
             }
         }
     }
