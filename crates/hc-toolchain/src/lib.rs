@@ -55,10 +55,27 @@ pub struct ToolSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    Stdio,
+    StreamableHttp,
+    Sse,
+}
+
+fn default_mcp_transport_kind() -> McpTransportKind {
+    McpTransportKind::Stdio
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerSpec {
     pub id: String,
     pub name: String,
     pub description: String,
+    #[serde(default = "default_mcp_transport_kind")]
+    pub transport: McpTransportKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
     pub command: Vec<String>,
     pub tags: Vec<String>,
 }
@@ -85,6 +102,11 @@ struct McpServerFrontmatter {
     title: String,
     tenant_id: String,
     user_id: String,
+    #[serde(default = "default_mcp_transport_kind")]
+    transport: McpTransportKind,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     command: Vec<String>,
     tags: Vec<String>,
 }
@@ -554,8 +576,17 @@ pub fn validate_mcp_server_spec(server: &McpServerSpec) -> Result<()> {
     if server.name.trim().is_empty() {
         bail!("mcp server name cannot be empty");
     }
-    if server.command.is_empty() {
-        bail!("mcp server {} does not define a command", server.id);
+    match server.transport {
+        McpTransportKind::Stdio => {
+            if server.command.is_empty() {
+                bail!("mcp stdio server {} does not define a command", server.id);
+            }
+        }
+        McpTransportKind::StreamableHttp | McpTransportKind::Sse => {
+            if server.url.as_deref().unwrap_or_default().trim().is_empty() {
+                bail!("mcp http server {} does not define a url", server.id);
+            }
+        }
     }
     Ok(())
 }
@@ -644,6 +675,8 @@ impl McpServerSpec {
             id: frontmatter.id,
             name: frontmatter.title,
             description,
+            transport: frontmatter.transport,
+            url: frontmatter.url,
             command: frontmatter.command,
             tags: frontmatter.tags,
         };
@@ -678,6 +711,8 @@ impl McpServerFrontmatter {
             title: server.name.clone(),
             tenant_id: namespace.tenant_id.clone(),
             user_id: namespace.user_id.clone(),
+            transport: server.transport.clone(),
+            url: server.url.clone(),
             command: server.command.clone(),
             tags: server.tags.clone(),
         }
@@ -770,7 +805,7 @@ pub fn discover_mcp_tools_with_timeout(
     server: &McpServerSpec,
     timeout: Duration,
 ) -> Result<Vec<ToolSpec>> {
-    let mut session = McpStdioSession::start(server, timeout)?;
+    let mut session = McpSession::start(server, timeout)?;
     session.initialize()?;
     let response = session.request("tools/list", json!({}))?;
     let tools = response
@@ -822,7 +857,7 @@ pub fn call_mcp_tool_with_timeout(
     arguments: Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let mut session = McpStdioSession::start(server, timeout)?;
+    let mut session = McpSession::start(server, timeout)?;
     session.initialize()?;
     session.request(
         "tools/call",
@@ -831,6 +866,273 @@ pub fn call_mcp_tool_with_timeout(
             "arguments": arguments,
         }),
     )
+}
+
+enum McpSession {
+    Stdio(McpStdioSession),
+    Http(McpHttpSession),
+}
+
+impl McpSession {
+    fn start(server: &McpServerSpec, timeout: Duration) -> Result<Self> {
+        match server.transport {
+            McpTransportKind::Stdio => Ok(Self::Stdio(McpStdioSession::start(server, timeout)?)),
+            McpTransportKind::StreamableHttp | McpTransportKind::Sse => {
+                Ok(Self::Http(McpHttpSession::start(server, timeout)?))
+            }
+        }
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        match self {
+            Self::Stdio(session) => session.initialize(),
+            Self::Http(session) => session.initialize(),
+        }
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            Self::Stdio(session) => session.request(method, params),
+            Self::Http(session) => session.request(method, params),
+        }
+    }
+}
+
+struct McpHttpSession {
+    client: reqwest::blocking::Client,
+    url: String,
+    post_url: String,
+    transport: McpTransportKind,
+    next_id: u64,
+    protocol_version: String,
+    session_id: Option<String>,
+    sse_reader: Option<BufReader<reqwest::blocking::Response>>,
+}
+
+impl McpHttpSession {
+    fn start(server: &McpServerSpec, timeout: Duration) -> Result<Self> {
+        validate_mcp_server_spec(server)?;
+        let url = server
+            .url
+            .as_deref()
+            .context("mcp http server missed url")?
+            .trim()
+            .to_owned();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("failed to build mcp http client")?;
+        let mut session = Self {
+            client,
+            post_url: url.clone(),
+            url: url.clone(),
+            transport: server.transport.clone(),
+            next_id: 1,
+            protocol_version: "2025-06-18".to_owned(),
+            session_id: None,
+            sse_reader: None,
+        };
+        if server.transport == McpTransportKind::Sse {
+            session.connect_sse()?;
+        }
+        Ok(session)
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": self.protocol_version,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "honeycomb",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        )?;
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(())
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let response = self.post_message(&message, Some(id))?;
+        if let Some(error) = response.get("error") {
+            bail!("mcp {method} failed: {error}");
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let _ = self.post_message(&message, None)?;
+        Ok(())
+    }
+
+    fn connect_sse(&mut self) -> Result<()> {
+        let response = self
+            .client
+            .get(&self.url)
+            .header("Accept", "text/event-stream")
+            .send()
+            .with_context(|| format!("failed to open mcp sse stream {}", self.url))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            bail!("mcp sse connect failed with {status}: {body}");
+        }
+
+        let mut reader = BufReader::new(response);
+        let endpoint = loop {
+            let event = read_sse_event(&mut reader).context("failed to read mcp sse endpoint")?;
+            if event.event.as_deref() == Some("endpoint") && !event.data.trim().is_empty() {
+                break event.data.trim().to_owned();
+            }
+        };
+        self.post_url = resolve_mcp_sse_endpoint(&self.url, &endpoint)?;
+        self.sse_reader = Some(reader);
+        Ok(())
+    }
+
+    fn post_message(&mut self, message: &Value, request_id: Option<u64>) -> Result<Value> {
+        let mut request = self
+            .client
+            .post(&self.post_url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", &self.protocol_version)
+            .json(message);
+        if let Some(session_id) = &self.session_id {
+            request = request.header("Mcp-Session-Id", session_id);
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("failed to post mcp http message to {}", self.post_url))?;
+        if let Some(session_id) = response.headers().get("Mcp-Session-Id") {
+            self.session_id = Some(
+                session_id
+                    .to_str()
+                    .context("invalid Mcp-Session-Id header")?
+                    .to_owned(),
+            );
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            bail!("mcp http request failed with {status}: {body}");
+        }
+        if self.transport == McpTransportKind::Sse {
+            return match request_id {
+                Some(id) => self.read_sse_response(id),
+                None => Ok(Value::Null),
+            };
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = response.text().context("failed to read mcp http body")?;
+        parse_mcp_http_response_body(&content_type, &body)
+    }
+
+    fn read_sse_response(&mut self, request_id: u64) -> Result<Value> {
+        let reader = self
+            .sse_reader
+            .as_mut()
+            .context("mcp sse session is not connected")?;
+        loop {
+            let event = read_sse_event(reader).context("failed to read mcp sse response")?;
+            if event.data.trim().is_empty() {
+                continue;
+            }
+            let value: Value =
+                serde_json::from_str(&event.data).context("failed to parse mcp sse message")?;
+            if value.get("id").and_then(Value::as_u64) == Some(request_id) {
+                return Ok(value);
+            }
+        }
+    }
+}
+
+struct SseEvent {
+    event: Option<String>,
+    data: String,
+}
+
+fn read_sse_event<R: BufRead>(reader: &mut R) -> Result<SseEvent> {
+    let mut event = None;
+    let mut data = Vec::new();
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .context("failed to read sse line")?;
+        if read == 0 {
+            bail!("mcp sse stream closed");
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            if event.is_some() || !data.is_empty() {
+                return Ok(SseEvent {
+                    event,
+                    data: data.join("\n"),
+                });
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim().to_owned());
+        }
+    }
+}
+
+fn resolve_mcp_sse_endpoint(base_url: &str, endpoint: &str) -> Result<String> {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return Ok(endpoint.to_owned());
+    }
+    let base = reqwest::Url::parse(base_url).context("invalid mcp sse url")?;
+    Ok(base
+        .join(endpoint)
+        .with_context(|| format!("invalid mcp sse endpoint: {endpoint}"))?
+        .to_string())
+}
+
+fn parse_mcp_http_response_body(content_type: &str, body: &str) -> Result<Value> {
+    if content_type.contains("text/event-stream") {
+        let data = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&data).context("failed to parse mcp sse data");
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(body).context("failed to parse mcp http json response")
 }
 
 struct McpStdioSession {

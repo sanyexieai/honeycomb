@@ -1769,10 +1769,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "hc-context",
- "hc-llm",
  "hc-protocol",
- "hc-store",
+ "hc-service",
  "serde",
  "serde_json",
  "tokio",
@@ -1785,6 +1783,17 @@ dependencies = [
  "anyhow",
  "hc-store",
  "serde",
+]
+
+[[package]]
+name = "hc-careos-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -1917,6 +1926,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hc-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hc-agent",
+ "hc-context",
+ "hc-llm",
+ "hc-protocol",
+ "hc-store",
+ "hc-toolchain",
+ "serde_json",
+]
+
+[[package]]
 name = "hc-skill"
 version = "0.1.0"
 dependencies = [
@@ -1944,6 +1967,7 @@ name = "hc-tool-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-agent",
  "hc-capability",
  "hc-context",
  "hc-llm",
@@ -1962,6 +1986,7 @@ dependencies = [
  "anyhow",
  "hc-capability",
  "hc-store",
+ "reqwest",
  "serde",
  "serde_json",
 ]
@@ -4985,6 +5010,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 

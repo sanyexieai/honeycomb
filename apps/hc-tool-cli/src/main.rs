@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use hc_agent::{AgentProfile, AgentRepository};
 use hc_capability::ModelDependence;
 use hc_context::{
     ChatCaptureOptions, ChatMemoryOptions, MemoryRetriever, RetrievedMemory,
@@ -24,10 +25,10 @@ use hc_llm::{
 use hc_skill::{SkillProfile, SkillRepository};
 use hc_store::store::WorkspaceNamespace;
 use hc_toolchain::{
-    CommandToolExecutor, McpServerRepository, McpServerSpec, ToolCatalog, ToolComposition,
-    ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository, ToolSpec, ToolStability,
-    build_default_tool_execution_plan, call_mcp_tool, default_tool_catalog, discover_mcp_tools,
-    is_mcp_tool_command, normalize_mcp_server_id,
+    CommandToolExecutor, McpServerRepository, McpServerSpec, McpTransportKind, ToolCatalog,
+    ToolComposition, ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository,
+    ToolSpec, ToolStability, build_default_tool_execution_plan, call_mcp_tool,
+    default_tool_catalog, discover_mcp_tools, is_mcp_tool_command, normalize_mcp_server_id,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::Deserialize;
@@ -63,6 +64,8 @@ struct McpAddOptions {
     id: String,
     name: String,
     description: String,
+    transport: Option<McpTransportKind>,
+    url: Option<String>,
     command: Vec<String>,
     tags: Vec<String>,
     json: bool,
@@ -421,47 +424,62 @@ fn handle_chat(args: &[String]) -> Result<()> {
             println!("warning> chat memory write skipped: {error}");
         }
         let mut tool_execution_context = None;
-        match route_tool_turn(
-            &registry,
-            &provider,
-            &model,
-            trimmed,
-            &selection,
-            system_message.as_deref(),
-        ) {
-            Ok(route) if route.action == "create_tool" || route.action == "create_skill" => {
-                match handle_natural_language_tool_create(
-                    &registry,
-                    &provider,
-                    &model,
-                    trimmed,
-                    system_message.as_deref(),
-                ) {
-                    Ok(true) => {
-                        let catalog = load_cli_tool_catalog()?;
-                        history.clear();
-                        history.push(ChatMessage::new(
-                            MessageRole::System,
-                            render_tool_chat_system_prompt(&catalog, system_message.as_deref())?,
-                        ));
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        println!("warning> tool builder skipped: {error}");
+        if let Some(route) = configured_agent_mcp_route(trimmed, &selection, &catalog)? {
+            if route.action != "run_tool" {
+                if let Some(message) = route.message {
+                    println!("assistant> {message}");
+                }
+                continue;
+            }
+            let context = execute_routed_tool(&route)?;
+            apply_tool_route(&mut selection, &catalog, route)?;
+            tool_execution_context = Some(context);
+        } else {
+            match route_tool_turn(
+                &registry,
+                &provider,
+                &model,
+                trimmed,
+                &selection,
+                system_message.as_deref(),
+            ) {
+                Ok(route) if route.action == "create_tool" || route.action == "create_skill" => {
+                    match handle_natural_language_tool_create(
+                        &registry,
+                        &provider,
+                        &model,
+                        trimmed,
+                        system_message.as_deref(),
+                    ) {
+                        Ok(true) => {
+                            let catalog = load_cli_tool_catalog()?;
+                            history.clear();
+                            history.push(ChatMessage::new(
+                                MessageRole::System,
+                                render_tool_chat_system_prompt(
+                                    &catalog,
+                                    system_message.as_deref(),
+                                )?,
+                            ));
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            println!("warning> tool builder skipped: {error}");
+                        }
                     }
                 }
-            }
-            Ok(route) if route.action == "run_tool" => {
-                let context = execute_routed_tool(&route)?;
-                apply_tool_route(&mut selection, &catalog, route)?;
-                tool_execution_context = Some(context);
-            }
-            Ok(route) => {
-                apply_tool_route(&mut selection, &catalog, route)?;
-            }
-            Err(error) => {
-                println!("{}", render_router_warning(&error));
+                Ok(route) if route.action == "run_tool" => {
+                    let context = execute_routed_tool(&route)?;
+                    apply_tool_route(&mut selection, &catalog, route)?;
+                    tool_execution_context = Some(context);
+                }
+                Ok(route) => {
+                    apply_tool_route(&mut selection, &catalog, route)?;
+                }
+                Err(error) => {
+                    println!("{}", render_router_warning(&error));
+                }
             }
         }
         let request_history = build_chat_request_history(
@@ -639,10 +657,19 @@ fn handle_mcp(args: &[String]) -> Result<()> {
 
 fn handle_mcp_add(args: &[String]) -> Result<()> {
     let options = parse_mcp_add_options(args)?;
+    let transport = options.transport.unwrap_or_else(|| {
+        if options.url.is_some() {
+            McpTransportKind::StreamableHttp
+        } else {
+            McpTransportKind::Stdio
+        }
+    });
     let server = McpServerSpec {
         id: normalize_mcp_server_id(&options.id),
         name: options.name,
         description: options.description,
+        transport,
+        url: options.url,
         command: options.command,
         tags: normalized_tags(options.tags, "mcp"),
     };
@@ -661,7 +688,13 @@ fn handle_mcp_add(args: &[String]) -> Result<()> {
 
     println!("mcp> {}", server.id);
     println!("path> {}", path.display());
-    println!("command> {}", server.command.join(" "));
+    println!("transport> {:?}", server.transport);
+    if let Some(url) = &server.url {
+        println!("url> {url}");
+    }
+    if !server.command.is_empty() {
+        println!("command> {}", server.command.join(" "));
+    }
     Ok(())
 }
 
@@ -673,11 +706,13 @@ fn handle_mcp_list(args: &[String]) -> Result<()> {
         return Ok(());
     }
     for server in servers {
+        let endpoint = server
+            .url
+            .clone()
+            .unwrap_or_else(|| server.command.join(" "));
         println!(
-            "{} | {} | {}",
-            server.id,
-            server.name,
-            server.command.join(" ")
+            "{} | {} | {:?} | {}",
+            server.id, server.name, server.transport, endpoint
         );
     }
     Ok(())
@@ -1055,6 +1090,109 @@ fn execute_routed_tool(route: &NaturalLanguageToolRoute) -> Result<String> {
     Ok(render_tool_execution_context(&plan, &outcome))
 }
 
+fn configured_agent_mcp_route(
+    user_turn: &str,
+    selection: &ToolSelection,
+    catalog: &ToolCatalog,
+) -> Result<Option<NaturalLanguageToolRoute>> {
+    let tool = if let Some(agent) = select_agent_by_configured_hints(user_turn)? {
+        match select_mcp_tool_for_agent(&agent, user_turn, catalog) {
+            Some(tool) => Some(tool),
+            None => {
+                return Ok(Some(NaturalLanguageToolRoute {
+                    action: "mcp_unavailable".to_owned(),
+                    tool_id: None,
+                    args: Vec::new(),
+                    goal: Some(user_turn.trim().to_owned()),
+                    message: Some(format!(
+                        "已匹配到 agent {}，但没有发现它配置的可用 MCP 工具。请确认对应 MCP 服务已在 mcp server 配置的 HTTP/SSE 地址上可访问。",
+                        agent.id
+                    )),
+                }));
+            }
+        }
+    } else {
+        None
+    }
+    .or_else(|| select_configured_mcp_tool(selection));
+
+    let Some(tool) = tool else {
+        return Ok(None);
+    };
+    Ok(Some(NaturalLanguageToolRoute {
+        action: "run_tool".to_owned(),
+        tool_id: Some(tool.id),
+        args: vec![format!("query={}", user_turn.trim())],
+        goal: Some(user_turn.trim().to_owned()),
+        message: None,
+    }))
+}
+
+fn select_agent_by_configured_hints(user_turn: &str) -> Result<Option<AgentProfile>> {
+    let mut scored = agent_repository()
+        .list_profiles()?
+        .into_iter()
+        .map(|agent| {
+            let score = agent
+                .intent_hints
+                .iter()
+                .filter(|hint| hint_matches_user_turn(user_turn, hint))
+                .count();
+            (agent, score)
+        })
+        .filter(|(_, score)| *score > 0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.priority.cmp(&left.0.priority))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    Ok(scored.into_iter().next().map(|(agent, _)| agent))
+}
+
+fn select_mcp_tool_for_agent(
+    agent: &AgentProfile,
+    user_turn: &str,
+    catalog: &ToolCatalog,
+) -> Option<ToolSpec> {
+    let mut scored = catalog
+        .list()
+        .into_iter()
+        .filter(|tool| {
+            is_mcp_tool_command(&tool.default_command)
+                && tool.default_command.get(1).is_some_and(|server_id| {
+                    agent.tool_refs.iter().any(|tool_ref| tool_ref == server_id)
+                })
+        })
+        .map(|tool| (tool.clone(), score_tool_for_goal(tool, user_turn)))
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    scored
+        .into_iter()
+        .find(|(_, score)| *score > 0)
+        .map(|(tool, _)| tool)
+}
+
+fn select_configured_mcp_tool(selection: &ToolSelection) -> Option<ToolSpec> {
+    selection
+        .selected
+        .as_ref()
+        .filter(|tool| is_mcp_tool_command(&tool.default_command))
+        .cloned()
+}
+
+fn hint_matches_user_turn(user_turn: &str, hint: &str) -> bool {
+    let hint = hint.trim();
+    !hint.is_empty() && user_turn.contains(hint)
+}
+
 fn execute_builtin_tool(
     tool: &ToolSpec,
     plan: &hc_toolchain::ToolExecutionPlan,
@@ -1401,7 +1539,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateOptions> {
 fn parse_mcp_add_options(args: &[String]) -> Result<McpAddOptions> {
     if args.len() < 2 {
         bail!(
-            "usage: hc-tool-cli mcp add <server-id> <name> --description <text> --command <token> [--command <token>] [--tag <tag>] [--json]"
+            "usage: hc-tool-cli mcp add <server-id> <name> --description <text> [--url <endpoint> | --command <token> ...] [--transport <stdio|streamable_http|sse>] [--tag <tag>] [--json]"
         );
     }
 
@@ -1428,6 +1566,21 @@ fn parse_mcp_add_options(args: &[String]) -> Result<McpAddOptions> {
                 );
                 index += 2;
             }
+            "--url" => {
+                options.url = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --url")?,
+                );
+                index += 2;
+            }
+            "--transport" => {
+                options.transport = Some(parse_mcp_transport_kind(
+                    args.get(index + 1)
+                        .context("missing value for --transport")?,
+                )?);
+                index += 2;
+            }
             "--tag" => {
                 options.tags.push(
                     args.get(index + 1)
@@ -1446,10 +1599,32 @@ fn parse_mcp_add_options(args: &[String]) -> Result<McpAddOptions> {
     if options.description.trim().is_empty() {
         bail!("missing --description for mcp add");
     }
-    if options.command.is_empty() {
-        bail!("missing --command for mcp add");
+    let transport = options.transport.clone().unwrap_or_else(|| {
+        if options.url.is_some() {
+            McpTransportKind::StreamableHttp
+        } else {
+            McpTransportKind::Stdio
+        }
+    });
+    match transport {
+        McpTransportKind::Stdio if options.command.is_empty() => {
+            bail!("missing --command for stdio mcp add");
+        }
+        McpTransportKind::StreamableHttp | McpTransportKind::Sse if options.url.is_none() => {
+            bail!("missing --url for http mcp add");
+        }
+        _ => {}
     }
     Ok(options)
+}
+
+fn parse_mcp_transport_kind(value: &str) -> Result<McpTransportKind> {
+    match value {
+        "stdio" => Ok(McpTransportKind::Stdio),
+        "streamable_http" | "http" => Ok(McpTransportKind::StreamableHttp),
+        "sse" => Ok(McpTransportKind::Sse),
+        other => bail!("unsupported mcp transport: {other}"),
+    }
 }
 
 fn tool_from_create_options(options: &CreateOptions) -> Result<ToolSpec> {
@@ -1578,6 +1753,8 @@ fn set_executable_if_requested(path: &Path, executable: bool) -> Result<()> {
     if !executable {
         return Ok(());
     }
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2029,6 +2206,10 @@ fn tool_repository() -> ToolRepository {
 
 fn mcp_server_repository() -> McpServerRepository {
     McpServerRepository::with_namespace(workspace_root(), runtime_namespace())
+}
+
+fn agent_repository() -> AgentRepository {
+    AgentRepository::with_namespace(workspace_root(), runtime_namespace())
 }
 
 fn skill_repository() -> SkillRepository {

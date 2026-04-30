@@ -3,10 +3,12 @@
 pub mod binding;
 pub mod bootstrap;
 pub mod conversation;
+pub mod domain;
 pub mod incubation;
 pub mod orchestrator;
 pub mod persistence;
 pub mod planning;
+pub mod profile;
 pub mod task;
 pub mod view;
 pub mod workbench;
@@ -21,6 +23,7 @@ pub use conversation::{
     ConversationParticipantMode, ConversationParticipantState, ConversationStatus,
     ConversationStopPolicy, ConversationTurnPolicy, ConversationTurnState,
 };
+pub use domain::{DomainKind, DomainProfile, DomainProfileSummary, DomainRepository};
 pub use hc_capability::{
     CapabilityInputType, CapabilityNamespace, CapabilityOutputType, CapabilityProfile,
     CapabilityRepository, CapabilityTier, CapabilityVisibility, ModelDependence,
@@ -50,6 +53,7 @@ pub use persistence::{
 pub use planning::{
     AgentProposal, AgentRuntimeBudget, EvolutionIssue, TaskPlan, TaskPlanStatus, WorkItem,
 };
+pub use profile::{AgentKind, AgentProfile, AgentProfileSummary, AgentRepository};
 pub use task::{TaskBudget, TaskContext, TaskNamespace, TaskRequest};
 pub use view::{AgentCardView, AssetSummaryView, WorkspaceViewModel, build_workspace_view};
 pub use workbench::{AgentWorkbench, WorkspacePhase, bootstrap_task_workbench};

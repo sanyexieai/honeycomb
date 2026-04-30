@@ -129,6 +129,8 @@ fn mcp_server_repository_roundtrips_markdown_server() {
         id: "mcp.echo".to_owned(),
         name: "Echo MCP".to_owned(),
         description: "Exposes echo tools over MCP.".to_owned(),
+        transport: hc_toolchain::McpTransportKind::Stdio,
+        url: None,
         command: vec!["python3".to_owned(), "echo_server.py".to_owned()],
         tags: vec!["mcp".to_owned(), "echo".to_owned()],
     };
@@ -164,6 +166,8 @@ fn mcp_discovery_times_out_when_server_does_not_respond() {
         id: "mcp.sleepy".to_owned(),
         name: "Sleepy MCP".to_owned(),
         description: "Never responds during discovery.".to_owned(),
+        transport: hc_toolchain::McpTransportKind::Stdio,
+        url: None,
         command: vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
         tags: vec!["mcp".to_owned()],
     };

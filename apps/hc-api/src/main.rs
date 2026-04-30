@@ -1,39 +1,44 @@
 use std::{env, fs, net::SocketAddr, path::PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use hc_context::{
-    ContextMemoryQuery, ContextRequest, DefaultContextComposer, MemoryKind, MemoryNamespace,
-    MemoryScope, PromptPolicy, WorkspaceMemoryRetriever, generate_with_context,
-    load_context_memory_system_prompt, load_context_memory_usage_policy_prompt, memory_kind_label,
-    memory_scope_label, workspace_namespace_from_memory_namespace,
-};
-use hc_llm::{
-    ChatMessage, GenerateRequest, MessageRole, ModelRef, default_model_from_env,
-    default_provider_from_env, default_registry_from_env,
-};
 use hc_protocol::{
-    ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest, ChatResponse,
-    ErrorResponse, HealthResponse, MemoryRef,
+    AgentListResponse, AgentRouteRequest, AgentRouteResponse, ApiNamespace, ChatRequest,
+    ChatResponse, DomainListResponse, ErrorResponse, HealthResponse, McpServerListResponse,
 };
+use hc_service::{
+    ServiceConfig,
+    agent::{list_agents, list_domains, route_agent},
+    chat::handle_chat_request,
+    tool::list_mcp_servers,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
 struct AppState {
-    workspace_root: PathBuf,
+    service: ServiceConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NamespaceQuery {
+    #[serde(default = "default_tenant_id")]
+    tenant_id: String,
+    #[serde(default = "default_user_id")]
+    user_id: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     load_local_env_file()?;
     let state = AppState {
-        workspace_root: workspace_root(),
+        service: ServiceConfig::new(workspace_root()),
     };
     let bind_addr = bind_addr()?;
     let app = Router::new()
@@ -41,6 +46,10 @@ async fn main() -> Result<()> {
         .route("/openapi.json", get(openapi))
         .route("/swagger-ui", get(swagger_ui))
         .route("/swagger-ui/", get(swagger_ui))
+        .route("/v1/agents", get(agents))
+        .route("/v1/domains", get(domains))
+        .route("/v1/mcp/servers", get(mcp_servers))
+        .route("/v1/agents/route", post(agent_route))
         .route("/v1/chat", post(chat))
         .with_state(state);
 
@@ -72,9 +81,66 @@ async fn chat(
     State(state): State<AppState>,
     Json(request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ApiError> {
-    let response = tokio::task::spawn_blocking(move || handle_chat_request(&state, request))
+    let response =
+        tokio::task::spawn_blocking(move || handle_chat_request(&state.service, request))
+            .await
+            .map_err(|error| ApiError(anyhow!("chat worker failed: {error}")))?
+            .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn agents(
+    State(state): State<AppState>,
+    Query(query): Query<NamespaceQuery>,
+) -> Result<Json<AgentListResponse>, ApiError> {
+    let namespace = ApiNamespace {
+        tenant_id: query.tenant_id,
+        user_id: query.user_id,
+    };
+    let response = tokio::task::spawn_blocking(move || list_agents(&state.service, namespace))
         .await
-        .map_err(|error| ApiError(anyhow!("chat worker failed: {error}")))?
+        .map_err(|error| ApiError(anyhow!("agent worker failed: {error}")))?
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn domains(
+    State(state): State<AppState>,
+    Query(query): Query<NamespaceQuery>,
+) -> Result<Json<DomainListResponse>, ApiError> {
+    let namespace = ApiNamespace {
+        tenant_id: query.tenant_id,
+        user_id: query.user_id,
+    };
+    let response = tokio::task::spawn_blocking(move || list_domains(&state.service, namespace))
+        .await
+        .map_err(|error| ApiError(anyhow!("domain worker failed: {error}")))?
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn mcp_servers(
+    State(state): State<AppState>,
+    Query(query): Query<NamespaceQuery>,
+) -> Result<Json<McpServerListResponse>, ApiError> {
+    let namespace = ApiNamespace {
+        tenant_id: query.tenant_id,
+        user_id: query.user_id,
+    };
+    let response = tokio::task::spawn_blocking(move || list_mcp_servers(&state.service, namespace))
+        .await
+        .map_err(|error| ApiError(anyhow!("mcp server worker failed: {error}")))?
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn agent_route(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRouteRequest>,
+) -> Result<Json<AgentRouteResponse>, ApiError> {
+    let response = tokio::task::spawn_blocking(move || route_agent(&state.service, request))
+        .await
+        .map_err(|error| ApiError(anyhow!("agent route worker failed: {error}")))?
         .map_err(ApiError::from)?;
     Ok(Json(response))
 }
@@ -151,6 +217,154 @@ fn openapi_document() -> Value {
                         "500": { "$ref": "#/components/responses/InternalError" }
                     }
                 }
+            },
+            "/v1/agents": {
+                "get": {
+                    "summary": "List workspace agent profiles",
+                    "operationId": "listAgents",
+                    "parameters": [
+                        {
+                            "name": "tenant_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string",
+                                "default": "local"
+                            }
+                        },
+                        {
+                            "name": "user_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string",
+                                "default": "default"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Agent profiles available in the workspace namespace",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/AgentListResponse" }
+                                }
+                            }
+                        },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
+            "/v1/domains": {
+                "get": {
+                    "summary": "List workspace domain profiles",
+                    "operationId": "listDomains",
+                    "parameters": [
+                        {
+                            "name": "tenant_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string",
+                                "default": "local"
+                            }
+                        },
+                        {
+                            "name": "user_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string",
+                                "default": "default"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Domain profiles available in the workspace namespace",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/DomainListResponse" }
+                                }
+                            }
+                        },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
+            "/v1/mcp/servers": {
+                "get": {
+                    "summary": "List workspace MCP server definitions",
+                    "operationId": "listMcpServers",
+                    "parameters": [
+                        {
+                            "name": "tenant_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string",
+                                "default": "local"
+                            }
+                        },
+                        {
+                            "name": "user_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string",
+                                "default": "default"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "MCP servers available in the workspace namespace",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/McpServerListResponse" }
+                                }
+                            }
+                        },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
+            "/v1/agents/route": {
+                "post": {
+                    "summary": "Route input to the best matching agent profile",
+                    "operationId": "routeAgent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AgentRouteRequest" },
+                                "examples": {
+                                    "identity": {
+                                        "value": {
+                                            "input": "你叫什么",
+                                            "namespace": {
+                                                "tenant_id": "local",
+                                                "user_id": "default"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Ranked routing candidates",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/AgentRouteResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/BadRequest" },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
             }
         },
         "components": {
@@ -216,6 +430,22 @@ fn openapi_document() -> Value {
                         "provider": { "type": "string" },
                         "model": { "type": "string" },
                         "system_prompt": { "type": "string" },
+                        "agent_id": {
+                            "type": "string",
+                            "description": "Explicit agent profile id. When omitted, the service routes input to an agent."
+                        },
+                        "domain_id": {
+                            "type": "string",
+                            "description": "Optional domain hint for routing."
+                        },
+                        "active_agent_id": {
+                            "type": "string",
+                            "description": "Agent id from the active task/session context."
+                        },
+                        "active_task_id": {
+                            "type": "string",
+                            "description": "Active task id used by future task-aware routing."
+                        },
                         "memory": { "$ref": "#/components/schemas/ApiMemoryQuery" },
                         "temperature": {
                             "type": "number",
@@ -271,6 +501,8 @@ fn openapi_document() -> Value {
                         "message": { "$ref": "#/components/schemas/ApiChatMessage" },
                         "model": { "type": "string" },
                         "provider": { "type": "string" },
+                        "selected_agent_id": { "type": "string" },
+                        "selected_domain_id": { "type": "string" },
                         "recalled_memories": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/MemoryRef" }
@@ -287,6 +519,178 @@ fn openapi_document() -> Value {
                     "properties": {
                         "status": { "type": "string", "example": "ok" },
                         "service": { "type": "string", "example": "hc-api" }
+                    }
+                },
+                "AgentProfileSummary": {
+                    "type": "object",
+                    "required": [
+                        "id",
+                        "name",
+                        "kind",
+                        "priority",
+                        "intent_hints",
+                        "tool_refs",
+                        "memory_scope_refs",
+                        "tags"
+                    ],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["domain_service", "task_role", "router", "guard", "other"]
+                        },
+                        "project_id": { "type": "string" },
+                        "domain_id": { "type": "string" },
+                        "priority": { "type": "integer" },
+                        "intent_hints": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "tool_refs": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "memory_scope_refs": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "AgentListResponse": {
+                    "type": "object",
+                    "required": ["agents"],
+                    "properties": {
+                        "agents": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/AgentProfileSummary" }
+                        }
+                    }
+                },
+                "DomainProfileSummary": {
+                    "type": "object",
+                    "required": [
+                        "id",
+                        "name",
+                        "kind",
+                        "priority",
+                        "intent_hints",
+                        "tool_refs",
+                        "memory_scope_refs",
+                        "tags"
+                    ],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["service", "project_area", "safety", "other"]
+                        },
+                        "project_id": { "type": "string" },
+                        "priority": { "type": "integer" },
+                        "intent_hints": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "default_agent_id": { "type": "string" },
+                        "tool_refs": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "memory_scope_refs": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "DomainListResponse": {
+                    "type": "object",
+                    "required": ["domains"],
+                    "properties": {
+                        "domains": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/DomainProfileSummary" }
+                        }
+                    }
+                },
+                "McpServerSummary": {
+                    "type": "object",
+                    "required": ["id", "name", "description", "transport", "command", "tags"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "transport": { "type": "string" },
+                        "url": { "type": "string" },
+                        "command": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "McpServerListResponse": {
+                    "type": "object",
+                    "required": ["servers"],
+                    "properties": {
+                        "servers": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/McpServerSummary" }
+                        }
+                    }
+                },
+                "AgentRouteRequest": {
+                    "type": "object",
+                    "required": ["input"],
+                    "properties": {
+                        "input": { "type": "string" },
+                        "namespace": { "$ref": "#/components/schemas/ApiNamespace" },
+                        "project_id": { "type": "string" },
+                        "domain_id": { "type": "string" },
+                        "active_agent_id": { "type": "string" },
+                        "active_task_id": { "type": "string" },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "default": 5
+                        }
+                    }
+                },
+                "AgentRouteCandidate": {
+                    "type": "object",
+                    "required": ["agent_id", "score", "reasons"],
+                    "properties": {
+                        "agent_id": { "type": "string" },
+                        "domain_id": { "type": "string" },
+                        "score": { "type": "integer" },
+                        "reasons": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "AgentRouteResponse": {
+                    "type": "object",
+                    "required": ["candidates"],
+                    "properties": {
+                        "selected_agent_id": { "type": "string" },
+                        "selected_domain_id": { "type": "string" },
+                        "candidates": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/AgentRouteCandidate" }
+                        }
                     }
                 },
                 "ErrorResponse": {
@@ -333,169 +737,6 @@ fn swagger_ui_html() -> String {
     SWAGGER_UI_HTML.replace("__HONEYCOMB_OPENAPI_SPEC__", &spec_json)
 }
 
-fn handle_chat_request(state: &AppState, request: ChatRequest) -> Result<ChatResponse> {
-    let memory_namespace = memory_namespace_from_api(&request.memory.namespace);
-    let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
-    let model = ModelRef::new(
-        request
-            .provider
-            .clone()
-            .unwrap_or_else(default_provider_from_env),
-        request.model.clone().unwrap_or_else(default_model_from_env),
-    );
-    let messages = request_messages(&request)?;
-    let mut generation = GenerateRequest::new(model.clone(), messages);
-    generation.temperature = request.temperature;
-    generation.max_output_tokens = request.max_output_tokens;
-
-    let memory_query =
-        build_memory_query(memory_namespace, &request.memory, request.input.clone())?;
-    let system_prompt = match request.system_prompt {
-        Some(system_prompt) if !system_prompt.trim().is_empty() => system_prompt,
-        _ => load_context_memory_system_prompt(&workspace_namespace)?,
-    };
-    let context_request = ContextRequest::new(generation)
-        .with_memory_query(memory_query)
-        .with_system_prompt(system_prompt)
-        .with_prompt_policy(PromptPolicy::new(
-            "Memory Usage Policy",
-            load_context_memory_usage_policy_prompt(&workspace_namespace)?,
-        ));
-
-    let registry = default_registry_from_env();
-    let retriever = WorkspaceMemoryRetriever::new(&state.workspace_root, workspace_namespace);
-    let composer = DefaultContextComposer;
-    let response = generate_with_context(&registry, &retriever, &composer, &context_request)?;
-
-    Ok(ChatResponse {
-        message: api_message_from_llm(response.response.message),
-        model: response.response.model.model,
-        provider: response.response.model.provider,
-        recalled_memories: response
-            .recalled_memories
-            .into_iter()
-            .map(memory_ref_from_retrieved)
-            .collect(),
-        synthesized_prompt_asset_count: response.synthesized_prompt_assets.len(),
-    })
-}
-
-fn request_messages(request: &ChatRequest) -> Result<Vec<ChatMessage>> {
-    let mut messages = request
-        .messages
-        .iter()
-        .map(llm_message_from_api)
-        .collect::<Vec<_>>();
-    if let Some(input) = request.input.as_deref()
-        && !input.trim().is_empty()
-    {
-        messages.push(ChatMessage::new(MessageRole::User, input.trim().to_owned()));
-    }
-    if messages.is_empty() {
-        bail!("chat request requires input or messages");
-    }
-    Ok(messages)
-}
-
-fn build_memory_query(
-    namespace: MemoryNamespace,
-    memory: &ApiMemoryQuery,
-    fallback_text: Option<String>,
-) -> Result<ContextMemoryQuery> {
-    let mut query = ContextMemoryQuery::default().for_namespace(namespace);
-    let text = memory
-        .text
-        .clone()
-        .or(fallback_text)
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if let Some(text) = text {
-        query = query.with_text(text);
-    }
-    query = query.with_limit(memory.limit.unwrap_or(8).max(1));
-    if let Some(scope) = memory.scope.as_deref() {
-        query = query.with_scope(parse_scope(scope)?);
-    }
-    if let Some(kind) = memory.kind.as_deref() {
-        query.memory_query.kind = Some(parse_kind(kind)?);
-    }
-    if let Some(tag) = memory.tag.as_deref()
-        && !tag.trim().is_empty()
-    {
-        query = query.with_tag(tag.trim().to_owned());
-    }
-    Ok(query)
-}
-
-fn llm_message_from_api(message: &ApiChatMessage) -> ChatMessage {
-    let role = match message.role {
-        ApiMessageRole::System => MessageRole::System,
-        ApiMessageRole::User => MessageRole::User,
-        ApiMessageRole::Assistant => MessageRole::Assistant,
-        ApiMessageRole::Tool => MessageRole::Tool,
-    };
-    let mut chat_message = ChatMessage::new(role, message.content.clone());
-    if let Some(name) = &message.name {
-        chat_message = chat_message.named(name.clone());
-    }
-    chat_message
-}
-
-fn api_message_from_llm(message: ChatMessage) -> ApiChatMessage {
-    let role = match message.role {
-        MessageRole::System => ApiMessageRole::System,
-        MessageRole::User => ApiMessageRole::User,
-        MessageRole::Assistant => ApiMessageRole::Assistant,
-        MessageRole::Tool => ApiMessageRole::Tool,
-    };
-    ApiChatMessage {
-        role,
-        content: message.content,
-        name: message.name,
-    }
-}
-
-fn memory_ref_from_retrieved(memory: hc_context::RetrievedMemory) -> MemoryRef {
-    MemoryRef {
-        id: memory.id,
-        title: memory.title,
-        summary: memory.summary,
-        scope: memory_scope_label(&memory.scope).to_owned(),
-        kind: memory_kind_label(&memory.kind).to_owned(),
-        source_kind: memory.source_kind,
-        confidence_milli: memory.confidence_milli,
-        tags: memory.tags,
-        room_id: memory.room_id,
-    }
-}
-
-fn memory_namespace_from_api(namespace: &ApiNamespace) -> MemoryNamespace {
-    MemoryNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone())
-}
-
-fn parse_scope(value: &str) -> Result<MemoryScope> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "global" => Ok(MemoryScope::Global),
-        "persona" => Ok(MemoryScope::Persona),
-        "session" => Ok(MemoryScope::Session),
-        "instance" => Ok(MemoryScope::Instance),
-        "project" => Ok(MemoryScope::Project),
-        "task" => Ok(MemoryScope::Task),
-        other => bail!("unsupported memory scope: {other}"),
-    }
-}
-
-fn parse_kind(value: &str) -> Result<MemoryKind> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "summary" => Ok(MemoryKind::Summary),
-        "decision" => Ok(MemoryKind::Decision),
-        "preference" => Ok(MemoryKind::Preference),
-        "knowledge" => Ok(MemoryKind::Knowledge),
-        "workflow_memory" | "workflow-memory" => Ok(MemoryKind::WorkflowMemory),
-        other => bail!("unsupported memory kind: {other}"),
-    }
-}
-
 fn bind_addr() -> Result<SocketAddr> {
     env::var("HC_API_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
@@ -507,6 +748,14 @@ fn workspace_root() -> PathBuf {
     env::var("HC_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("workspace"))
+}
+
+fn default_tenant_id() -> String {
+    "local".to_owned()
+}
+
+fn default_user_id() -> String {
+    "default".to_owned()
 }
 
 fn load_local_env_file() -> Result<()> {

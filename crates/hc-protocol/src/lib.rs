@@ -73,6 +73,14 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<String>,
     #[serde(default)]
     pub memory: ApiMemoryQuery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,8 +108,102 @@ pub struct ChatResponse {
     pub message: ApiChatMessage,
     pub model: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_domain_id: Option<String>,
     pub recalled_memories: Vec<MemoryRef>,
     pub synthesized_prompt_asset_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub project_id: Option<String>,
+    pub domain_id: Option<String>,
+    pub priority: i32,
+    pub intent_hints: Vec<String>,
+    pub tool_refs: Vec<String>,
+    pub memory_scope_refs: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentListResponse {
+    pub agents: Vec<AgentProfileSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub project_id: Option<String>,
+    pub priority: i32,
+    pub intent_hints: Vec<String>,
+    pub default_agent_id: Option<String>,
+    pub tool_refs: Vec<String>,
+    pub memory_scope_refs: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainListResponse {
+    pub domains: Vec<DomainProfileSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub command: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerListResponse {
+    pub servers: Vec<McpServerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRouteRequest {
+    pub input: String,
+    #[serde(default)]
+    pub namespace: ApiNamespace,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRouteCandidate {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<String>,
+    pub score: i32,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRouteResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_domain_id: Option<String>,
+    pub candidates: Vec<AgentRouteCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

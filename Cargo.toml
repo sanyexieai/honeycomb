@@ -2,6 +2,7 @@
 members = [
   "apps/hc",
   "apps/hc-api",
+  "apps/hc-careos-mcp",
   "apps/hc-context-cli",
   "apps/hc-llm-cli",
   "apps/hc-responder-cli",
@@ -11,6 +12,7 @@ members = [
   "crates/hc-claim",
   "crates/hc-context",
   "crates/hc-protocol",
+  "crates/hc-service",
   "crates/hc-core",
   "crates/hc-log",
   "crates/hc-llm",

@@ -1,0 +1,16 @@
+[package]
+name = "hc-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hc-agent = { path = "../hc-agent" }
+hc-context = { path = "../hc-context" }
+hc-llm = { path = "../hc-llm" }
+hc-protocol = { path = "../hc-protocol" }
+hc-store = { path = "../hc-store" }
+hc-toolchain = { path = "../hc-toolchain" }
+serde_json.workspace = true
