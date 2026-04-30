@@ -11,10 +11,9 @@ use hc_llm::{
 use hc_memory::{
     ArtifactDraft, ArtifactEvolutionAction, ArtifactEvolutionEvent, MemoryAssetForm,
     MemoryAssetStage, MemoryCatalog, MemoryLayer, MemoryOwnerKind, MemoryOwnerRef, MemoryQuery,
-    MemoryRecord, MemoryRepository, MemoryRoom, MemoryRoomAsset, MemoryRoomAssetKind,
-    MemoryRoomRepository,
+    MemoryRecord, MemoryRepository, MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository,
 };
-pub use hc_memory::{MemoryKind, MemoryNamespace, MemoryScope};
+pub use hc_memory::{MemoryKind, MemoryNamespace, MemoryRoom, MemoryScope};
 use hc_persona::PersonaProfile;
 use hc_store::store::{
     MarkdownIndex, MarkdownIndexEntry, MarkdownQuery, WorkspaceNamespace, WorkspaceStore,

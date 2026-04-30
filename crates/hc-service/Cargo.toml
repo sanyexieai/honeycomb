@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 hc-agent = { path = "../hc-agent" }
+hc-capability = { path = "../hc-capability" }
 hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }
 hc-llm = { path = "../hc-llm" }
@@ -17,3 +18,4 @@ hc-store = { path = "../hc-store" }
 hc-toolchain = { path = "../hc-toolchain" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true

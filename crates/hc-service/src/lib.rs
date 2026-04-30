@@ -3,8 +3,11 @@
 pub mod agent;
 pub mod chat;
 pub mod conversation;
+pub mod index;
 pub mod scheduler;
 pub mod tool;
+pub mod tool_turn;
+pub mod turn;
 
 use std::path::PathBuf;
 

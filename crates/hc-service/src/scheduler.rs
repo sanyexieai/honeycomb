@@ -2,11 +2,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use hc_context::runtime::{RuntimeIdentity, RuntimeVariables};
 use hc_protocol::ApiNamespace;
 use hc_scheduler::{
-    ScheduleRepository, ScheduledRun, ScheduledRunStatus, ScheduledTargetKind, now_unix,
+    ScheduleRepository, ScheduleStatus, ScheduledRun, ScheduledRunStatus, ScheduledTargetKind,
+    ScheduledTask, now_unix,
 };
 use hc_store::store::WorkspaceNamespace;
 use hc_toolchain::{McpServerRepository, call_mcp_tool};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ServiceConfig;
 
@@ -26,6 +27,94 @@ pub struct SchedulerDispatchReceipt {
     pub status: String,
     pub result_ref: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRequest {
+    #[serde(default)]
+    pub namespace: ApiNamespace,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub schedule: ScheduledTask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleStatusRequest {
+    #[serde(default)]
+    pub namespace: ApiNamespace,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub schedule_id: String,
+    pub status: ScheduleStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SchedulerRunRequest {
+    #[serde(default)]
+    pub namespace: ApiNamespace,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub now_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleWriteResponse {
+    pub schedule: ScheduledTask,
+    pub path: String,
+}
+
+pub fn list_schedules(
+    config: &ServiceConfig,
+    namespace: ApiNamespace,
+) -> Result<Vec<ScheduledTask>> {
+    let repository = schedule_repository(config, namespace);
+    repository.list_schedules()
+}
+
+pub fn write_schedule(
+    config: &ServiceConfig,
+    request: ScheduleRequest,
+) -> Result<ScheduleWriteResponse> {
+    let namespace = normalized_namespace(request.namespace, request.tenant_id, request.user_id);
+    let repository = schedule_repository(config, namespace);
+    let path = repository.write_schedule(&request.schedule)?;
+    Ok(ScheduleWriteResponse {
+        schedule: request.schedule,
+        path: path.to_string_lossy().replace('\\', "/"),
+    })
+}
+
+pub fn set_schedule_status(
+    config: &ServiceConfig,
+    request: ScheduleStatusRequest,
+) -> Result<ScheduledTask> {
+    let namespace = normalized_namespace(request.namespace, request.tenant_id, request.user_id);
+    let repository = schedule_repository(config, namespace);
+    repository.set_schedule_status(&request.schedule_id, request.status)
+}
+
+pub fn list_scheduled_runs(
+    config: &ServiceConfig,
+    namespace: ApiNamespace,
+) -> Result<Vec<ScheduledRun>> {
+    let repository = schedule_repository(config, namespace);
+    repository.list_runs()
+}
+
+pub fn queue_due_scheduled_runs(
+    config: &ServiceConfig,
+    request: SchedulerRunRequest,
+) -> Result<Vec<ScheduledRun>> {
+    let namespace = normalized_namespace(request.namespace, request.tenant_id, request.user_id);
+    let repository = schedule_repository(config, namespace);
+    repository.queue_due_runs(request.now_unix.unwrap_or_else(now_unix))
 }
 
 pub fn dispatch_due_scheduled_runs(
@@ -178,6 +267,39 @@ fn receipt(
 
 fn workspace_namespace(namespace: ApiNamespace) -> WorkspaceNamespace {
     WorkspaceNamespace::new(namespace.tenant_id, namespace.user_id)
+}
+
+fn schedule_repository(config: &ServiceConfig, namespace: ApiNamespace) -> ScheduleRepository {
+    ScheduleRepository::with_namespace(
+        config.workspace_root.clone(),
+        workspace_namespace(namespace),
+    )
+}
+
+fn normalized_namespace(
+    mut namespace: ApiNamespace,
+    tenant_id: Option<String>,
+    user_id: Option<String>,
+) -> ApiNamespace {
+    if let Some(tenant_id) = tenant_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        namespace.tenant_id = tenant_id;
+    }
+    if let Some(user_id) = user_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        namespace.user_id = user_id;
+    }
+    if namespace.tenant_id.trim().is_empty() {
+        namespace.tenant_id = hc_context::runtime::DEFAULT_TENANT_ID.to_owned();
+    }
+    if namespace.user_id.trim().is_empty() {
+        namespace.user_id = hc_context::runtime::DEFAULT_USER_ID.to_owned();
+    }
+    namespace
 }
 
 #[cfg(test)]

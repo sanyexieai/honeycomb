@@ -19,6 +19,8 @@ hc-conversation = { path = "../../crates/hc-conversation" }
 hc-context = { path = "../../crates/hc-context" }
 hc-llm = { path = "../../crates/hc-llm" }
 hc-scheduler = { path = "../../crates/hc-scheduler" }
+hc-service = { path = "../../crates/hc-service" }
 hc-skill = { path = "../../crates/hc-skill" }
 hc-store = { path = "../../crates/hc-store" }
 hc-toolchain = { path = "../../crates/hc-toolchain" }
+hc-protocol = { path = "../../crates/hc-protocol" }

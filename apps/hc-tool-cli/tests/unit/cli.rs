@@ -1,12 +1,13 @@
 use super::{
-    KeywordToolSelector, ToolSelector, build_chat_request_history, build_from_create_tool_command,
-    code_block_extension, execute_builtin_tool, expand_default_command_token_in_root,
-    extract_code_blocks, extract_create_tool_command, looks_like_complete_artifact,
-    parse_tool_build_response, parse_tool_route_response, render_chat_error,
+    KeywordToolSelector, TimedSequenceRule, ToolSelector, build_chat_request_history,
+    build_from_create_tool_command, code_block_extension, execute_builtin_tool,
+    expand_default_command_token_in_root, extract_code_blocks, extract_create_tool_command,
+    extract_i64_numbers, looks_like_complete_artifact, parse_tool_build_response,
+    parse_tool_route_response, reminder_delay_seconds, render_chat_error,
     render_tool_execution_context, render_tool_selection_context, sanitize_model_response,
     score_tool_for_goal, selection_input_from_history, skill_from_natural_language_draft,
-    tool_from_natural_language_draft, try_execute_create_tool_command_from_response,
-    write_generated_tool_files_under,
+    timed_sequence_end, tool_from_natural_language_draft,
+    try_execute_create_tool_command_from_response, write_generated_tool_files_under,
 };
 use hc_capability::ModelDependence;
 use hc_llm::{ChatMessage, LlmError, MessageRole};
@@ -112,6 +113,47 @@ fn invalid_chat_setting_error_gets_friendly_context() {
     ));
     assert!(rendered.contains("provider rejected the chat request"));
     assert!(rendered.contains("/clear"));
+}
+
+#[test]
+fn extracts_chinese_countdown_numbers_in_order() {
+    assert_eq!(extract_i64_numbers("倒数十个数"), vec![10]);
+    assert_eq!(extract_i64_numbers("从二十倒数到十五"), vec![20, 15]);
+    assert_eq!(extract_i64_numbers("从10开始倒计时到0"), vec![10, 0]);
+}
+
+#[test]
+fn countdown_quantity_uses_one_as_end() {
+    let rule = TimedSequenceRule {
+        direction: "countdown".to_owned(),
+        default_end: Some(0),
+        max_items: 120,
+        ..TimedSequenceRule::default()
+    };
+    assert_eq!(timed_sequence_end("倒数十个数", 10, &[10], &rule), 1);
+    assert_eq!(
+        timed_sequence_end("从10开始倒计时到0", 10, &[10, 0], &rule),
+        0
+    );
+}
+
+#[test]
+fn parses_simple_reminder_delay() {
+    assert_eq!(
+        reminder_delay_seconds(
+            "\u{4e00}\u{5206}\u{949f}\u{4ee5}\u{540e}\u{53eb}\u{6211}",
+            30
+        ),
+        Some(60)
+    );
+    assert_eq!(
+        reminder_delay_seconds("remind me in 2 minutes", 30),
+        Some(120)
+    );
+    assert_eq!(
+        reminder_delay_seconds("\u{7a0d}\u{540e}\u{53eb}\u{6211}", 30),
+        Some(30)
+    );
 }
 
 #[test]

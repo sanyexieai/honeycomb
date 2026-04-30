@@ -1779,12 +1779,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "hc-conversation",
  "hc-protocol",
+ "hc-scheduler",
  "hc-service",
+ "hc-store",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -1963,6 +1967,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hc-agent",
+ "hc-capability",
  "hc-context",
  "hc-conversation",
  "hc-llm",
@@ -1972,6 +1977,7 @@ dependencies = [
  "hc-toolchain",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -2008,7 +2014,9 @@ dependencies = [
  "hc-context",
  "hc-conversation",
  "hc-llm",
+ "hc-protocol",
  "hc-scheduler",
+ "hc-service",
  "hc-skill",
  "hc-store",
  "hc-toolchain",

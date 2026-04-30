@@ -10,17 +10,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::GB18030;
-use hc_agent::{
-    AgentProfile, AgentRepository, phrase_match_score, phrase_match_score_with_stop_terms,
-};
+use hc_agent::phrase_match_score;
 use hc_capability::ModelDependence;
 use hc_context::{
-    ChatCaptureOptions, ChatMemoryOptions, MemoryNamespace, MemoryRetriever, RetrievedMemory,
-    WorkspaceMemoryRetriever, load_tool_chat_prompt, load_tool_natural_language_builder_prompt,
-    load_tool_router_prompt, memory_kind_label, memory_scope_label, parse_memory_kind,
-    parse_memory_scope, persist_chat_turn_assistant_reply, persist_chat_turn_user_message,
-    persist_global_preference_from_chat_input, prepare_chat_capture_room,
-    render_recalled_memory_context,
+    ChatCaptureOptions, ChatMemoryOptions, MemoryNamespace, MemoryRetriever, MemoryRoom,
+    RetrievedMemory, WorkspaceMemoryRetriever, load_tool_chat_prompt,
+    load_tool_natural_language_builder_prompt, load_tool_router_prompt, memory_kind_label,
+    memory_scope_label, parse_memory_kind, parse_memory_scope, persist_chat_turn_assistant_reply,
+    persist_chat_turn_user_message, persist_global_preference_from_chat_input,
+    prepare_chat_capture_room, render_recalled_memory_context,
     runtime::{RuntimeIdentity, RuntimeVariableRepository, RuntimeVariables},
     workspace_namespace_from_memory_namespace,
 };
@@ -30,9 +28,18 @@ use hc_llm::{
     default_provider_from_env, default_registry_from_env, is_timeout_error,
     sanitize_assistant_text,
 };
+use hc_protocol::{ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest};
 use hc_scheduler::{
     ScheduleRepository, ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledRunStatus,
     ScheduledTarget, ScheduledTargetKind, ScheduledTask, now_unix,
+};
+use hc_service::{
+    ServiceConfig,
+    tool_turn::{
+        PendingToolConfirmation, ToolTurnSessionState, load_tool_turn_session_state,
+        save_tool_turn_session_state, try_handle_configured_mcp_turn,
+        try_handle_persisted_pending_confirmation,
+    },
 };
 use hc_skill::{SkillProfile, SkillRepository};
 use hc_store::{
@@ -116,139 +123,103 @@ struct ToolSelectionCandidate {
     score: i32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolRoutingTags {
-    #[serde(default)]
-    intent_rules: Vec<ToolIntentRoutingRule>,
-    #[serde(default)]
-    tool_weights: Vec<ToolWeightRule>,
-    #[serde(default)]
-    confirmation_hints: Vec<String>,
-    #[serde(default)]
-    routing_stop_terms: Vec<String>,
-    #[serde(default)]
-    argument_rules: Vec<ToolArgumentRule>,
-    #[serde(default)]
-    tool_argument_rules: Vec<ToolScopedArgumentRule>,
-    #[serde(default)]
-    confirmation_flows: Vec<ToolConfirmationFlowRule>,
-    #[serde(default)]
-    confirmation_retry: ToolConfirmationRetryRule,
-    #[serde(default)]
-    timed_sequence_rules: Vec<TimedSequenceRule>,
+#[derive(Debug, Clone)]
+struct TurnFrame {
+    user_turn: String,
+    runtime: RuntimeVariables,
+    namespace: MemoryNamespace,
+    workspace_namespace: WorkspaceNamespace,
+    session_id: Option<String>,
+    turn_index: usize,
+    selection_input: String,
+    selection: ToolSelection,
+    recalled_memories: Vec<RetrievedMemory>,
+    tool_execution_context: Option<String>,
+    selected_agent_id: Option<String>,
+    selected_domain_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolIntentRoutingRule {
-    #[serde(default)]
-    hints: Vec<String>,
-    #[serde(default)]
-    examples: Vec<String>,
-    #[serde(default)]
-    negative_examples: Vec<String>,
-    #[serde(default)]
-    preferred_selectors: Vec<String>,
-    #[serde(default)]
-    weight: i32,
+#[derive(Debug, Clone)]
+struct TurnNodeReply {
+    reply: Option<String>,
+    warning: Option<String>,
+    clear_pending_confirmation: bool,
+    next_pending_confirmation: Option<PendingToolConfirmation>,
+    stop_pipeline: bool,
+    reset_system_prompt: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolWeightRule {
-    #[serde(default)]
-    selectors: Vec<String>,
-    #[serde(default)]
-    weight: i32,
+#[derive(Debug, Clone)]
+enum NormalChatNodeResult {
+    CreatedTool {
+        path: PathBuf,
+    },
+    AssistantReply {
+        content: String,
+        artifact_paths: Vec<PathBuf>,
+    },
+    InvalidCreateCommand {
+        content: String,
+        warning: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolArgumentRule {
-    #[serde(default)]
-    hints: Vec<String>,
-    #[serde(default)]
-    args: BTreeMap<String, serde_json::Value>,
+enum ExplicitCommandNodeResult {
+    Continue,
+    Exit,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolScopedArgumentRule {
-    #[serde(default)]
-    selectors: Vec<String>,
-    #[serde(default)]
-    args: BTreeMap<String, serde_json::Value>,
-    #[serde(default)]
-    include_matched_argument_rules: bool,
-    #[serde(default)]
-    context_calls: Vec<ToolContextCallRule>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolContextCallRule {
-    arg: String,
-    server_id: String,
-    #[serde(default)]
-    tool_names: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolConfirmationFlowRule {
-    #[serde(default)]
-    source_selectors: Vec<String>,
-    #[serde(default)]
-    target_selectors: Vec<String>,
-    #[serde(default)]
-    fallback_target_selectors: Vec<Vec<String>>,
-    #[serde(default)]
-    item_paths: Vec<String>,
-    #[serde(default)]
-    target_args: BTreeMap<String, serde_json::Value>,
-    #[serde(default)]
-    item_arg_mappings: Vec<ToolItemArgMapping>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ToolConfirmationRetryRule {
-    #[serde(default = "default_confirmation_retry_delay_seconds")]
-    delay_seconds: u64,
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default = "default_confirmation_retry_trigger")]
-    trigger: String,
-    #[serde(default = "default_confirmation_retry_reply")]
-    reply: String,
-    #[serde(default)]
-    retryable_failure_hints: Vec<String>,
-}
-
-impl Default for ToolConfirmationRetryRule {
-    fn default() -> Self {
+impl TurnFrame {
+    fn new(
+        user_turn: impl Into<String>,
+        namespace: MemoryNamespace,
+        session_id: Option<String>,
+        turn_index: usize,
+        selection_input: String,
+        selection: ToolSelection,
+        recalled_memories: Vec<RetrievedMemory>,
+    ) -> Self {
+        let user_turn = user_turn.into();
+        let runtime = runtime_variables_for_namespace(&namespace, session_id.as_deref());
+        let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
         Self {
-            delay_seconds: default_confirmation_retry_delay_seconds(),
-            agent_id: None,
-            trigger: default_confirmation_retry_trigger(),
-            reply: default_confirmation_retry_reply(),
-            retryable_failure_hints: Vec::new(),
+            user_turn,
+            runtime,
+            namespace,
+            workspace_namespace,
+            session_id,
+            turn_index,
+            selection_input,
+            selection,
+            recalled_memories,
+            tool_execution_context: None,
+            selected_agent_id: None,
+            selected_domain_id: None,
         }
+    }
+
+    fn room_id(&self) -> Option<String> {
+        self.session_id.clone()
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    fn set_tool_execution_context(&mut self, context: impl Into<String>) {
+        self.tool_execution_context = Some(context.into());
     }
 }
 
-fn default_confirmation_retry_delay_seconds() -> u64 {
-    5
-}
-
-fn default_confirmation_retry_trigger() -> String {
-    "tool.confirmation_retry_due".to_owned()
-}
-
-fn default_confirmation_retry_reply() -> String {
-    "我会继续处理这次确认，完成后主动告诉您。".to_owned()
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
-struct ToolItemArgMapping {
-    arg: String,
+struct ToolRoutingTags {
     #[serde(default)]
-    keys: Vec<String>,
+    timed_sequence_rules: Vec<TimedSequenceRule>,
     #[serde(default)]
-    format: Option<String>,
+    reminder_rules: Vec<ReminderRule>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -271,6 +242,42 @@ struct TimedSequenceRule {
     trigger: Option<String>,
     #[serde(default)]
     scheduled_reply: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReminderRule {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    hints: Vec<String>,
+    #[serde(default = "default_reminder_delay_seconds")]
+    default_delay_seconds: u64,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    trigger: Option<String>,
+    #[serde(default)]
+    scheduled_reply: Option<String>,
+    #[serde(default)]
+    due_reply: Option<String>,
+}
+
+impl Default for ReminderRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            hints: Vec::new(),
+            default_delay_seconds: default_reminder_delay_seconds(),
+            agent_id: None,
+            trigger: None,
+            scheduled_reply: None,
+            due_reply: None,
+        }
+    }
+}
+
+fn default_reminder_delay_seconds() -> u64 {
+    60
 }
 
 fn default_timed_sequence_interval_seconds() -> u64 {
@@ -296,57 +303,10 @@ struct ToolResponseRenderer {
     #[serde(default)]
     selectors: Vec<String>,
     #[serde(default)]
-    item_paths: Vec<String>,
-    #[serde(default)]
-    name_keys: Vec<String>,
-    #[serde(default)]
-    primary_fields: Vec<ToolResponseField>,
-    #[serde(default)]
-    alternative_fields: Vec<ToolResponseField>,
-    #[serde(default)]
-    reason_keys: Vec<String>,
-    #[serde(default)]
-    reason_array_keys: Vec<String>,
-    #[serde(default)]
-    context_arg: Option<String>,
-    #[serde(default)]
-    header: Option<String>,
-    #[serde(default)]
-    header_with_context: Option<String>,
-    #[serde(default)]
-    primary_heading: Option<String>,
-    #[serde(default)]
-    alternatives_heading: Option<String>,
-    #[serde(default)]
-    confirmation_prompt: Option<String>,
-    #[serde(default)]
     empty_reply: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     failure_reply: Option<String>,
-    #[serde(default)]
-    order_success: Option<String>,
-    #[serde(default)]
-    status_labels: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ToolResponseField {
-    label: String,
-    #[serde(default)]
-    keys: Vec<String>,
-    #[serde(default)]
-    format: Option<String>,
-    #[serde(default)]
-    max_len: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingToolConfirmation {
-    tool_id: String,
-    fallback_tool_ids: Vec<String>,
-    items: Vec<serde_json::Value>,
-    flow: ToolConfirmationFlowRule,
 }
 
 #[derive(Debug, Clone)]
@@ -702,7 +662,6 @@ fn handle_chat(args: &[String]) -> Result<()> {
 
     let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
     let mut history = vec![ChatMessage::new(MessageRole::System, tool_prompt)];
-    let mut pending_confirmation: Option<PendingToolConfirmation> = None;
     loop {
         let Some(input) = prompt_raw(&mut editor)? else {
             break;
@@ -712,89 +671,26 @@ fn handle_chat(args: &[String]) -> Result<()> {
             continue;
         }
 
-        match trimmed {
-            "/quit" | "/exit" => break,
-            "/help" => {
-                println!("/help");
-                println!("/clear");
-                println!("/tools");
-                println!("/plan <goal>");
-                println!(
-                    "/create-tool <id> <name> --description <text> --command <token> [--command <token>] [--tag <tag>]"
-                );
-                println!("/mcp add|list|tools|call ...");
-                println!(
-                    "chat options: --tenant-id <id> --user-id <id> --session-id <id> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
-                );
-                println!("/quit");
-                continue;
+        if let Some(command_result) = run_explicit_command_node(
+            trimmed,
+            &mut history,
+            system_message.as_deref(),
+            &memory_options,
+            &capture_options,
+        )? {
+            match command_result {
+                ExplicitCommandNodeResult::Continue => continue,
+                ExplicitCommandNodeResult::Exit => break,
             }
-            "/clear" => {
-                let catalog = load_cli_tool_catalog()?;
-                history.clear();
-                history.push(ChatMessage::new(
-                    MessageRole::System,
-                    render_tool_chat_system_prompt(
-                        &catalog,
-                        system_message.as_deref(),
-                        &memory_options.namespace,
-                        capture_options.room_id.as_deref(),
-                    )?,
-                ));
-                println!("history cleared");
-                continue;
-            }
-            "/tools" => {
-                let catalog = load_cli_tool_catalog()?;
-                for tool in catalog.list() {
-                    println!("{} | {} | {}", tool.id, tool.name, tool.description);
-                }
-                continue;
-            }
-            _ if trimmed.starts_with("/plan ") => {
-                let catalog = load_cli_tool_catalog()?;
-                let goal = trimmed
-                    .strip_prefix("/plan ")
-                    .map(str::trim)
-                    .unwrap_or_default();
-                if goal.is_empty() {
-                    println!("usage: /plan <goal>");
-                    continue;
-                }
-                let (tool, _) = auto_select_tool(&catalog, goal)?;
-                let plan = build_default_tool_execution_plan(&tool, goal)?;
-                println!("tool> {}", plan.tool_id);
-                println!("command> {}", plan.suggested_command.join(" "));
-                print_lines("guidance", &plan.guidance);
-                continue;
-            }
-            _ if trimmed.starts_with("/create-tool ") => {
-                match handle_create_from_chat(trimmed.strip_prefix("/create-tool ").unwrap_or("")) {
-                    Ok(path) => {
-                        println!("created> {}", path.display());
-                        let catalog = load_cli_tool_catalog()?;
-                        history.clear();
-                        history.push(ChatMessage::new(
-                            MessageRole::System,
-                            render_tool_chat_system_prompt(
-                                &catalog,
-                                system_message.as_deref(),
-                                &memory_options.namespace,
-                                capture_options.room_id.as_deref(),
-                            )?,
-                        ));
-                    }
-                    Err(error) => println!("error> {error}"),
-                }
-                continue;
-            }
-            _ => {}
         }
 
         let catalog = load_cli_tool_catalog()?;
+        let mut pending_confirmation = load_cli_pending_confirmation(
+            &memory_options.namespace,
+            capture_options.room_id.as_deref(),
+        )?;
         let selector = KeywordToolSelector::default();
         let selection_input = selection_input_from_history(&history, trimmed);
-        let mut selection = selector.select(&selection_input, &catalog)?;
         let recalled_memories = if memory_options.enabled {
             let query = memory_options.build_query(trimmed);
             memory_retriever.retrieve(&query)?
@@ -809,306 +705,149 @@ fn handle_chat(args: &[String]) -> Result<()> {
             .filter(|message| message.role == MessageRole::User)
             .count()
             + 1;
+        let mut frame = TurnFrame::new(
+            trimmed.to_owned(),
+            memory_options.namespace.clone(),
+            capture_options.room_id.clone(),
+            turn_index,
+            selection_input.clone(),
+            selector.select(&selection_input, &catalog)?,
+            recalled_memories,
+        );
         if let Some(room) = &chat_room
             && let Err(error) = persist_chat_turn_user_message(
                 workspace_root(),
-                workspace_namespace.clone(),
+                frame.workspace_namespace.clone(),
                 room,
-                turn_index,
-                trimmed.to_owned(),
+                frame.turn_index,
+                frame.user_turn.clone(),
             )
         {
             println!("warning> chat memory write skipped: {error}");
         }
-        if let Some(route) = confirmed_pending_route(
-            trimmed,
-            &pending_confirmation,
-            &memory_options.namespace,
-            capture_options.room_id.as_deref(),
-        ) {
-            let (plan, outcome) = execute_routed_tool_outcome(&route)?;
-            let context = render_tool_execution_context(&plan, &outcome);
-            apply_tool_route(&mut selection, &catalog, route.clone())?;
-            if outcome.success {
-                pending_confirmation = None;
-                let reply = render_order_reply(&outcome)
-                    .unwrap_or_else(|| render_unrenderable_tool_reply(&outcome));
-                println!("assistant> {reply}");
-                history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-                if let Some(room) = &chat_room
-                    && let Err(error) = persist_chat_turn_assistant_reply(
-                        workspace_root(),
-                        workspace_namespace.clone(),
-                        room,
-                        turn_index,
-                        reply,
-                    )
-                {
-                    println!("warning> chat memory write skipped: {error}");
-                }
-                let _ = context;
-                continue;
-            }
-
-            record_tool_flow_failure(
-                "pending_confirmation",
-                trimmed,
-                &route,
-                &outcome,
-                &workspace_namespace,
-                chat_room.as_ref().map(|room| room.id.clone()),
+        if let Some(node_reply) = run_pending_confirmation_node(&mut frame, &catalog)? {
+            apply_turn_node_reply_state(&node_reply, &mut pending_confirmation);
+            save_cli_pending_confirmation(
+                &memory_options.namespace,
+                capture_options.room_id.as_deref(),
+                &pending_confirmation,
             )?;
-            if is_retryable_tool_failure(&outcome) {
-                let reply = schedule_confirmation_retry(
-                    &route,
-                    &outcome,
-                    &workspace_namespace,
-                    chat_room.as_ref().map(|room| room.id.clone()),
-                )?;
-                println!("assistant> {reply}");
-                history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-                if let Some(room) = &chat_room
-                    && let Err(error) = persist_chat_turn_assistant_reply(
-                        workspace_root(),
-                        workspace_namespace.clone(),
-                        room,
-                        turn_index,
-                        reply,
-                    )
-                {
-                    println!("warning> chat memory write skipped: {error}");
-                }
-                let _ = context;
+            print_turn_node_warning(&node_reply);
+            if emit_turn_node_reply(&frame, &node_reply, &mut history, chat_room.as_ref())? {
                 continue;
             }
-            let _ = context;
+            if node_reply.stop_pipeline {
+                continue;
+            }
         }
-        if let Some(reply) = handle_timed_sequence_turn(
-            trimmed,
-            &memory_options.namespace.tenant_id,
-            &memory_options.namespace.user_id,
-            chat_room.as_ref().map(|room| room.id.clone()),
-        )? {
-            if !reply.trim().is_empty() {
-                println!("assistant> {reply}");
-            }
-            history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-            if !reply.trim().is_empty() {
-                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-                if let Some(room) = &chat_room
-                    && let Err(error) = persist_chat_turn_assistant_reply(
-                        workspace_root(),
-                        workspace_namespace.clone(),
-                        room,
-                        turn_index,
-                        reply,
-                    )
-                {
-                    println!("warning> chat memory write skipped: {error}");
-                }
-            }
-            continue;
-        }
-        let mut tool_execution_context = None;
-        if let Some(route) = configured_agent_mcp_route(
-            trimmed,
-            &selection,
-            &catalog,
-            &memory_options.namespace,
-            capture_options.room_id.as_deref(),
-        )? {
-            if route.action != "run_tool" {
-                if let Some(message) = route.message {
-                    println!("assistant> {message}");
-                }
-                continue;
-            }
-            let (plan, outcome) = execute_routed_tool_outcome(&route)?;
-            let context = render_tool_execution_context(&plan, &outcome);
-            apply_tool_route(&mut selection, &catalog, route.clone())?;
-            if outcome.success
-                && let Some(reply) = render_grounded_tool_reply(&outcome)
-            {
-                pending_confirmation =
-                    pending_confirmation_from_outcome(&outcome, &catalog).or(pending_confirmation);
-                println!("assistant> {reply}");
-                history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-                history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-                if let Some(room) = &chat_room
-                    && let Err(error) = persist_chat_turn_assistant_reply(
-                        workspace_root(),
-                        workspace_namespace.clone(),
-                        room,
-                        turn_index,
-                        reply,
-                    )
-                {
-                    println!("warning> chat memory write skipped: {error}");
-                }
-                continue;
-            }
-            record_tool_flow_failure(
-                "configured_agent_mcp",
-                trimmed,
-                &route,
-                &outcome,
-                &workspace_namespace,
-                chat_room.as_ref().map(|room| room.id.clone()),
+        if let Some(node_reply) = run_timed_sequence_node(&frame, &history)? {
+            apply_turn_node_reply_state(&node_reply, &mut pending_confirmation);
+            save_cli_pending_confirmation(
+                &memory_options.namespace,
+                capture_options.room_id.as_deref(),
+                &pending_confirmation,
             )?;
-            let _ = context;
-            tool_execution_context = Some(
-                "Internal note: a routed tool call did not produce a user-presentable result. Continue with ordinary intent handling. Do not invent concrete tool data, and do not mention internal tool/service failure unless it is directly relevant."
-                    .to_owned(),
-            );
+            print_turn_node_warning(&node_reply);
+            emit_turn_node_reply(&frame, &node_reply, &mut history, chat_room.as_ref())?;
+            if node_reply.stop_pipeline {
+                continue;
+            }
+        }
+        if let Some(node_reply) = run_configured_agent_mcp_node(&mut frame, &catalog)? {
+            apply_turn_node_reply_state(&node_reply, &mut pending_confirmation);
+            save_cli_pending_confirmation(
+                &memory_options.namespace,
+                capture_options.room_id.as_deref(),
+                &pending_confirmation,
+            )?;
+            print_turn_node_warning(&node_reply);
+            emit_turn_node_reply(&frame, &node_reply, &mut history, chat_room.as_ref())?;
+            if node_reply.stop_pipeline {
+                continue;
+            }
         } else {
-            match route_tool_turn(
+            let node_reply = run_llm_tool_router_node(
                 &registry,
                 &provider,
                 &model,
-                trimmed,
-                &selection,
+                &mut frame,
+                &catalog,
                 system_message.as_deref(),
-            ) {
-                Ok(route) if route.action == "create_tool" || route.action == "create_skill" => {
-                    match handle_natural_language_tool_create(
-                        &registry,
-                        &provider,
-                        &model,
-                        trimmed,
-                        system_message.as_deref(),
-                    ) {
-                        Ok(true) => {
-                            let catalog = load_cli_tool_catalog()?;
-                            history.clear();
-                            history.push(ChatMessage::new(
-                                MessageRole::System,
-                                render_tool_chat_system_prompt(
-                                    &catalog,
-                                    system_message.as_deref(),
-                                    &memory_options.namespace,
-                                    capture_options.room_id.as_deref(),
-                                )?,
-                            ));
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            println!("warning> tool builder skipped: {error}");
-                        }
-                    }
-                }
-                Ok(mut route) if route.action == "run_tool" => {
-                    append_platform_args_to_mcp_route(
-                        &mut route,
+            )?;
+            print_turn_node_warning(&node_reply);
+            if node_reply.reset_system_prompt {
+                let catalog = load_cli_tool_catalog()?;
+                history.clear();
+                history.push(ChatMessage::new(
+                    MessageRole::System,
+                    render_tool_chat_system_prompt(
                         &catalog,
+                        system_message.as_deref(),
                         &memory_options.namespace,
                         capture_options.room_id.as_deref(),
-                    );
-                    let context = execute_routed_tool(&route)?;
-                    apply_tool_route(&mut selection, &catalog, route)?;
-                    tool_execution_context = Some(context);
-                }
-                Ok(route) => {
-                    apply_tool_route(&mut selection, &catalog, route)?;
-                }
-                Err(error) => {
-                    println!("{}", render_router_warning(&error));
-                }
+                    )?,
+                ));
+            }
+            if node_reply.stop_pipeline {
+                continue;
             }
         }
-        let request_history = build_chat_request_history(
-            &history,
-            merge_optional_contexts([
-                render_recalled_memory_context(&recalled_memories),
-                render_tool_selection_context(&selection),
-                tool_execution_context,
-            ]),
-            trimmed,
-        );
-        let request = GenerateRequest::new(
-            ModelRef::new(provider.clone(), model.clone()),
-            request_history,
-        );
         print!("assistant> ");
         io::stdout().flush().context("failed to flush stdout")?;
-        match registry.generate(&request) {
-            Ok(response) => {
-                let display_content = sanitize_model_response(&response.message.content);
-                match try_execute_create_tool_command_from_response(&display_content) {
-                    Ok(Some(path)) => {
-                        println!("created> {}", path.display());
-                        let catalog = load_cli_tool_catalog()?;
-                        history.clear();
-                        history.push(ChatMessage::new(
-                            MessageRole::System,
-                            render_tool_chat_system_prompt(
-                                &catalog,
-                                system_message.as_deref(),
-                                &memory_options.namespace,
-                                capture_options.room_id.as_deref(),
-                            )?,
-                        ));
-                    }
-                    Ok(None) => {
-                        if display_content.trim().is_empty() {
-                            println!(
-                                "warning> model emitted a provider tool-call marker instead of normal text; ignored it. Please retry."
-                            );
-                        } else {
-                            println!("{display_content}");
-                            for path in persist_response_artifacts(trimmed, &display_content)? {
-                                println!("saved> {}", path.display());
-                            }
-                        }
-                        history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-                        history.push(ChatMessage::new(MessageRole::Assistant, display_content));
-                        if let Some(room) = &chat_room
-                            && let Some(assistant_message) = history.last()
-                            && let Err(error) = persist_chat_turn_assistant_reply(
-                                workspace_root(),
-                                workspace_namespace.clone(),
-                                room,
-                                turn_index,
-                                assistant_message.content.clone(),
-                            )
-                        {
-                            println!("warning> chat memory write skipped: {error}");
-                        }
-                        if memory_options.enabled {
-                            match persist_global_preference_from_chat_input(
-                                workspace_root(),
-                                workspace_namespace.clone(),
-                                memory_options.namespace.clone(),
-                                chat_room.as_ref().map(|room| room.id.clone()),
-                                trimmed.to_owned(),
-                                &registry,
-                                &ModelRef::new(provider.clone(), model.clone()),
-                            ) {
-                                Ok(paths) => {
-                                    if show_memory {
-                                        for path in paths {
-                                            println!("memory saved> {}", path.display());
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    println!("warning> global memory write skipped: {error}");
+        match run_normal_chat_node(&registry, &provider, &model, &history, &frame)? {
+            NormalChatNodeResult::CreatedTool { path } => {
+                println!("created> {}", path.display());
+                let catalog = load_cli_tool_catalog()?;
+                history.clear();
+                history.push(ChatMessage::new(
+                    MessageRole::System,
+                    render_tool_chat_system_prompt(
+                        &catalog,
+                        system_message.as_deref(),
+                        &memory_options.namespace,
+                        capture_options.room_id.as_deref(),
+                    )?,
+                ));
+            }
+            NormalChatNodeResult::AssistantReply {
+                content,
+                artifact_paths,
+            } => {
+                emit_normal_chat_assistant_reply(
+                    &frame,
+                    content,
+                    artifact_paths,
+                    &mut history,
+                    chat_room.as_ref(),
+                )?;
+                if memory_options.enabled {
+                    match persist_global_preference_from_chat_input(
+                        workspace_root(),
+                        workspace_namespace.clone(),
+                        memory_options.namespace.clone(),
+                        chat_room.as_ref().map(|room| room.id.clone()),
+                        frame.user_turn.clone(),
+                        &registry,
+                        &ModelRef::new(provider.clone(), model.clone()),
+                    ) {
+                        Ok(paths) => {
+                            if show_memory {
+                                for path in paths {
+                                    println!("memory saved> {}", path.display());
                                 }
                             }
                         }
-                    }
-                    Err(error) => {
-                        println!("{display_content}");
-                        println!("warning> ignored invalid create command from model: {error}");
-                        history.push(ChatMessage::new(MessageRole::User, trimmed.to_owned()));
-                        history.push(ChatMessage::new(MessageRole::Assistant, display_content));
+                        Err(error) => {
+                            println!("warning> global memory write skipped: {error}");
+                        }
                     }
                 }
             }
-            Err(error) => {
-                println!("{}", render_chat_error(&error));
+            NormalChatNodeResult::InvalidCreateCommand { content, warning } => {
+                emit_invalid_create_command_reply(&frame, content, warning, &mut history);
+            }
+            NormalChatNodeResult::Error { message } => {
+                println!("{message}");
             }
         }
     }
@@ -2491,330 +2230,448 @@ fn synthetic_routed_tool_error_outcome(
     )
 }
 
-fn configured_agent_mcp_route(
-    user_turn: &str,
-    selection: &ToolSelection,
-    catalog: &ToolCatalog,
-    namespace: &MemoryNamespace,
-    session_id: Option<&str>,
-) -> Result<Option<NaturalLanguageToolRoute>> {
-    let tool = if let Some(agent) = select_agent_by_configured_hints(user_turn)? {
-        let agent_catalog = catalog_with_agent_mcp_tools(catalog, &agent)?;
-        match select_mcp_tool_for_agent(&agent, user_turn, &agent_catalog) {
-            Some(tool) => Some(tool),
-            None => {
-                return Ok(Some(NaturalLanguageToolRoute {
-                    action: "mcp_unavailable".to_owned(),
-                    tool_id: None,
-                    fallback_tool_ids: Vec::new(),
-                    args: Vec::new(),
-                    goal: Some(user_turn.trim().to_owned()),
-                    message: Some(
-                        "我找到了对应服务，但暂时没有拿到可用能力。请检查该服务是否在线，或先刷新一次服务能力缓存。".to_owned()
-                    ),
-                }));
+fn run_explicit_command_node(
+    trimmed: &str,
+    history: &mut Vec<ChatMessage>,
+    system_message: Option<&str>,
+    memory_options: &ChatMemoryOptions,
+    capture_options: &ChatCaptureOptions,
+) -> Result<Option<ExplicitCommandNodeResult>> {
+    match trimmed {
+        "/quit" | "/exit" => Ok(Some(ExplicitCommandNodeResult::Exit)),
+        "/help" => {
+            println!("/help");
+            println!("/clear");
+            println!("/tools");
+            println!("/plan <goal>");
+            println!(
+                "/create-tool <id> <name> --description <text> --command <token> [--command <token>] [--tag <tag>]"
+            );
+            println!("/mcp add|list|tools|call ...");
+            println!(
+                "chat options: --tenant-id <id> --user-id <id> --session-id <id> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
+            );
+            println!("/quit");
+            Ok(Some(ExplicitCommandNodeResult::Continue))
+        }
+        "/clear" => {
+            reset_chat_history(history, system_message, memory_options, capture_options)?;
+            println!("history cleared");
+            Ok(Some(ExplicitCommandNodeResult::Continue))
+        }
+        "/tools" => {
+            let catalog = load_cli_tool_catalog()?;
+            for tool in catalog.list() {
+                println!("{} | {} | {}", tool.id, tool.name, tool.description);
             }
+            Ok(Some(ExplicitCommandNodeResult::Continue))
         }
-    } else {
-        None
-    }
-    .or_else(|| select_configured_mcp_tool(selection, user_turn));
-
-    let Some(tool) = tool else {
-        return Ok(None);
-    };
-    Ok(Some(NaturalLanguageToolRoute {
-        action: "run_tool".to_owned(),
-        tool_id: Some(tool.id.clone()),
-        fallback_tool_ids: Vec::new(),
-        args: route_args_for_tool(&tool, user_turn, namespace, session_id),
-        goal: Some(user_turn.trim().to_owned()),
-        message: None,
-    }))
-}
-
-fn route_args_for_tool(
-    tool: &ToolSpec,
-    user_turn: &str,
-    namespace: &MemoryNamespace,
-    session_id: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![format!("query={}", user_turn.trim())];
-    args.extend(platform_mcp_runtime_run_args(namespace, session_id));
-    args.extend(mcp_default_run_args(tool));
-    for rule in &tool_routing_tags().tool_argument_rules {
-        if !tool_matches_any_selector(tool, &rule.selectors) {
-            continue;
-        }
-        args.extend(
-            rule.args
-                .iter()
-                .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value))),
-        );
-        if rule.include_matched_argument_rules {
-            args.extend(matched_routing_argument_args(user_turn));
-        }
-        for context_call in &rule.context_calls {
-            if let Some(context) = fetch_tool_context(context_call) {
-                args.push(format!("{}={context}", context_call.arg));
+        _ if trimmed.starts_with("/plan ") => {
+            let catalog = load_cli_tool_catalog()?;
+            let goal = trimmed
+                .strip_prefix("/plan ")
+                .map(str::trim)
+                .unwrap_or_default();
+            if goal.is_empty() {
+                println!("usage: /plan <goal>");
+                return Ok(Some(ExplicitCommandNodeResult::Continue));
             }
+            let (tool, _) = auto_select_tool(&catalog, goal)?;
+            let plan = build_default_tool_execution_plan(&tool, goal)?;
+            println!("tool> {}", plan.tool_id);
+            println!("command> {}", plan.suggested_command.join(" "));
+            print_lines("guidance", &plan.guidance);
+            Ok(Some(ExplicitCommandNodeResult::Continue))
         }
+        _ if trimmed.starts_with("/create-tool ") => {
+            match handle_create_from_chat(trimmed.strip_prefix("/create-tool ").unwrap_or("")) {
+                Ok(path) => {
+                    println!("created> {}", path.display());
+                    reset_chat_history(history, system_message, memory_options, capture_options)?;
+                }
+                Err(error) => println!("error> {error}"),
+            }
+            Ok(Some(ExplicitCommandNodeResult::Continue))
+        }
+        _ => Ok(None),
     }
-    args
 }
 
-fn matched_routing_argument_args(user_turn: &str) -> Vec<String> {
-    tool_routing_tags()
-        .argument_rules
-        .iter()
-        .filter(|rule| text_matches_any(user_turn, &rule.hints))
-        .flat_map(|rule| {
-            rule.args
-                .iter()
-                .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value)))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-fn confirmed_pending_route(
-    user_turn: &str,
-    pending: &Option<PendingToolConfirmation>,
-    namespace: &MemoryNamespace,
-    session_id: Option<&str>,
-) -> Option<NaturalLanguageToolRoute> {
-    let pending = pending.as_ref()?;
-    if !is_confirmation_turn(user_turn) {
-        return None;
-    }
-    let item = pending.items.first()?;
-    Some(NaturalLanguageToolRoute {
-        action: "run_tool".to_owned(),
-        tool_id: Some(pending.tool_id.clone()),
-        fallback_tool_ids: pending.fallback_tool_ids.clone(),
-        args: pending_order_args(pending, item, user_turn, namespace, session_id),
-        goal: Some(user_turn.trim().to_owned()),
-        message: None,
-    })
-}
-
-fn schedule_confirmation_retry(
-    route: &NaturalLanguageToolRoute,
-    outcome: &ToolExecutionOutcome,
-    namespace: &WorkspaceNamespace,
-    room_id: Option<String>,
-) -> Result<String> {
-    let retry = &tool_routing_tags().confirmation_retry;
-    let repository = ConversationRepository::with_namespace(workspace_root(), namespace.clone());
-    let now = now_unix();
-    let mut followup = PendingFollowUp::new(
-        retry
-            .agent_id
-            .clone()
-            .unwrap_or_else(|| "agent.system.tool_retry".to_owned()),
-        retry.trigger.clone(),
-        now.saturating_add(retry.delay_seconds),
-    );
-    followup.id = format!("tool-confirmation-retry.{now}");
-    followup.room_id = room_id;
-    followup.payload.insert(
-        "action".to_owned(),
-        serde_json::Value::String("retry_tool_confirmation".to_owned()),
-    );
-    if let Some(tool_id) = &route.tool_id {
-        followup.payload.insert(
-            "tool_id".to_owned(),
-            serde_json::Value::String(tool_id.clone()),
-        );
-    }
-    followup.payload.insert(
-        "fallback_tool_ids".to_owned(),
-        serde_json::Value::Array(
-            route
-                .fallback_tool_ids
-                .iter()
-                .cloned()
-                .map(serde_json::Value::String)
-                .collect(),
-        ),
-    );
-    followup.payload.insert(
-        "args".to_owned(),
-        serde_json::Value::Array(
-            route
-                .args
-                .iter()
-                .cloned()
-                .map(serde_json::Value::String)
-                .collect(),
-        ),
-    );
-    if let Some(goal) = &route.goal {
-        followup
-            .payload
-            .insert("goal".to_owned(), serde_json::Value::String(goal.clone()));
-    }
-    followup.payload.insert(
-        "last_error".to_owned(),
-        serde_json::Value::String(outcome.summary.clone()),
-    );
-    followup.payload.insert(
-        "last_observations".to_owned(),
-        serde_json::Value::Array(
-            outcome
-                .observations
-                .iter()
-                .take(12)
-                .cloned()
-                .map(serde_json::Value::String)
-                .collect(),
-        ),
-    );
-    followup.notes = "Retry a confirmed tool action without asking the user to retry.".to_owned();
-    let followup_id = followup.id.clone();
-    repository.write_followup(&followup)?;
-    spawn_confirmation_retry_worker(
-        namespace.clone(),
-        followup_id,
-        route.clone(),
-        retry.delay_seconds,
-    );
-    Ok(retry.reply.clone())
-}
-
-fn is_retryable_tool_failure(outcome: &ToolExecutionOutcome) -> bool {
-    let retry = &tool_routing_tags().confirmation_retry;
-    !retry.retryable_failure_hints.is_empty()
-        && retry.retryable_failure_hints.iter().any(|hint| {
-            text_matches_any(&outcome.summary, std::slice::from_ref(hint))
-                || outcome
-                    .observations
-                    .iter()
-                    .any(|observation| text_matches_any(observation, std::slice::from_ref(hint)))
-        })
-}
-
-fn record_tool_flow_failure(
-    flow: &str,
-    user_turn: &str,
-    route: &NaturalLanguageToolRoute,
-    outcome: &ToolExecutionOutcome,
-    namespace: &WorkspaceNamespace,
-    room_id: Option<String>,
+fn reset_chat_history(
+    history: &mut Vec<ChatMessage>,
+    system_message: Option<&str>,
+    memory_options: &ChatMemoryOptions,
+    capture_options: &ChatCaptureOptions,
 ) -> Result<()> {
-    let now = now_unix();
-    let failure_id = format!("routing.failure.{flow}.{now}");
-    let dir = workspace_root()
-        .join(namespace.scoped_prefix())
-        .join("routing")
-        .join("failures");
-    fs::create_dir_all(&dir).with_context(|| {
-        format!(
-            "failed to create routing failure directory {}",
-            dir.display()
-        )
-    })?;
-    let path = dir.join(format!("{failure_id}.md"));
-    let frontmatter = serde_json::json!({
-        "id": failure_id,
-        "type": "routing_flow_failure",
-        "title": format!("Routing Flow Failure {flow}"),
-        "tenant_id": namespace.tenant_id.clone(),
-        "user_id": namespace.user_id.clone(),
-        "room_id": room_id,
-        "flow": flow,
-        "tool_id": route.tool_id.clone(),
-        "fallback_tool_ids": route.fallback_tool_ids.clone(),
-        "status": "recorded",
-        "created_at_unix": now,
-        "retryable": is_retryable_tool_failure(outcome),
-    });
-    let content = format!(
-        "---\n{}---\n\n## User Turn\n\n{}\n\n## Route Args\n\n{}\n\n## Outcome\n\n- success: {}\n- summary: {}\n\n## Observations\n\n{}\n",
-        serde_yaml::to_string(&frontmatter)?,
-        user_turn,
-        route.args.join("\n"),
-        outcome.success,
-        outcome.summary,
-        outcome.observations.join("\n")
-    );
-    fs::write(&path, content)
-        .with_context(|| format!("failed to write routing failure {}", path.display()))?;
+    let catalog = load_cli_tool_catalog()?;
+    history.clear();
+    history.push(ChatMessage::new(
+        MessageRole::System,
+        render_tool_chat_system_prompt(
+            &catalog,
+            system_message,
+            &memory_options.namespace,
+            capture_options.room_id.as_deref(),
+        )?,
+    ));
     Ok(())
 }
 
-fn spawn_confirmation_retry_worker(
-    namespace: WorkspaceNamespace,
-    followup_id: String,
-    route: NaturalLanguageToolRoute,
-    delay_seconds: u64,
-) {
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(delay_seconds));
-        let outcome = match execute_routed_tool_outcome(&route) {
-            Ok((_plan, outcome)) => outcome,
-            Err(error) => {
-                mark_confirmation_retry_followup(
-                    &namespace,
-                    &followup_id,
-                    FollowUpStatus::Failed,
-                    format!(
-                        "Confirmation retry failed to execute at {}: {error}",
-                        now_unix()
-                    ),
-                );
-                return;
-            }
-        };
-        if !outcome.success {
-            mark_confirmation_retry_followup(
-                &namespace,
-                &followup_id,
-                FollowUpStatus::Failed,
-                format!(
-                    "Confirmation retry returned failure at {}: {}\n{}",
-                    now_unix(),
-                    outcome.summary,
-                    outcome.observations.join("\n")
-                ),
-            );
-            return;
-        }
-        let reply = render_order_reply(&outcome)
-            .unwrap_or_else(|| render_unrenderable_tool_reply(&outcome));
-        println!("\nassistant> {reply}");
-
-        mark_confirmation_retry_followup(
-            &namespace,
-            &followup_id,
-            FollowUpStatus::Fired,
-            format!("Confirmation retry completed at {}", now_unix()),
-        );
-    });
+fn run_pending_confirmation_node(
+    frame: &mut TurnFrame,
+    _: &ToolCatalog,
+) -> Result<Option<TurnNodeReply>> {
+    let request = chat_request_from_turn_frame(frame);
+    let Some(tool_result) =
+        try_handle_persisted_pending_confirmation(&ServiceConfig::new(workspace_root()), &request)?
+    else {
+        return Ok(None);
+    };
+    frame.set_tool_execution_context(format!(
+        "Service-layer pending confirmation handled by {}/{}.",
+        tool_result.server_id, tool_result.tool_name
+    ));
+    Ok(Some(TurnNodeReply {
+        reply: Some(tool_result.response.message.content),
+        warning: None,
+        clear_pending_confirmation: true,
+        next_pending_confirmation: None,
+        stop_pipeline: true,
+        reset_system_prompt: false,
+    }))
 }
 
-fn mark_confirmation_retry_followup(
-    namespace: &WorkspaceNamespace,
-    followup_id: &str,
-    status: FollowUpStatus,
-    notes: String,
-) {
-    let repository = ConversationRepository::with_namespace(workspace_root(), namespace.clone());
-    let relative_path = ConversationRepository::followup_relative_path_for(followup_id);
-    if let Ok(mut followup) = repository.read_followup(relative_path) {
-        followup.status = status;
-        followup.notes = notes;
-        let _ = repository.write_followup(&followup);
+fn run_timed_sequence_node(
+    frame: &TurnFrame,
+    history: &[ChatMessage],
+) -> Result<Option<TurnNodeReply>> {
+    let Some(reply) = handle_timed_sequence_turn(
+        &frame.user_turn,
+        history,
+        &frame.runtime.identity.tenant_id,
+        &frame.runtime.identity.user_id,
+        frame.room_id(),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TurnNodeReply {
+        reply: Some(reply),
+        warning: None,
+        clear_pending_confirmation: false,
+        next_pending_confirmation: None,
+        stop_pipeline: true,
+        reset_system_prompt: false,
+    }))
+}
+
+fn run_configured_agent_mcp_node(
+    frame: &mut TurnFrame,
+    _: &ToolCatalog,
+) -> Result<Option<TurnNodeReply>> {
+    let request = chat_request_from_turn_frame(frame);
+    let tool_result = match try_handle_configured_mcp_turn(
+        &ServiceConfig::new(workspace_root()),
+        &request,
+    ) {
+        Ok(Some(tool_result)) => tool_result,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            frame.set_tool_execution_context(format!(
+                "Internal note: configured MCP turn failed before producing a user-presentable result: {}. Continue ordinary intent handling without inventing concrete tool data.",
+                compact_single_line(&error.to_string(), 300)
+            ));
+            return Ok(Some(TurnNodeReply {
+                reply: None,
+                warning: None,
+                clear_pending_confirmation: false,
+                next_pending_confirmation: None,
+                stop_pipeline: false,
+                reset_system_prompt: false,
+            }));
+        }
+    };
+    Ok(Some(TurnNodeReply {
+        reply: Some(tool_result.response.message.content),
+        warning: None,
+        clear_pending_confirmation: false,
+        next_pending_confirmation: None,
+        stop_pipeline: true,
+        reset_system_prompt: false,
+    }))
+}
+
+fn chat_request_from_turn_frame(frame: &TurnFrame) -> ChatRequest {
+    ChatRequest {
+        tenant_id: Some(frame.runtime.identity.tenant_id.clone()),
+        user_id: Some(frame.runtime.identity.user_id.clone()),
+        session_id: Some(frame.runtime.identity.session_id.clone()),
+        input: Some(frame.user_turn.clone()),
+        messages: vec![ApiChatMessage {
+            role: ApiMessageRole::User,
+            content: frame.user_turn.clone(),
+            name: None,
+        }],
+        provider: None,
+        model: None,
+        system_prompt: None,
+        agent_id: frame.selected_agent_id.clone(),
+        domain_id: frame.selected_domain_id.clone(),
+        active_agent_id: frame.selected_agent_id.clone(),
+        active_task_id: None,
+        memory: ApiMemoryQuery {
+            namespace: ApiNamespace {
+                tenant_id: frame.namespace.tenant_id.clone(),
+                user_id: frame.namespace.user_id.clone(),
+            },
+            scope: None,
+            kind: None,
+            tag: None,
+            text: None,
+            limit: None,
+        },
+        temperature: None,
+        max_output_tokens: None,
     }
+}
+
+fn run_llm_tool_router_node(
+    registry: &ProviderRegistry,
+    provider: &str,
+    model: &str,
+    frame: &mut TurnFrame,
+    catalog: &ToolCatalog,
+    system_message: Option<&str>,
+) -> Result<TurnNodeReply> {
+    match route_tool_turn(
+        registry,
+        provider,
+        model,
+        &frame.user_turn,
+        &frame.selection,
+        system_message,
+    ) {
+        Ok(route) if route.action == "create_tool" || route.action == "create_skill" => {
+            match handle_natural_language_tool_create(
+                registry,
+                provider,
+                model,
+                &frame.user_turn,
+                system_message,
+            ) {
+                Ok(true) => Ok(TurnNodeReply {
+                    reply: None,
+                    warning: None,
+                    clear_pending_confirmation: false,
+                    next_pending_confirmation: None,
+                    stop_pipeline: true,
+                    reset_system_prompt: true,
+                }),
+                Ok(false) => Ok(TurnNodeReply {
+                    reply: None,
+                    warning: None,
+                    clear_pending_confirmation: false,
+                    next_pending_confirmation: None,
+                    stop_pipeline: false,
+                    reset_system_prompt: false,
+                }),
+                Err(error) => Ok(TurnNodeReply {
+                    reply: None,
+                    warning: Some(format!("warning> tool builder skipped: {error}")),
+                    clear_pending_confirmation: false,
+                    next_pending_confirmation: None,
+                    stop_pipeline: false,
+                    reset_system_prompt: false,
+                }),
+            }
+        }
+        Ok(mut route) if route.action == "run_tool" => {
+            append_platform_args_to_mcp_route(
+                &mut route,
+                catalog,
+                &frame.namespace,
+                frame.session_id(),
+            );
+            let context = execute_routed_tool(&route)?;
+            apply_tool_route(&mut frame.selection, catalog, route)?;
+            frame.set_tool_execution_context(context);
+            Ok(TurnNodeReply {
+                reply: None,
+                warning: None,
+                clear_pending_confirmation: false,
+                next_pending_confirmation: None,
+                stop_pipeline: false,
+                reset_system_prompt: false,
+            })
+        }
+        Ok(route) => {
+            apply_tool_route(&mut frame.selection, catalog, route)?;
+            Ok(TurnNodeReply {
+                reply: None,
+                warning: None,
+                clear_pending_confirmation: false,
+                next_pending_confirmation: None,
+                stop_pipeline: false,
+                reset_system_prompt: false,
+            })
+        }
+        Err(error) => Ok(TurnNodeReply {
+            reply: None,
+            warning: Some(render_router_warning(&error)),
+            clear_pending_confirmation: false,
+            next_pending_confirmation: None,
+            stop_pipeline: false,
+            reset_system_prompt: false,
+        }),
+    }
+}
+
+fn run_normal_chat_node(
+    registry: &ProviderRegistry,
+    provider: &str,
+    model: &str,
+    history: &[ChatMessage],
+    frame: &TurnFrame,
+) -> Result<NormalChatNodeResult> {
+    let request_history = build_chat_request_history(
+        history,
+        merge_optional_contexts([
+            render_turn_frame_context(frame),
+            render_recalled_memory_context(&frame.recalled_memories),
+            render_tool_selection_context(&frame.selection),
+            frame.tool_execution_context.clone(),
+        ]),
+        &frame.user_turn,
+    );
+    let request = GenerateRequest::new(
+        ModelRef::new(provider.to_owned(), model.to_owned()),
+        request_history,
+    );
+    let response = match registry.generate(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(NormalChatNodeResult::Error {
+                message: render_chat_error(&error),
+            });
+        }
+    };
+    let content = sanitize_model_response(&response.message.content);
+    match try_execute_create_tool_command_from_response(&content) {
+        Ok(Some(path)) => Ok(NormalChatNodeResult::CreatedTool { path }),
+        Ok(None) => Ok(NormalChatNodeResult::AssistantReply {
+            artifact_paths: persist_response_artifacts(&frame.user_turn, &content)?,
+            content,
+        }),
+        Err(error) => Ok(NormalChatNodeResult::InvalidCreateCommand {
+            content,
+            warning: format!("warning> ignored invalid create command from model: {error}"),
+        }),
+    }
+}
+
+fn apply_turn_node_reply_state(
+    node_reply: &TurnNodeReply,
+    pending_confirmation: &mut Option<PendingToolConfirmation>,
+) {
+    if node_reply.clear_pending_confirmation {
+        *pending_confirmation = None;
+    }
+    if let Some(next_pending) = &node_reply.next_pending_confirmation {
+        *pending_confirmation = Some(next_pending.clone());
+    }
+}
+
+fn print_turn_node_warning(node_reply: &TurnNodeReply) {
+    if let Some(warning) = &node_reply.warning {
+        println!("{warning}");
+    }
+}
+
+fn emit_turn_node_reply(
+    frame: &TurnFrame,
+    node_reply: &TurnNodeReply,
+    history: &mut Vec<ChatMessage>,
+    room: Option<&MemoryRoom>,
+) -> Result<bool> {
+    let Some(reply) = &node_reply.reply else {
+        return Ok(false);
+    };
+    if !reply.trim().is_empty() {
+        println!("assistant> {reply}");
+    }
+    history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
+    if !reply.trim().is_empty() {
+        persist_assistant_reply(frame, reply.clone(), history, room)?;
+    }
+    Ok(true)
+}
+
+fn emit_normal_chat_assistant_reply(
+    frame: &TurnFrame,
+    content: String,
+    artifact_paths: Vec<PathBuf>,
+    history: &mut Vec<ChatMessage>,
+    room: Option<&MemoryRoom>,
+) -> Result<()> {
+    if content.trim().is_empty() {
+        println!(
+            "warning> model emitted a provider tool-call marker instead of normal text; ignored it. Please retry."
+        );
+    } else {
+        println!("{content}");
+        for path in artifact_paths {
+            println!("saved> {}", path.display());
+        }
+    }
+    history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
+    persist_assistant_reply(frame, content, history, room)
+}
+
+fn emit_invalid_create_command_reply(
+    frame: &TurnFrame,
+    content: String,
+    warning: String,
+    history: &mut Vec<ChatMessage>,
+) {
+    println!("{content}");
+    println!("{warning}");
+    history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
+    history.push(ChatMessage::new(MessageRole::Assistant, content));
+}
+
+fn persist_assistant_reply(
+    frame: &TurnFrame,
+    reply: String,
+    history: &mut Vec<ChatMessage>,
+    room: Option<&MemoryRoom>,
+) -> Result<()> {
+    history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
+    if let Some(room) = room
+        && let Err(error) = persist_chat_turn_assistant_reply(
+            workspace_root(),
+            frame.workspace_namespace.clone(),
+            room,
+            frame.turn_index,
+            reply,
+        )
+    {
+        println!("warning> chat memory write skipped: {error}");
+    }
+    Ok(())
 }
 
 fn handle_timed_sequence_turn(
     user_turn: &str,
+    history: &[ChatMessage],
     tenant_id: &str,
     user_id: &str,
     room_id: Option<String>,
 ) -> Result<Option<String>> {
-    let Some((rule, values)) = timed_sequence_for_turn(user_turn) else {
+    if let Some(reply) = handle_reminder_turn(user_turn, tenant_id, user_id, room_id.clone())? {
+        return Ok(Some(reply));
+    }
+
+    let Some((rule, values)) = timed_sequence_for_turn_with_history(user_turn, history) else {
         return Ok(None);
     };
     let namespace = WorkspaceNamespace::new(tenant_id.to_owned(), user_id.to_owned());
@@ -2867,6 +2724,145 @@ fn handle_timed_sequence_turn(
     Ok(Some(String::new()))
 }
 
+fn handle_reminder_turn(
+    user_turn: &str,
+    tenant_id: &str,
+    user_id: &str,
+    room_id: Option<String>,
+) -> Result<Option<String>> {
+    let Some((rule, delay_seconds)) = reminder_for_turn(user_turn) else {
+        return Ok(None);
+    };
+    let namespace = WorkspaceNamespace::new(tenant_id.to_owned(), user_id.to_owned());
+    let repository = ConversationRepository::with_namespace(workspace_root(), namespace.clone());
+    let now = now_unix();
+    let reminder_prefix = if rule.id.trim().is_empty() {
+        "reminder"
+    } else {
+        rule.id.trim()
+    };
+    let reminder_id = format!("{reminder_prefix}.{now}");
+    let trigger = rule
+        .trigger
+        .clone()
+        .unwrap_or_else(|| "reminder.due".to_owned());
+    let agent_id = rule
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| "agent.system.reminder".to_owned());
+    let due_reply = rule
+        .due_reply
+        .clone()
+        .unwrap_or_else(|| "到时间了。".to_owned());
+    let mut followup = PendingFollowUp::new(agent_id, trigger, now.saturating_add(delay_seconds));
+    followup.id = reminder_id.clone();
+    followup.room_id = room_id;
+    followup.payload.insert(
+        "draft_message".to_owned(),
+        serde_json::Value::String(due_reply),
+    );
+    followup.payload.insert(
+        "source_turn".to_owned(),
+        serde_json::Value::String(user_turn.to_owned()),
+    );
+    followup.notes = format!("Reminder due in {delay_seconds} seconds.");
+    repository.write_followup(&followup)?;
+    spawn_reminder_worker(namespace, reminder_id, delay_seconds);
+    Ok(Some(
+        rule.scheduled_reply
+            .clone()
+            .unwrap_or_else(|| "好，到时间我会提醒您。".to_owned()),
+    ))
+}
+
+fn reminder_for_turn(user_turn: &str) -> Option<(&'static ReminderRule, u64)> {
+    tool_routing_tags().reminder_rules.iter().find_map(|rule| {
+        if !text_matches_any(user_turn, &rule.hints) {
+            return None;
+        }
+        let delay_seconds = reminder_delay_seconds(user_turn, rule.default_delay_seconds)?;
+        Some((rule, delay_seconds))
+    })
+}
+
+fn reminder_delay_seconds(text: &str, default_delay_seconds: u64) -> Option<u64> {
+    let numbers = extract_i64_numbers(text);
+    let value = numbers
+        .first()
+        .copied()
+        .filter(|value| *value > 0)
+        .map(|value| value as u64);
+    let unit_seconds = if contains_any(text, &["\u{6beb}\u{79d2}", "ms"]) {
+        0
+    } else if contains_any(
+        text,
+        &["\u{5c0f}\u{65f6}", "\u{949f}\u{5934}", "hour", "hours", "h"],
+    ) {
+        60 * 60
+    } else if contains_any(
+        text,
+        &["\u{5206}\u{949f}", "\u{5206}", "minute", "minutes", "min"],
+    ) {
+        60
+    } else if contains_any(text, &["\u{79d2}", "second", "seconds", "sec", "s"]) {
+        1
+    } else {
+        return Some(default_delay_seconds);
+    };
+    Some(value.unwrap_or(1).saturating_mul(unit_seconds).max(1))
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn spawn_reminder_worker(namespace: WorkspaceNamespace, followup_id: String, delay_seconds: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(delay_seconds));
+        let repository = ConversationRepository::with_namespace(workspace_root(), namespace);
+        let relative_path = ConversationRepository::followup_relative_path_for(&followup_id);
+        let Ok(mut followup) = repository.read_followup(relative_path) else {
+            return;
+        };
+        if followup.status != FollowUpStatus::Pending {
+            return;
+        }
+        if let Some(message) = followup
+            .payload
+            .get("draft_message")
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("\nassistant> {message}");
+        }
+        followup.status = FollowUpStatus::Fired;
+        followup.notes = format!("Reminder fired at {}", now_unix());
+        let _ = repository.write_followup(&followup);
+    });
+}
+
+fn timed_sequence_for_turn_with_history(
+    user_turn: &str,
+    history: &[ChatMessage],
+) -> Option<(&'static TimedSequenceRule, Vec<i64>)> {
+    if let Some(sequence) = timed_sequence_for_turn(user_turn) {
+        return Some(sequence);
+    }
+    let current_matches_timing = tool_routing_tags()
+        .timed_sequence_rules
+        .iter()
+        .any(|rule| text_matches_any(user_turn, &rule.hints));
+    if !current_matches_timing {
+        return None;
+    }
+    let previous_user_turn = history
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())?;
+    timed_sequence_for_turn(&format!("{previous_user_turn} {user_turn}"))
+}
+
 fn timed_sequence_for_turn(user_turn: &str) -> Option<(&'static TimedSequenceRule, Vec<i64>)> {
     tool_routing_tags()
         .timed_sequence_rules
@@ -2877,14 +2873,30 @@ fn timed_sequence_for_turn(user_turn: &str) -> Option<(&'static TimedSequenceRul
             }
             let numbers = extract_i64_numbers(user_turn);
             let start = *numbers.first()?;
-            let end = numbers
-                .get(1)
-                .copied()
-                .or(rule.default_end)
-                .unwrap_or(start);
+            let end = timed_sequence_end(user_turn, start, &numbers, rule);
             let values = build_timed_sequence_values(start, end, rule)?;
             Some((rule, values))
         })
+}
+
+fn timed_sequence_end(
+    user_turn: &str,
+    start: i64,
+    numbers: &[i64],
+    rule: &TimedSequenceRule,
+) -> i64 {
+    if let Some(end) = numbers.get(1).copied() {
+        return end;
+    }
+    if is_count_quantity_turn(user_turn) && rule.direction == "countdown" {
+        return 1;
+    }
+    rule.default_end.unwrap_or(start)
+}
+
+fn is_count_quantity_turn(text: &str) -> bool {
+    (text.contains("个数") || text.contains("个数字") || text.contains("个"))
+        && !text.contains("到")
 }
 
 fn build_timed_sequence_values(start: i64, end: i64, rule: &TimedSequenceRule) -> Option<Vec<i64>> {
@@ -2920,23 +2932,110 @@ fn build_timed_sequence_values(start: i64, end: i64, rule: &TimedSequenceRule) -
 
 fn extract_i64_numbers(text: &str) -> Vec<i64> {
     let mut numbers = Vec::new();
-    let mut current = String::new();
+    let mut ascii = String::new();
+    let mut chinese = String::new();
     for ch in text.chars() {
-        if ch.is_ascii_digit() || (ch == '-' && current.is_empty()) {
-            current.push(ch);
-        } else if !current.is_empty() {
-            if let Ok(value) = current.parse::<i64>() {
-                numbers.push(value);
-            }
-            current.clear();
+        if ch.is_ascii_digit() || (ch == '-' && ascii.is_empty() && chinese.is_empty()) {
+            flush_chinese_number(&mut chinese, &mut numbers);
+            ascii.push(ch);
+        } else if is_chinese_number_char(ch) {
+            flush_ascii_number(&mut ascii, &mut numbers);
+            chinese.push(ch);
+        } else {
+            flush_ascii_number(&mut ascii, &mut numbers);
+            flush_chinese_number(&mut chinese, &mut numbers);
         }
     }
-    if !current.is_empty()
-        && let Ok(value) = current.parse::<i64>()
-    {
-        numbers.push(value);
-    }
+    flush_ascii_number(&mut ascii, &mut numbers);
+    flush_chinese_number(&mut chinese, &mut numbers);
     numbers
+}
+
+fn flush_ascii_number(current: &mut String, numbers: &mut Vec<i64>) {
+    if !current.is_empty() {
+        if let Ok(value) = current.parse::<i64>() {
+            numbers.push(value);
+        }
+        current.clear();
+    }
+}
+
+fn flush_chinese_number(current: &mut String, numbers: &mut Vec<i64>) {
+    if !current.is_empty() {
+        if let Some(value) = parse_chinese_i64(current) {
+            numbers.push(value);
+        }
+        current.clear();
+    }
+}
+
+fn is_chinese_number_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '零' | '〇'
+            | '一'
+            | '二'
+            | '两'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+    )
+}
+
+fn chinese_digit_value(ch: char) -> Option<i64> {
+    match ch {
+        '零' | '〇' => Some(0),
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn parse_chinese_i64(text: &str) -> Option<i64> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0i64;
+    let mut current = 0i64;
+    let mut saw_unit = false;
+    for ch in text.chars() {
+        match ch {
+            '十' => {
+                total += current.max(1) * 10;
+                current = 0;
+                saw_unit = true;
+            }
+            '百' => {
+                total += current.max(1) * 100;
+                current = 0;
+                saw_unit = true;
+            }
+            '千' => {
+                total += current.max(1) * 1000;
+                current = 0;
+                saw_unit = true;
+            }
+            other => {
+                current = chinese_digit_value(other)?;
+            }
+        }
+    }
+    let value = if saw_unit { total + current } else { current };
+    Some(value)
 }
 
 fn deliver_timed_sequence_followups(
@@ -2978,69 +3077,6 @@ fn deliver_timed_sequence_followups(
         }
     }
     Ok(())
-}
-
-fn is_confirmation_turn(user_turn: &str) -> bool {
-    text_matches_any(user_turn, &tool_routing_tags().confirmation_hints)
-}
-
-fn pending_order_args(
-    pending: &PendingToolConfirmation,
-    item: &serde_json::Value,
-    user_turn: &str,
-    namespace: &MemoryNamespace,
-    session_id: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![format!("query={}", user_turn.trim())];
-    args.extend(platform_mcp_runtime_run_args(namespace, session_id));
-    if let Some(server_id) = pending_tool_server_id(&pending.tool_id)
-        && let Ok(server) = mcp_server_repository().get_server(&server_id)
-    {
-        args.extend(mcp_server_default_run_args(&server));
-    }
-    args.extend(
-        pending
-            .flow
-            .target_args
-            .iter()
-            .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value))),
-    );
-    for mapping in &pending.flow.item_arg_mappings {
-        if let Some(value) = value_for_keys(item, &mapping.keys)
-            && let Some(rendered) = render_item_arg_mapping(value, mapping)
-        {
-            args.push(format!("{}={rendered}", mapping.arg));
-        }
-    }
-    args
-}
-
-fn pending_tool_server_id(tool_id: &str) -> Option<String> {
-    load_cli_tool_catalog().ok().and_then(|catalog| {
-        catalog
-            .list()
-            .into_iter()
-            .find(|tool| tool.id == tool_id)
-            .and_then(|tool| tool.default_command.get(1).cloned())
-    })
-}
-
-fn mcp_default_run_args(tool: &ToolSpec) -> Vec<String> {
-    let Some(server_id) = tool.default_command.get(1) else {
-        return Vec::new();
-    };
-    let Ok(server) = mcp_server_repository().get_server(server_id) else {
-        return Vec::new();
-    };
-    mcp_server_default_run_args(&server)
-}
-
-fn mcp_server_default_run_args(server: &McpServerSpec) -> Vec<String> {
-    server
-        .default_args
-        .iter()
-        .map(|(key, value)| format!("{key}={}", jsonish_arg_value(value)))
-        .collect()
 }
 
 fn platform_mcp_runtime_run_args(
@@ -3120,249 +3156,48 @@ fn load_runtime_variables(identity: RuntimeIdentity) -> RuntimeVariables {
         .unwrap_or_else(|_| RuntimeVariables::new(identity))
 }
 
-fn jsonish_arg_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(value) => value.clone(),
-        other => other.to_string(),
+fn cli_api_namespace(namespace: &MemoryNamespace) -> ApiNamespace {
+    ApiNamespace {
+        tenant_id: namespace.tenant_id.clone(),
+        user_id: namespace.user_id.clone(),
     }
 }
 
-fn pending_confirmation_from_outcome(
-    outcome: &ToolExecutionOutcome,
-    catalog: &ToolCatalog,
-) -> Option<PendingToolConfirmation> {
-    let flow = tool_routing_tags()
-        .confirmation_flows
-        .iter()
-        .find(|flow| outcome_matches_selectors(outcome, &flow.source_selectors))?;
-    let order_tool = catalog
-        .list()
-        .into_iter()
-        .find(|tool| tool_matches_all_selectors(tool, &flow.target_selectors))?;
-    let fallback_tool_ids = confirmation_fallback_tool_ids(catalog, flow, &order_tool.id);
-    let value = extract_tool_json_from_observations(&outcome.observations)?;
-    let items = extract_items_for_paths(&value, &flow.item_paths)
-        .into_iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>();
-    if items.is_empty() {
-        return None;
-    }
-    Some(PendingToolConfirmation {
-        tool_id: order_tool.id.clone(),
-        fallback_tool_ids,
-        items,
-        flow: flow.clone(),
-    })
+fn cli_session_id(namespace: &MemoryNamespace, session_id: Option<&str>) -> String {
+    runtime_variables_for_namespace(namespace, session_id)
+        .identity
+        .session_id
 }
 
-fn confirmation_fallback_tool_ids(
-    catalog: &ToolCatalog,
-    flow: &ToolConfirmationFlowRule,
-    primary_tool_id: &str,
-) -> Vec<String> {
-    let mut ids = Vec::new();
-    for selectors in &flow.fallback_target_selectors {
-        if selectors.is_empty() {
-            continue;
-        }
-        if let Some(tool) = catalog
-            .list()
-            .into_iter()
-            .find(|tool| tool_matches_all_selectors(tool, selectors))
-            && tool.id != primary_tool_id
-            && !ids.iter().any(|id| id == &tool.id)
-        {
-            ids.push(tool.id.clone());
-        }
-    }
-    ids
+fn load_cli_pending_confirmation(
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
+) -> Result<Option<PendingToolConfirmation>> {
+    let api_namespace = cli_api_namespace(namespace);
+    let session_id = cli_session_id(namespace, session_id);
+    let state = load_tool_turn_session_state(
+        &ServiceConfig::new(workspace_root()),
+        &api_namespace,
+        &session_id,
+    )?;
+    Ok(state.pending_confirmation)
 }
 
-fn fetch_tool_context(rule: &ToolContextCallRule) -> Option<String> {
-    let repository = mcp_server_repository();
-    let server = repository.get_server(&rule.server_id).ok()?;
-    if !server.enabled {
-        return None;
-    }
-    let mut context = serde_json::Map::new();
-    for tool_name in &rule.tool_names {
-        if let Ok(value) = call_mcp_tool(
-            &server,
-            tool_name,
-            serde_json::Value::Object(server.default_args.clone().into_iter().collect()),
-        ) {
-            context.insert(tool_name.to_owned(), value);
-        }
-    }
-    if context.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(context).to_string())
-    }
-}
-
-fn outcome_matches_selectors(outcome: &ToolExecutionOutcome, selectors: &[String]) -> bool {
-    selectors.iter().any(|selector| {
-        text_contains_selector(&outcome.tool_id, selector)
-            || outcome
-                .command
-                .iter()
-                .any(|part| text_contains_selector(part, selector))
-    })
-}
-
-fn render_item_arg_mapping(
-    value: &serde_json::Value,
-    mapping: &ToolItemArgMapping,
-) -> Option<String> {
-    match mapping.format.as_deref() {
-        Some("single_menu_item") => value
-            .as_i64()
-            .map(|menu_id| serde_json::json!([{ "menu_id": menu_id, "quantity": 1 }]).to_string()),
-        _ => Some(jsonish_arg_value(value)),
-    }
-}
-
-fn select_agent_by_configured_hints(user_turn: &str) -> Result<Option<AgentProfile>> {
-    let mut scored = agent_repository()
-        .list_profiles()?
-        .into_iter()
-        .map(|agent| {
-            let score = route_phrase_score(user_turn, &agent.intent_hints, 50)
-                + route_phrase_score(user_turn, &agent.routing_examples, 45)
-                - route_phrase_score(user_turn, &agent.negative_routing_examples, 60)
-                + if best_routing_phrase_match_score(user_turn, &agent.routing_examples) > 0 {
-                    agent.priority / 10
-                } else {
-                    0
-                };
-            (agent, score)
-        })
-        .filter(|(_, score)| *score > 0)
-        .collect::<Vec<_>>();
-    scored.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.0.priority.cmp(&left.0.priority))
-            .then_with(|| left.0.id.cmp(&right.0.id))
-    });
-    Ok(scored.into_iter().next().map(|(agent, _)| agent))
-}
-
-fn select_mcp_tool_for_agent(
-    agent: &AgentProfile,
-    user_turn: &str,
-    catalog: &ToolCatalog,
-) -> Option<ToolSpec> {
-    let mut scored = catalog
-        .list()
-        .into_iter()
-        .filter(|tool| {
-            is_mcp_tool_command(&tool.default_command)
-                && tool.default_command.get(1).is_some_and(|server_id| {
-                    agent
-                        .tool_refs
-                        .iter()
-                        .any(|tool_ref| normalize_mcp_server_id(tool_ref) == *server_id)
-                })
-        })
-        .map(|tool| (tool.clone(), score_tool_for_goal(tool, user_turn)))
-        .collect::<Vec<_>>();
-    scored.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| {
-                tool_query_preference(&right.0, user_turn)
-                    .cmp(&tool_query_preference(&left.0, user_turn))
-            })
-            .then_with(|| left.0.id.cmp(&right.0.id))
-    });
-    scored
-        .into_iter()
-        .find(|(tool, score)| *score > 0 || tool_query_preference(tool, user_turn) > 0)
-        .map(|(tool, _)| tool)
-}
-
-fn catalog_with_agent_mcp_tools(
-    catalog: &ToolCatalog,
-    agent: &AgentProfile,
-) -> Result<ToolCatalog> {
-    let mut scoped = ToolCatalog::new();
-    for tool in catalog.list() {
-        scoped.register(tool.clone());
-    }
-    let repository = mcp_server_repository();
-    for server_id in &agent.tool_refs {
-        let normalized = normalize_mcp_server_id(server_id);
-        if let Ok(cache) = repository.read_tool_cache(&normalized) {
-            scoped.register_many(cache.tools);
-            continue;
-        }
-        let server = repository.get_server(&normalized)?;
-        if !server.enabled {
-            continue;
-        }
-        let cache = repository.refresh_tool_cache(&server)?;
-        scoped.register_many(cache.tools);
-    }
-    Ok(scoped)
-}
-
-fn select_configured_mcp_tool(selection: &ToolSelection, user_turn: &str) -> Option<ToolSpec> {
-    let selected = selection
-        .selected
-        .as_ref()
-        .filter(|tool| is_mcp_tool_command(&tool.default_command))?;
-    if tool_intent_preference(selected, user_turn) <= 0 {
-        return None;
-    }
-    let top_score = selection
-        .candidates
-        .iter()
-        .find(|candidate| candidate.tool.id == selected.id)
-        .map(|candidate| candidate.score)?;
-    let tied_servers = selection
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.score == top_score && top_score > 0)
-        .filter_map(|candidate| candidate.tool.default_command.get(1))
-        .collect::<std::collections::BTreeSet<_>>();
-    if tied_servers.len() > 1 {
-        return None;
-    }
-    Some(selected.clone())
-}
-
-fn tool_query_preference(tool: &ToolSpec, user_turn: &str) -> i32 {
-    let mut score = 0;
-    score += tool_intent_preference(tool, user_turn);
-    for rule in &tool_routing_tags().tool_weights {
-        if tool_matches_any_selector(tool, &rule.selectors) {
-            score += rule.weight;
-        }
-    }
-    score
-}
-
-fn tool_intent_preference(tool: &ToolSpec, user_turn: &str) -> i32 {
-    let mut score = 0;
-    let routing_tags = tool_routing_tags();
-    for rule in &routing_tags.intent_rules {
-        let intent_score = best_routing_phrase_match_score(user_turn, &rule.hints)
-            .max(best_routing_phrase_match_score(user_turn, &rule.examples));
-        let negative_score = best_routing_phrase_match_score(user_turn, &rule.negative_examples);
-        if intent_score > 0 && tool_matches_any_selector(tool, &rule.preferred_selectors) {
-            score += rule.weight * intent_score / 100;
-        }
-        if negative_score > 0 && tool_matches_any_selector(tool, &rule.preferred_selectors) {
-            score -= rule.weight.abs() * negative_score / 100;
-        }
-    }
-    score
+fn save_cli_pending_confirmation(
+    namespace: &MemoryNamespace,
+    session_id: Option<&str>,
+    pending_confirmation: &Option<PendingToolConfirmation>,
+) -> Result<()> {
+    let api_namespace = cli_api_namespace(namespace);
+    let session_id = cli_session_id(namespace, session_id);
+    save_tool_turn_session_state(
+        &ServiceConfig::new(workspace_root()),
+        &api_namespace,
+        &session_id,
+        &ToolTurnSessionState {
+            pending_confirmation: pending_confirmation.clone(),
+        },
+    )
 }
 
 fn tool_routing_tags() -> &'static ToolRoutingTags {
@@ -3419,36 +3254,6 @@ fn text_matches_any(text: &str, selectors: &[String]) -> bool {
         .any(|selector| phrase_match_score(text, selector) > 0)
 }
 
-fn tool_matches_any_selector(tool: &ToolSpec, selectors: &[String]) -> bool {
-    selectors
-        .iter()
-        .any(|selector| tool_matches_selector(tool, selector))
-}
-
-fn tool_matches_all_selectors(tool: &ToolSpec, selectors: &[String]) -> bool {
-    !selectors.is_empty()
-        && selectors
-            .iter()
-            .all(|selector| tool_matches_selector(tool, selector))
-}
-
-fn tool_matches_selector(tool: &ToolSpec, selector: &str) -> bool {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return false;
-    }
-    tool.tags
-        .iter()
-        .any(|tag| text_contains_selector(tag, selector))
-        || text_contains_selector(&tool.id, selector)
-        || text_contains_selector(&tool.name, selector)
-        || text_contains_selector(&tool.description, selector)
-        || tool
-            .default_command
-            .iter()
-            .any(|part| text_contains_selector(part, selector))
-}
-
 fn text_contains_selector(text: &str, selector: &str) -> bool {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -3458,26 +3263,6 @@ fn text_contains_selector(text: &str, selector: &str) -> bool {
         || text
             .to_ascii_lowercase()
             .contains(&selector.to_ascii_lowercase())
-}
-
-fn route_phrase_score(user_turn: &str, phrases: &[String], weight: i32) -> i32 {
-    let score = best_routing_phrase_match_score(user_turn, phrases);
-    if score <= 0 {
-        return 0;
-    }
-    weight * score / 100
-}
-
-fn best_routing_phrase_match_score(user_turn: &str, phrases: &[String]) -> i32 {
-    phrases
-        .iter()
-        .map(|phrase| routing_phrase_match_score(user_turn, phrase))
-        .max()
-        .unwrap_or(0)
-}
-
-fn routing_phrase_match_score(user_turn: &str, phrase: &str) -> i32 {
-    phrase_match_score_with_stop_terms(user_turn, phrase, &tool_routing_tags().routing_stop_terms)
 }
 
 fn execute_builtin_tool(
@@ -3750,124 +3535,6 @@ fn mcp_result_observations(result: &serde_json::Value) -> Vec<String> {
     observations
 }
 
-fn render_grounded_tool_reply(outcome: &ToolExecutionOutcome) -> Option<String> {
-    let renderer = renderer_for_outcome(outcome, Some("ranked_items"))?;
-    let value = extract_tool_json_from_observations(&outcome.observations)?;
-    let items = extract_ranked_items(&value, Some(renderer));
-    if items.is_empty() {
-        return None;
-    }
-
-    let mut lines = vec![if outcome_has_configured_context(outcome, renderer) {
-        renderer
-            .header_with_context
-            .as_deref()
-            .or(renderer.header.as_deref())
-            .unwrap_or("I found these available options:")
-            .to_owned()
-    } else {
-        renderer
-            .header
-            .as_deref()
-            .unwrap_or("I found these available options:")
-            .to_owned()
-    }];
-    let mut items = items.into_iter().take(3);
-    if let Some(primary) = items.next() {
-        if let Some(heading) = &renderer.primary_heading {
-            lines.push(heading.clone());
-        }
-        lines.extend(render_configured_primary_item(primary, renderer));
-    }
-    let alternatives = items.collect::<Vec<_>>();
-    if !alternatives.is_empty() {
-        if let Some(heading) = &renderer.alternatives_heading {
-            lines.push(heading.clone());
-        }
-        for (index, item) in alternatives.into_iter().enumerate() {
-            lines.push(render_configured_alternative_item(
-                index + 2,
-                item,
-                renderer,
-            ));
-        }
-    }
-    if let Some(prompt) = &renderer.confirmation_prompt {
-        lines.push(prompt.clone());
-    }
-    Some(lines.join("\n"))
-}
-
-fn render_configured_primary_item(
-    item: &serde_json::Value,
-    renderer: &ToolResponseRenderer,
-) -> Vec<String> {
-    let mut lines = vec![format!("1. {}", configured_item_name(item, renderer))];
-    for field in &renderer.primary_fields {
-        if let Some(value) = render_configured_field(item, field) {
-            lines.push(format!("   {}: {}", field.label, value));
-        }
-    }
-    if let Some(reason) = configured_item_reason(item, renderer) {
-        lines.push(format!("   Reason: {reason}"));
-    }
-    lines
-}
-
-fn render_configured_alternative_item(
-    index: usize,
-    item: &serde_json::Value,
-    renderer: &ToolResponseRenderer,
-) -> String {
-    let details = renderer
-        .alternative_fields
-        .iter()
-        .filter_map(|field| render_configured_field(item, field))
-        .collect::<Vec<_>>();
-    let suffix = if details.is_empty() {
-        String::new()
-    } else {
-        format!(" - {}", details.join("; "))
-    };
-    format!("{index}. {}{suffix}", configured_item_name(item, renderer))
-}
-
-fn configured_item_name(item: &serde_json::Value, renderer: &ToolResponseRenderer) -> String {
-    value_for_keys(item, &renderer.name_keys)
-        .and_then(display_json_value)
-        .unwrap_or_else(|| "Unnamed".to_owned())
-}
-
-fn configured_item_reason(
-    item: &serde_json::Value,
-    renderer: &ToolResponseRenderer,
-) -> Option<String> {
-    for key in &renderer.reason_array_keys {
-        if let Some(values) = value_for_key(item, key).and_then(serde_json::Value::as_array) {
-            let rendered = values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|value| is_user_readable_text(value))
-                .take(2)
-                .map(|value| compact_single_line(value, 80))
-                .collect::<Vec<_>>()
-                .join("; ");
-            if !rendered.trim().is_empty() {
-                return Some(rendered);
-            }
-        }
-    }
-    for key in &renderer.reason_keys {
-        if let Some(value) = value_for_key(item, key).and_then(serde_json::Value::as_str) {
-            let value = compact_single_line(value, 110);
-            if !value.trim().is_empty() && is_user_readable_text(&value) {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
 fn render_unrenderable_tool_reply(outcome: &ToolExecutionOutcome) -> String {
     renderer_for_outcome(outcome, None)
         .and_then(|renderer| renderer.empty_reply.clone())
@@ -3881,57 +3548,6 @@ fn render_tool_failure_reply(outcome: &ToolExecutionOutcome) -> String {
     renderer_for_outcome(outcome, None)
         .and_then(|renderer| renderer.failure_reply.clone())
         .unwrap_or_else(|| "I did not get a usable result, so I will not invent one.".to_owned())
-}
-
-fn render_order_reply(outcome: &ToolExecutionOutcome) -> Option<String> {
-    let renderer = renderer_for_outcome(outcome, Some("order"))?;
-    let value = extract_tool_json_from_observations(&outcome.observations)?;
-    let mut lines = vec![
-        renderer
-            .order_success
-            .as_deref()
-            .unwrap_or("The order has been submitted.")
-            .to_owned(),
-    ];
-    for field in &renderer.primary_fields {
-        if let Some(value) = render_configured_field(&value, field) {
-            lines.push(format!("{}: {}", field.label, value));
-        }
-    }
-    Some(lines.join("\n"))
-}
-
-fn extract_ranked_items<'a>(
-    value: &'a serde_json::Value,
-    renderer: Option<&ToolResponseRenderer>,
-) -> Vec<&'a serde_json::Value> {
-    if let Some(array) = value.as_array() {
-        return array.iter().filter(|item| item.is_object()).collect();
-    }
-    let Some(renderer) = renderer else {
-        return Vec::new();
-    };
-    for key in &renderer.item_paths {
-        if let Some(array) = value_for_key(value, key).and_then(serde_json::Value::as_array) {
-            return array.iter().filter(|item| item.is_object()).collect();
-        }
-    }
-    Vec::new()
-}
-
-fn extract_items_for_paths<'a>(
-    value: &'a serde_json::Value,
-    paths: &[String],
-) -> Vec<&'a serde_json::Value> {
-    if let Some(array) = value.as_array() {
-        return array.iter().filter(|item| item.is_object()).collect();
-    }
-    for path in paths {
-        if let Some(array) = value_for_key(value, path).and_then(serde_json::Value::as_array) {
-            return array.iter().filter(|item| item.is_object()).collect();
-        }
-    }
-    Vec::new()
 }
 
 fn renderer_for_outcome<'a>(
@@ -3960,80 +3576,6 @@ fn renderer_matches_outcome(
                 .iter()
                 .any(|part| text_contains_selector(part, selector))
     })
-}
-
-fn outcome_has_configured_context(
-    outcome: &ToolExecutionOutcome,
-    renderer: &ToolResponseRenderer,
-) -> bool {
-    let Some(context_arg) = renderer.context_arg.as_deref() else {
-        return false;
-    };
-    outcome
-        .command
-        .iter()
-        .any(|part| part.trim_start().starts_with(&format!("{context_arg}=")))
-}
-
-fn render_configured_field(item: &serde_json::Value, field: &ToolResponseField) -> Option<String> {
-    let value = value_for_keys(item, &field.keys)?;
-    let rendered = match field.format.as_deref() {
-        Some("cents_cny") => value
-            .as_i64()
-            .map(|cents| format!("约 {:.2} 元", cents as f64 / 100.0))
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .map(|cents| format!("约 {:.2} 元", cents / 100.0))
-            }),
-        Some("yuan_cny") => value
-            .as_f64()
-            .map(|yuan| format!("约 {:.2} 元", yuan))
-            .or_else(|| value.as_i64().map(|yuan| format!("约 {:.2} 元", yuan))),
-        Some("status_label") => value.as_str().map(|status| {
-            tool_response_rendering()
-                .renderers
-                .iter()
-                .find_map(|renderer| renderer.status_labels.get(status).cloned())
-                .unwrap_or_else(|| status.to_owned())
-        }),
-        _ => display_json_value(value),
-    }?;
-    Some(compact_single_line(&rendered, field.max_len.unwrap_or(120)))
-}
-
-fn value_for_keys<'a>(
-    value: &'a serde_json::Value,
-    keys: &[String],
-) -> Option<&'a serde_json::Value> {
-    keys.iter().find_map(|key| value_for_key(value, key))
-}
-
-fn value_for_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    let key = key.trim();
-    if key.is_empty() {
-        return None;
-    }
-    if key == "." {
-        return Some(value);
-    }
-    if key.starts_with('/') {
-        return value.pointer(key);
-    }
-    let mut current = value;
-    for segment in key.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(current)
-}
-
-fn display_json_value(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
-        serde_json::Value::Number(value) => Some(value.to_string()),
-        serde_json::Value::Bool(value) => Some(value.to_string()),
-        _ => None,
-    }
 }
 
 #[allow(dead_code)]
@@ -5072,10 +4614,6 @@ fn mcp_server_repository() -> McpServerRepository {
     McpServerRepository::with_namespace(workspace_root(), runtime_namespace())
 }
 
-fn agent_repository() -> AgentRepository {
-    AgentRepository::with_namespace(workspace_root(), runtime_namespace())
-}
-
 fn skill_repository() -> SkillRepository {
     SkillRepository::with_namespace(workspace_root(), runtime_namespace())
 }
@@ -5635,6 +5173,24 @@ fn render_tool_selection_context(selection: &ToolSelection) -> Option<String> {
     }
 
     Some(sections.join("\n\n"))
+}
+
+fn render_turn_frame_context(frame: &TurnFrame) -> Option<String> {
+    let mut lines = vec![
+        "Internal turn frame. Use this as orchestration context; do not reveal ids or runtime fields to the user:"
+            .to_owned(),
+        format!("tenant_id: {}", frame.runtime.identity.tenant_id),
+        format!("user_id: {}", frame.runtime.identity.user_id),
+        format!("session_id: {}", frame.runtime.identity.session_id),
+        format!("selection_input: {}", frame.selection_input),
+    ];
+    if let Some(agent_id) = &frame.selected_agent_id {
+        lines.push(format!("selected_agent_id: {agent_id}"));
+    }
+    if let Some(domain_id) = &frame.selected_domain_id {
+        lines.push(format!("selected_domain_id: {domain_id}"));
+    }
+    Some(lines.join("\n"))
 }
 
 fn render_tool_context(tool: &ToolSpec) -> String {

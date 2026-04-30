@@ -491,6 +491,43 @@ impl McpServerRepository {
         Ok(stored.frontmatter.into_cache())
     }
 
+    pub fn quarantine_tool_cache(&self, server_id: &str, reason: &str) -> Result<Option<PathBuf>> {
+        let source_relative = Self::cache_relative_path_for(server_id);
+        let source = self
+            .store
+            .resolve_in_namespace(&self.namespace, &source_relative);
+        if !source.exists() {
+            return Ok(None);
+        }
+        let target_relative = PathBuf::from("mcp").join("cache").join("bad").join(format!(
+            "{}.{}.broken.md",
+            normalize_mcp_server_id(server_id),
+            current_unix_timestamp()
+        ));
+        let target = self
+            .store
+            .resolve_in_namespace(&self.namespace, &target_relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create MCP bad cache directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::rename(&source, &target).with_context(|| {
+            format!(
+                "failed to quarantine MCP tool cache {} to {} after {reason}",
+                source.display(),
+                target.display()
+            )
+        })?;
+        let _ = self
+            .store
+            .rebuild_markdown_index_in_namespace(&self.namespace);
+        Ok(Some(target_relative))
+    }
+
     pub fn write_tool_cache(&self, server_id: &str, tools: Vec<ToolSpec>) -> Result<PathBuf> {
         let cache = McpToolCache {
             server_id: normalize_mcp_server_id(server_id),
@@ -1232,6 +1269,19 @@ fn resolve_mcp_sse_endpoint(base_url: &str, endpoint: &str) -> Result<String> {
         return Ok(endpoint.to_owned());
     }
     let base = reqwest::Url::parse(base_url).context("invalid mcp sse url")?;
+    if endpoint.starts_with('/') {
+        let origin = format!(
+            "{}://{}",
+            base.scheme(),
+            base.host_str().unwrap_or_default()
+        );
+        let origin = if let Some(port) = base.port() {
+            format!("{origin}:{port}")
+        } else {
+            origin
+        };
+        return Ok(format!("{origin}{endpoint}"));
+    }
     Ok(base
         .join(endpoint)
         .with_context(|| format!("invalid mcp sse endpoint: {endpoint}"))?

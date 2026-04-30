@@ -5,24 +5,115 @@ use hc_agent::{
 use hc_context::{
     ContextMemoryQuery, ContextRequest, DefaultContextComposer, MemoryKind, MemoryNamespace,
     MemoryScope, PromptPolicy, WorkspaceMemoryRetriever, generate_with_context,
-    load_context_memory_system_prompt, load_context_memory_usage_policy_prompt, memory_kind_label,
-    memory_scope_label,
+    generate_with_context_stream, load_context_memory_system_prompt,
+    load_context_memory_usage_policy_prompt, memory_kind_label, memory_scope_label,
     runtime::{RuntimeIdentity, default_session_id, runtime_identity_prompt},
     workspace_namespace_from_memory_namespace,
 };
 use hc_llm::{
-    ChatMessage, GenerateRequest, MessageRole, ModelRef, default_model_from_env,
-    default_provider_from_env, default_registry_from_env,
+    ChatMessage, GenerateRequest, LlmError, MessageRole, ModelRef, StreamChunk,
+    default_model_from_env, default_provider_from_env, default_registry_from_env,
 };
 use hc_protocol::{
     AgentRouteRequest, ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest,
     ChatResponse, MemoryRef,
 };
 use hc_store::store::WorkspaceNamespace;
+use serde::{Deserialize, Serialize};
 
 use crate::{ServiceConfig, agent::route_agent};
 
 pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Result<ChatResponse> {
+    let prepared = prepare_chat_request(config, request)?;
+    let registry = default_registry_from_env();
+    let retriever =
+        WorkspaceMemoryRetriever::new(&config.workspace_root, prepared.workspace_namespace.clone());
+    let composer = DefaultContextComposer;
+    let response =
+        generate_with_context(&registry, &retriever, &composer, &prepared.context_request)?;
+
+    Ok(chat_response_from_context_response(
+        response,
+        &prepared.request,
+        prepared.agent_context.as_ref(),
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatStreamEvent {
+    Started {
+        tenant_id: String,
+        user_id: String,
+        session_id: String,
+    },
+    Delta {
+        delta: String,
+        finish_reason: Option<String>,
+    },
+    Completed {
+        response: ChatResponse,
+    },
+}
+
+pub fn handle_chat_stream_request(
+    config: &ServiceConfig,
+    request: ChatRequest,
+    on_event: &mut dyn FnMut(ChatStreamEvent) -> Result<()>,
+) -> Result<ChatResponse> {
+    let prepared = prepare_chat_request(config, request)?;
+    on_event(ChatStreamEvent::Started {
+        tenant_id: prepared.request.memory.namespace.tenant_id.clone(),
+        user_id: prepared.request.memory.namespace.user_id.clone(),
+        session_id: prepared.request.session_id.clone().unwrap_or_else(|| {
+            default_session_id(
+                &prepared.request.memory.namespace.tenant_id,
+                &prepared.request.memory.namespace.user_id,
+            )
+        }),
+    })?;
+
+    let registry = default_registry_from_env();
+    let retriever =
+        WorkspaceMemoryRetriever::new(&config.workspace_root, prepared.workspace_namespace.clone());
+    let composer = DefaultContextComposer;
+    let mut stream_chunk = |chunk: StreamChunk| -> std::result::Result<(), LlmError> {
+        on_event(ChatStreamEvent::Delta {
+            delta: chunk.delta,
+            finish_reason: chunk.finish_reason.map(|reason| format!("{reason:?}")),
+        })
+        .map_err(|error| LlmError::ProviderFailure(error.to_string()))
+    };
+    let response = generate_with_context_stream(
+        &registry,
+        &retriever,
+        &composer,
+        &prepared.context_request,
+        &mut stream_chunk,
+    )?;
+    let response = chat_response_from_context_response(
+        response,
+        &prepared.request,
+        prepared.agent_context.as_ref(),
+    );
+    on_event(ChatStreamEvent::Completed {
+        response: response.clone(),
+    })?;
+    Ok(response)
+}
+
+#[derive(Debug, Clone)]
+struct PreparedChatRequest {
+    request: ChatRequest,
+    workspace_namespace: WorkspaceNamespace,
+    agent_context: Option<ResolvedAgentContext>,
+    context_request: ContextRequest,
+}
+
+fn prepare_chat_request(
+    config: &ServiceConfig,
+    request: ChatRequest,
+) -> Result<PreparedChatRequest> {
     let request = normalize_chat_request(request);
     let memory_namespace = memory_namespace_from_api(&request.memory.namespace);
     let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_namespace);
@@ -35,7 +126,7 @@ pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Resu
         request.model.clone().unwrap_or_else(default_model_from_env),
     );
     let messages = request_messages(&request)?;
-    let mut generation = GenerateRequest::new(model.clone(), messages);
+    let mut generation = GenerateRequest::new(model, messages);
     generation.temperature = request.temperature;
     generation.max_output_tokens = request.max_output_tokens;
 
@@ -57,31 +148,35 @@ pub fn handle_chat_request(config: &ServiceConfig, request: ChatRequest) -> Resu
             load_context_memory_usage_policy_prompt(&workspace_namespace)?,
         ));
 
-    let registry = default_registry_from_env();
-    let retriever = WorkspaceMemoryRetriever::new(&config.workspace_root, workspace_namespace);
-    let composer = DefaultContextComposer;
-    let response = generate_with_context(&registry, &retriever, &composer, &context_request)?;
+    Ok(PreparedChatRequest {
+        request,
+        workspace_namespace,
+        agent_context,
+        context_request,
+    })
+}
 
-    Ok(ChatResponse {
+fn chat_response_from_context_response(
+    response: hc_context::ContextResponse,
+    request: &ChatRequest,
+    agent_context: Option<&ResolvedAgentContext>,
+) -> ChatResponse {
+    ChatResponse {
         message: api_message_from_llm(response.response.message),
         model: response.response.model.model,
         provider: response.response.model.provider,
         tenant_id: Some(request.memory.namespace.tenant_id.clone()),
         user_id: Some(request.memory.namespace.user_id.clone()),
         session_id: request.session_id.clone(),
-        selected_agent_id: agent_context
-            .as_ref()
-            .map(|context| context.agent.id.clone()),
-        selected_domain_id: agent_context
-            .as_ref()
-            .and_then(|context| context.agent.domain_id.clone()),
+        selected_agent_id: agent_context.map(|context| context.agent.id.clone()),
+        selected_domain_id: agent_context.and_then(|context| context.agent.domain_id.clone()),
         recalled_memories: response
             .recalled_memories
             .into_iter()
             .map(memory_ref_from_retrieved)
             .collect(),
         synthesized_prompt_asset_count: response.synthesized_prompt_assets.len(),
-    })
+    }
 }
 
 fn normalize_chat_request(mut request: ChatRequest) -> ChatRequest {
