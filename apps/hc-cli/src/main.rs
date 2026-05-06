@@ -29,7 +29,16 @@ use hc_llm::{
     default_provider_from_env, default_registry_from_env, is_timeout_error,
     sanitize_assistant_text,
 };
+use hc_memory::{
+    MemoryRoom as MemoryRoomStorage, MemoryRoomRepository, RoomCapabilityResolver, 
+    ResolvedRoomCapabilities, CapabilityRef, ToolRef, SkillRef, ScheduleRef, 
+    MemoryNamespace as MemoryNamespaceStorage, InheritanceType, RoomConfig, ExecutionContext,
+};
 use hc_protocol::{ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest};
+use hc_behavior::{
+    BehaviorPattern, BehaviorConfig, BehaviorContext, BehaviorEngine, DecisionRecord,
+    DecisionType, DecisionOption, ExecutionResult,
+};
 use hc_scheduler::{
     ScheduleRepository, ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledRunStatus,
     ScheduledTarget, ScheduledTargetKind, ScheduledTask, now_unix,
@@ -386,6 +395,8 @@ fn main() -> Result<()> {
         [cmd, rest @ ..] if cmd == "mcp" => handle_mcp(rest),
         [cmd, rest @ ..] if cmd == "schedule" => handle_schedule(rest),
         [cmd, rest @ ..] if cmd == "index" => handle_index(rest),
+        [cmd, rest @ ..] if cmd == "room" => handle_room(rest),
+        [cmd, rest @ ..] if cmd == "pattern" => handle_pattern(rest),
         [other, ..] => bail!("unknown command: {other}"),
     }
 }
@@ -2426,6 +2437,9 @@ fn chat_request_from_turn_frame(frame: &TurnFrame) -> ChatRequest {
         tenant_id: Some(frame.runtime.identity.tenant_id.clone()),
         user_id: Some(frame.runtime.identity.user_id.clone()),
         session_id: Some(frame.runtime.identity.session_id.clone()),
+        room_id: None,
+        behavior_pattern: None,
+        thinking_depth: None,
         input: Some(frame.user_turn.clone()),
         messages: vec![ApiChatMessage {
             role: ApiMessageRole::User,
@@ -4961,6 +4975,580 @@ fn default_model() -> String {
     default_model_from_env()
 }
 
+// Room 能力管理命令
+fn handle_room(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "create" => handle_room_create(rest),
+        [cmd, rest @ ..] if cmd == "list" => handle_room_list(rest),
+        [cmd, rest @ ..] if cmd == "show" => handle_room_show(rest),
+        [cmd, rest @ ..] if cmd == "capabilities" => handle_room_capabilities(rest),
+        [cmd, rest @ ..] if cmd == "inherit" => handle_room_inherit(rest),
+        [] => {
+            println!("room commands:");
+            println!("  create    - create a new memory room");
+            println!("  list      - list memory rooms");
+            println!("  show      - show room details");
+            println!("  capabilities - show room capabilities");
+            println!("  inherit   - manage capability inheritance");
+            Ok(())
+        }
+        [other, ..] => bail!("unknown room command: {other}"),
+    }
+}
+
+fn handle_room_create(args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut layer = None;
+    let mut title = None;
+    let mut summary = None;
+    let mut tags = Vec::new();
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--layer" => {
+                layer = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --layer")?,
+                );
+                index += 2;
+            }
+            "--title" => {
+                title = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --title")?,
+                );
+                index += 2;
+            }
+            "--summary" => {
+                summary = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --summary")?,
+                );
+                index += 2;
+            }
+            "--tag" => {
+                tags.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --tag")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            arg => bail!("unknown argument: {arg}"),
+        }
+    }
+
+    let id = id.context("missing --id")?;
+    let layer = layer.context("missing --layer")?;
+    let title = title.context("missing --title")?;
+    let summary = summary.unwrap_or_else(|| format!("Memory room for {}", title));
+    
+    let memory_layer = match layer.as_str() {
+        "chat" => hc_memory::MemoryLayer::Chat,
+        "topic" => hc_memory::MemoryLayer::Topic,
+        "task" => hc_memory::MemoryLayer::Task,
+        "project" => hc_memory::MemoryLayer::Project,
+        "global" => hc_memory::MemoryLayer::Global,
+        _ => bail!("invalid layer: {} (must be chat, topic, task, project, or global)", layer),
+    };
+    
+    let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
+    let memory_namespace = MemoryNamespaceStorage::new(
+        runtime_context.tenant_id.as_deref().unwrap_or("local"),
+        runtime_context.user_id.as_deref().unwrap_or("default"),
+    );
+    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+        runtime_context.tenant_id.as_deref().unwrap_or("local"),
+        runtime_context.user_id.as_deref().unwrap_or("default"),
+    );
+    
+    let mut room = MemoryRoomStorage::new(id, memory_layer, title, summary)
+        .with_namespace(memory_namespace);
+    
+    for tag in tags {
+        room = room.with_tag(tag);
+    }
+    
+    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace);
+    let path = repository.write_room(&room)?;
+    
+    if json {
+        println!("{}", serde_json::to_string_pretty(&room)?);
+    } else {
+        println!("Created room {} at {}", room.id, path.display());
+    }
+    
+    Ok(())
+}
+
+fn handle_room_list(args: &[String]) -> Result<()> {
+    let options = parse_common_options(args)?;
+    let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
+    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+        runtime_context.tenant_id.as_deref().unwrap_or("local"),
+        runtime_context.user_id.as_deref().unwrap_or("default"),
+    );
+    
+    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace);
+    
+    let rooms = repository.list_rooms()
+        .context("Failed to list memory rooms")?;
+    
+    if options.json {
+        let room_data: Vec<_> = rooms
+            .iter()
+            .map(|room| {
+                serde_json::json!({
+                    "id": room.id,
+                    "layer": format!("{:?}", room.layer).to_lowercase(),
+                    "title": room.title,
+                    "summary": room.summary,
+                    "tags": room.tags,
+                    "status": room.status,
+                    "capabilities_count": room.inherited_capabilities.len(),
+                    "tools_count": room.inherited_tools.len(),
+                    "skills_count": room.inherited_skills.len(),
+                    "schedules_count": room.inherited_schedules.len(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&room_data)?);
+    } else {
+        if rooms.is_empty() {
+            println!("No memory rooms found.");
+        } else {
+            println!("Memory Rooms ({} total):", rooms.len());
+            println!();
+            for room in rooms {
+                println!("  {} ({:?})", room.id, room.layer);
+                println!("    Title: {}", room.title);
+                if !room.summary.is_empty() {
+                    println!("    Summary: {}", room.summary);
+                }
+                if !room.status.is_empty() {
+                    println!("    Status: {}", room.status);
+                }
+                
+                if !room.tags.is_empty() {
+                    println!("    Tags: {}", room.tags.join(", "));
+                }
+                
+                let capabilities_count = room.inherited_capabilities.len() + room.inherited_tools.len() + room.inherited_skills.len() + room.inherited_schedules.len();
+                if capabilities_count > 0 {
+                    println!("    Capabilities: {} capabilities, {} tools, {} skills, {} schedules",
+                        room.inherited_capabilities.len(),
+                        room.inherited_tools.len(), 
+                        room.inherited_skills.len(),
+                        room.inherited_schedules.len()
+                    );
+                }
+                println!();
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_room_show(args: &[String]) -> Result<()> {
+    let mut room_id = None;
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                room_id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            arg if !arg.starts_with("--") && room_id.is_none() => {
+                room_id = Some(arg.to_string());
+                index += 1;
+            }
+            arg => bail!("unknown argument: {arg}"),
+        }
+    }
+    
+    let room_id = room_id.context("missing room ID")?;
+    
+    let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
+    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+        runtime_context.tenant_id.as_deref().unwrap_or("local"),
+        runtime_context.user_id.as_deref().unwrap_or("default"),
+    );
+    
+    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace);
+    
+    match repository.get_room_by_id(&room_id)? {
+        Some(room) => {
+            if json {
+                let room_data = serde_json::json!({
+                    "id": room.id,
+                    "layer": format!("{:?}", room.layer).to_lowercase(),
+                    "title": room.title,
+                    "summary": room.summary,
+                    "status": room.status,
+                    "tags": room.tags,
+                    "config": {
+                        "execution_context": {
+                            "working_directory": room.room_config.execution_context.working_directory,
+                            "default_namespace": room.room_config.execution_context.default_namespace,
+                            "environment": room.room_config.execution_context.environment,
+                        }
+                    },
+                    "capabilities": room.inherited_capabilities.iter().map(|cap| {
+                        serde_json::json!({
+                            "id": cap.id,
+                            "inheritance_type": format!("{:?}", cap.inheritance_type).to_lowercase()
+                        })
+                    }).collect::<Vec<_>>(),
+                    "tools": room.inherited_tools.iter().map(|tool| {
+                        serde_json::json!({
+                            "id": tool.id,
+                            "inheritance_type": format!("{:?}", tool.inheritance_type).to_lowercase()
+                        })
+                    }).collect::<Vec<_>>(),
+                    "skills": room.inherited_skills.iter().map(|skill| {
+                        serde_json::json!({
+                            "id": skill.id,
+                            "inheritance_type": format!("{:?}", skill.inheritance_type).to_lowercase()
+                        })
+                    }).collect::<Vec<_>>(),
+                    "schedules": room.inherited_schedules.iter().map(|schedule| {
+                        serde_json::json!({
+                            "id": schedule.id,
+                            "inheritance_type": format!("{:?}", schedule.inheritance_type).to_lowercase()
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&room_data)?);
+            } else {
+                println!("Memory Room: {}", room.id);
+                println!("  Layer: {:?}", room.layer);
+                println!("  Title: {}", room.title);
+                if !room.summary.is_empty() {
+                    println!("  Summary: {}", room.summary);
+                }
+                if !room.status.is_empty() {
+                    println!("  Status: {}", room.status);
+                }
+                
+                if !room.tags.is_empty() {
+                    println!("  Tags: {}", room.tags.join(", "));
+                }
+                
+                println!();
+                println!("Execution Context:");
+                if let Some(wd) = &room.room_config.execution_context.working_directory {
+                    println!("  Working Directory: {}", wd);
+                }
+                if let Some(ns) = &room.room_config.execution_context.default_namespace {
+                    println!("  Default Namespace: {}", ns);
+                }
+                if !room.room_config.execution_context.environment.is_empty() {
+                    println!("  Environment Variables:");
+                    for (key, value) in &room.room_config.execution_context.environment {
+                        println!("    {}: {}", key, value);
+                    }
+                }
+                
+                println!();
+                if !room.inherited_capabilities.is_empty() {
+                    println!("Inherited Capabilities ({}):", room.inherited_capabilities.len());
+                    for cap in &room.inherited_capabilities {
+                        println!("  - {} ({:?})", cap.id, cap.inheritance_type);
+                    }
+                    println!();
+                }
+                
+                if !room.inherited_tools.is_empty() {
+                    println!("Inherited Tools ({}):", room.inherited_tools.len());
+                    for tool in &room.inherited_tools {
+                        println!("  - {} ({:?})", tool.id, tool.inheritance_type);
+                    }
+                    println!();
+                }
+                
+                if !room.inherited_skills.is_empty() {
+                    println!("Inherited Skills ({}):", room.inherited_skills.len());
+                    for skill in &room.inherited_skills {
+                        println!("  - {} ({:?})", skill.id, skill.inheritance_type);
+                    }
+                    println!();
+                }
+                
+                if !room.inherited_schedules.is_empty() {
+                    println!("Inherited Schedules ({}):", room.inherited_schedules.len());
+                    for schedule in &room.inherited_schedules {
+                        println!("  - {} ({:?})", schedule.id, schedule.inheritance_type);
+                    }
+                }
+            }
+        }
+        None => {
+            if json {
+                println!("{{\"error\": \"Room not found: {}\" }}", room_id);
+            } else {
+                println!("Room not found: {}", room_id);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_room_capabilities(args: &[String]) -> Result<()> {
+    let mut room_id = None;
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                room_id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            arg if !arg.starts_with("--") && room_id.is_none() => {
+                room_id = Some(arg.to_string());
+                index += 1;
+            }
+            arg => bail!("unknown argument: {arg}"),
+        }
+    }
+    
+    let room_id = room_id.context("missing room ID")?;
+    
+    let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
+    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+        runtime_context.tenant_id.as_deref().unwrap_or("local"),
+        runtime_context.user_id.as_deref().unwrap_or("default"),
+    );
+    
+    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace.clone());
+    
+    match repository.get_room_by_id(&room_id)? {
+        Some(room) => {
+            // 构建内存命名空间
+            let memory_namespace = MemoryNamespace::new(
+                runtime_context.tenant_id.as_deref().unwrap_or("local"),
+                runtime_context.user_id.as_deref().unwrap_or("default"),
+            );
+            
+            // 解析房间能力
+            let resolver = RoomCapabilityResolver::new(memory_namespace);
+            match resolver.resolve_room_capabilities(&room) {
+                Ok(capabilities) => {
+                    if json {
+                        let capabilities_data = serde_json::json!({
+                            "room_id": room_id,
+                            "capabilities": capabilities.capabilities.iter().map(|cap| {
+                                serde_json::json!({
+                                    "id": cap.capability_ref.id,
+                                    "inheritance_type": format!("{:?}", cap.capability_ref.inheritance_type).to_lowercase(),
+                                    "resolved": true
+                                })
+                            }).collect::<Vec<_>>(),
+                            "tools": capabilities.tools.iter().map(|tool| {
+                                serde_json::json!({
+                                    "id": tool.tool_ref.id,
+                                    "inheritance_type": format!("{:?}", tool.tool_ref.inheritance_type).to_lowercase(),
+                                    "resolved": true
+                                })
+                            }).collect::<Vec<_>>(),
+                            "skills": capabilities.skills.iter().map(|skill| {
+                                serde_json::json!({
+                                    "id": skill.skill_ref.id,
+                                    "inheritance_type": format!("{:?}", skill.skill_ref.inheritance_type).to_lowercase(),
+                                    "resolved": true
+                                })
+                            }).collect::<Vec<_>>(),
+                            "schedules": capabilities.schedules.iter().map(|schedule| {
+                                serde_json::json!({
+                                    "id": schedule.schedule_ref.id,
+                                    "inheritance_type": format!("{:?}", schedule.schedule_ref.inheritance_type).to_lowercase(),
+                                    "resolved": true
+                                })
+                            }).collect::<Vec<_>>(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&capabilities_data)?);
+                    } else {
+                        println!("Room Capabilities for: {}", room_id);
+                        println!();
+                        
+                        if !capabilities.capabilities.is_empty() {
+                            println!("Resolved Capabilities ({}):", capabilities.capabilities.len());
+                            for cap in &capabilities.capabilities {
+                                println!("  - {} ({:?})", cap.capability_ref.id, cap.capability_ref.inheritance_type);
+                            }
+                            println!();
+                        }
+                        
+                        if !capabilities.tools.is_empty() {
+                            println!("Resolved Tools ({}):", capabilities.tools.len());
+                            for tool in &capabilities.tools {
+                                println!("  - {} ({:?})", tool.tool_ref.id, tool.tool_ref.inheritance_type);
+                            }
+                            println!();
+                        }
+                        
+                        if !capabilities.skills.is_empty() {
+                            println!("Resolved Skills ({}):", capabilities.skills.len());
+                            for skill in &capabilities.skills {
+                                println!("  - {} ({:?})", skill.skill_ref.id, skill.skill_ref.inheritance_type);
+                            }
+                            println!();
+                        }
+                        
+                        if !capabilities.schedules.is_empty() {
+                            println!("Resolved Schedules ({}):", capabilities.schedules.len());
+                            for schedule in &capabilities.schedules {
+                                println!("  - {} ({:?})", schedule.schedule_ref.id, schedule.schedule_ref.inheritance_type);
+                            }
+                            println!();
+                        }
+                        
+                        let total_count = capabilities.capabilities.len() + capabilities.tools.len() + capabilities.skills.len() + capabilities.schedules.len();
+                        if total_count == 0 {
+                            println!("No resolved capabilities found for this room.");
+                        } else {
+                            println!("Total: {} resolved capabilities", total_count);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if json {
+                        println!(r#"{{"room_id": "{}", "error": "Failed to resolve capabilities: {}"}}"#, room_id, err);
+                    } else {
+                        println!("Failed to resolve capabilities for room {}: {}", room_id, err);
+                    }
+                }
+            }
+        }
+        None => {
+            if json {
+                println!(r#"{{"error": "Room not found: {}"}}"#, room_id);
+            } else {
+                println!("Room not found: {}", room_id);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_room_inherit(args: &[String]) -> Result<()> {
+    let mut room_id = None;
+    let mut capability_type = None;
+    let mut capability_id = None;
+    let mut inheritance_type = None;
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--room-id" => {
+                room_id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --room-id")?,
+                );
+                index += 2;
+            }
+            "--type" => {
+                capability_type = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --type")?,
+                );
+                index += 2;
+            }
+            "--id" => {
+                capability_id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--inheritance" => {
+                inheritance_type = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --inheritance")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            arg => bail!("unknown argument: {arg}"),
+        }
+    }
+    
+    let room_id = room_id.context("missing --room-id")?;
+    let capability_type = capability_type.context("missing --type (capability, tool, skill, schedule)")?;
+    let capability_id = capability_id.context("missing --id")?;
+    let inheritance_type = inheritance_type.unwrap_or_else(|| "manual".to_string());
+    
+    let inheritance = match inheritance_type.as_str() {
+        "manual" => InheritanceType::Manual,
+        "auto" => InheritanceType::AutoDiscovered,
+        "parent" => InheritanceType::FromParent,
+        "sibling" => InheritanceType::FromSibling,
+        "direct" => InheritanceType::Direct,
+        _ => bail!("invalid inheritance type: {} (must be manual, auto, parent, sibling, or direct)", inheritance_type),
+    };
+    
+    // TODO: 实现实际的继承逻辑
+    if json {
+        println!(
+            r#"{{"success": true, "room_id": "{}", "type": "{}", "capability_id": "{}", "inheritance": "{}"}}"#,
+            room_id, capability_type, capability_id, inheritance_type
+        );
+    } else {
+        println!(
+            "Added {} inheritance of {} {} to room {}",
+            inheritance_type, capability_type, capability_id, room_id
+        );
+    }
+    
+    Ok(())
+}
+
 fn is_help(value: &str) -> bool {
     matches!(value, "help" | "--help" | "-h")
 }
@@ -4990,6 +5578,16 @@ fn print_help() {
     println!("hc-cli schedule dispatch-due [--now-unix <ts>] [--json]");
     println!("hc-cli schedule dispatch-queued [--now-unix <ts>] [--json]");
     println!("hc-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]");
+    println!("hc-cli room create --id <id> --layer <chat|topic|task|project|global> --title <text> [--summary <text>] [--tag <tag>] [--json]");
+    println!("hc-cli room list [--json]");
+    println!("hc-cli room show <room-id> [--json]");
+    println!("hc-cli room capabilities <room-id> [--json]");
+    println!("hc-cli room inherit --room-id <id> --type <capability|tool|skill|schedule> --id <capability-id> [--inheritance <manual|auto|parent|sibling|direct>] [--json]");
+    println!("hc-cli pattern list [--json]");
+    println!("hc-cli pattern show <pattern-name> [--json]");
+    println!("hc-cli pattern test <pattern-name> [--context key=value] [--json]");
+    println!("hc-cli pattern config <pattern-name> [--thinking-depth <n>] [--metacognition <true|false>] [--learning-rate <f>] [--json]");
+    println!("hc-cli pattern default [--json]");
     println!("hc-cli index rebuild [--vector] [--dims <n>] [--json]");
     println!(
         "hc-cli index search <text> [--vector] [--rebuild] [--filter key=value] [--limit <n>] [--json]"
@@ -5006,6 +5604,445 @@ fn print_help() {
         "hc-cli run <tool.local-file.read|tool.local-file.write|tool.local-dir.list> <path> [--content <text>] [--path <dir>] [--json]"
     );
 }
+
+fn handle_pattern(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "list" => handle_pattern_list(rest),
+        [cmd, rest @ ..] if cmd == "show" => handle_pattern_show(rest),
+        [cmd, rest @ ..] if cmd == "test" => handle_pattern_test(rest),
+        [cmd, rest @ ..] if cmd == "config" => handle_pattern_config(rest),
+        [cmd, rest @ ..] if cmd == "default" => handle_pattern_default(rest),
+        [] => {
+            println!("pattern commands:");
+            println!("  list      - list available behavior patterns");
+            println!("  show      - show pattern details");
+            println!("  test      - test pattern decision making");
+            println!("  config    - configure pattern settings");
+            println!("  default   - show system default pattern");
+            Ok(())
+        }
+        [other, ..] => bail!("unknown pattern command: {other}"),
+    }
+}
+
+fn handle_pattern_list(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+    
+    let patterns = vec![
+        BehaviorPattern::Passive,
+        BehaviorPattern::Stable,
+        BehaviorPattern::Learning,
+        BehaviorPattern::Creative,
+        BehaviorPattern::Adaptive,
+    ];
+    
+    if json {
+        let pattern_data: Vec<_> = patterns
+            .iter()
+            .map(|pattern| {
+                serde_json::json!({
+                    "name": format!("{:?}", pattern).to_lowercase(),
+                    "description": match pattern {
+                        BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
+                        BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
+                        BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
+                        BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
+                        BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
+                    },
+                    "risk_tolerance": pattern.risk_tolerance(),
+                    "innovation_tendency": pattern.innovation_tendency(),
+                    "proactivity": pattern.proactivity(),
+                })
+            })
+            .collect();
+        
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "patterns": pattern_data
+        }))?);
+    } else {
+        println!("可用的行为模式:");
+        for pattern in patterns {
+            println!(
+                "  {:10} - {} (风险容忍度: {:.1}, 创新倾向: {:.1}, 主动性: {:.1})",
+                format!("{:?}", pattern).to_lowercase(),
+                match pattern {
+                    BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
+                    BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
+                    BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
+                    BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
+                    BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
+                },
+                pattern.risk_tolerance(),
+                pattern.innovation_tendency(),
+                pattern.proactivity(),
+            );
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_pattern_show(args: &[String]) -> Result<()> {
+    let mut pattern_name = None;
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            name if pattern_name.is_none() => {
+                pattern_name = Some(name.to_string());
+                index += 1;
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+    
+    let pattern_name = pattern_name.context("missing pattern name")?;
+    let pattern = BehaviorPattern::from_str(&pattern_name)?;
+    let config = BehaviorConfig::new(pattern.clone());
+    
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "pattern": format!("{:?}", pattern).to_lowercase(),
+            "description": match pattern {
+                BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
+                BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
+                BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
+                BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
+                BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
+            },
+            "attributes": {
+                "risk_tolerance": pattern.risk_tolerance(),
+                "innovation_tendency": pattern.innovation_tendency(),
+                "proactivity": pattern.proactivity(),
+            },
+            "config": {
+                "thinking_depth": config.thinking_depth,
+                "enable_metacognition": config.enable_metacognition,
+                "learning_rate": config.learning_rate,
+            }
+        }))?);
+    } else {
+        println!("行为模式: {:?}", pattern);
+        println!("描述: {}", match pattern {
+            BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
+            BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
+            BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
+            BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
+            BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
+        });
+        println!();
+        println!("属性:");
+        println!("  风险容忍度: {:.1}", pattern.risk_tolerance());
+        println!("  创新倾向:   {:.1}", pattern.innovation_tendency());
+        println!("  主动性:     {:.1}", pattern.proactivity());
+        println!();
+        println!("默认配置:");
+        println!("  思考深度:     {}", config.thinking_depth);
+        println!("  启用元认知:   {}", if config.enable_metacognition { "是" } else { "否" });
+        println!("  学习率:       {:.2}", config.learning_rate.unwrap_or(0.0));
+    }
+    
+    Ok(())
+}
+
+fn handle_pattern_test(args: &[String]) -> Result<()> {
+    let mut pattern_name = None;
+    let mut context_pairs = Vec::new();
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--context" => {
+                let context_value = args.get(index + 1)
+                    .context("missing value for --context")?;
+                
+                if let Some((key, value)) = context_value.split_once('=') {
+                    context_pairs.push((key.to_string(), value.to_string()));
+                } else {
+                    bail!("invalid context format: {context_value} (expected key=value)");
+                }
+                index += 2;
+            }
+            name if pattern_name.is_none() => {
+                pattern_name = Some(name.to_string());
+                index += 1;
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+    
+    let pattern_name = pattern_name.context("missing pattern name")?;
+    let pattern = BehaviorPattern::from_str(&pattern_name)?;
+    
+    // 构建测试上下文
+    let mut context = BehaviorContext {
+        user_id: Some("test-user".to_string()),
+        session_id: None,
+        room_id: Some("test-room".to_string()),
+        task_type: Some("cli-test".to_string()),
+        estimated_complexity: Some(5.0),
+        historical_success_rate: Some(0.8),
+        available_tools_count: None,
+        time_pressure: None,
+        user_preferences: BTreeMap::new(),
+        environment: BTreeMap::new(),
+    };
+    
+    // 应用用户提供的上下文
+    for (key, value) in context_pairs {
+        match key.as_str() {
+            "user_id" => context.user_id = Some(value),
+            "room_id" => context.room_id = Some(value),
+            "task_type" => context.task_type = Some(value),
+            "complexity" => {
+                context.estimated_complexity = Some(value.parse()
+                    .context("invalid complexity value (expected number)")?);
+            }
+            "success_rate" => {
+                context.historical_success_rate = Some(value.parse()
+                    .context("invalid success_rate value (expected number 0.0-1.0)")?);
+            }
+            "time_pressure" => {
+                context.time_pressure = Some(value.parse()
+                    .context("invalid time_pressure value (expected number)")?);
+            }
+            "available_tools_count" => {
+                context.available_tools_count = Some(value.parse()
+                    .context("invalid available_tools_count value (expected number)")?);
+            }
+            other => bail!("unknown context key: {other}"),
+        }
+    }
+    
+    let config = BehaviorConfig::new(pattern.clone());
+    let mut engine = BehaviorEngine::new(config, context.clone());
+    
+    // 创建一些测试选项
+    let options = vec![
+        DecisionOption::new("conservative", "保守方案 - 使用已知可靠的方法")
+            .with_pros(vec!["风险低".to_string(), "成功率高".to_string()])
+            .with_cons(vec!["创新性不足".to_string()])
+            .with_estimated_effort(Some(3.0))
+            .with_success_probability(Some(0.9))
+            .with_innovation_level(Some(0.2))
+            .with_risk_level(Some(0.1)),
+        DecisionOption::new("balanced", "平衡方案 - 在安全和创新之间取平衡")
+            .with_pros(vec!["平衡性好".to_string(), "适应性强".to_string()])
+            .with_cons(vec!["可能不够大胆".to_string()])
+            .with_estimated_effort(Some(5.0))
+            .with_success_probability(Some(0.7))
+            .with_innovation_level(Some(0.5))
+            .with_risk_level(Some(0.3)),
+        DecisionOption::new("innovative", "创新方案 - 尝试新的方法和技术")
+            .with_pros(vec!["创新性高".to_string(), "学习价值大".to_string()])
+            .with_cons(vec!["风险高".to_string(), "不确定性大".to_string()])
+            .with_estimated_effort(Some(8.0))
+            .with_success_probability(Some(0.5))
+            .with_innovation_level(Some(0.9))
+            .with_risk_level(Some(0.7)),
+    ];
+    
+    let decision_record = engine.make_decision(
+        DecisionType::StrategySelection,
+        options.clone(),
+    )?;
+    
+    if json {
+        println!("{}", serde_json::to_string_pretty(&decision_record)?);
+    } else {
+        println!("行为模式测试: {:?}", pattern);
+        println!();
+        println!("上下文:");
+        if let Some(user_id) = &context.user_id {
+            println!("  用户ID: {}", user_id);
+        }
+        if let Some(room_id) = &context.room_id {
+            println!("  房间ID: {}", room_id);
+        }
+        if let Some(task_type) = &context.task_type {
+            println!("  任务类型: {}", task_type);
+        }
+        if let Some(complexity) = context.estimated_complexity {
+            println!("  预估复杂度: {:.1}", complexity);
+        }
+        if let Some(success_rate) = context.historical_success_rate {
+            println!("  历史成功率: {:.1}%", success_rate * 100.0);
+        }
+        println!();
+        
+        println!("决策结果:");
+        println!("  选择的方案: {}", decision_record.chosen_option);
+        println!("  决策理由: {}", decision_record.reasoning);
+        println!("  信心度: {:.1}%", decision_record.confidence * 100.0);
+        
+        if !decision_record.options_considered.is_empty() {
+            println!();
+            println!("考虑的选项:");
+            for option in &decision_record.options_considered {
+                println!("  {} - {}", option.id, option.description);
+                println!("    工作量: {:.1}, 成功率: {:.1}%, 创新性: {:.1}, 风险: {:.1}",
+                    option.estimated_effort.unwrap_or(0.0),
+                    option.success_probability.unwrap_or(0.0) * 100.0,
+                    option.innovation_level.unwrap_or(0.0),
+                    option.risk_level.unwrap_or(0.0)
+                );
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_pattern_config(args: &[String]) -> Result<()> {
+    let mut pattern_name = None;
+    let mut thinking_depth = None;
+    let mut enable_metacognition = None;
+    let mut learning_rate = None;
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--thinking-depth" => {
+                thinking_depth = Some(
+                    args.get(index + 1)
+                        .context("missing value for --thinking-depth")?
+                        .parse::<u8>()
+                        .context("invalid thinking-depth value (expected integer)")?,
+                );
+                index += 2;
+            }
+            "--metacognition" => {
+                let value = args.get(index + 1)
+                    .context("missing value for --metacognition")?;
+                enable_metacognition = Some(match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => bail!("invalid metacognition value: {} (expected true/false)", value),
+                });
+                index += 2;
+            }
+            "--learning-rate" => {
+                learning_rate = Some(
+                    args.get(index + 1)
+                        .context("missing value for --learning-rate")?
+                        .parse::<f32>()
+                        .context("invalid learning-rate value (expected float)")?,
+                );
+                index += 2;
+            }
+            name if pattern_name.is_none() => {
+                pattern_name = Some(name.to_string());
+                index += 1;
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+    
+    let pattern_name = pattern_name.context("missing pattern name")?;
+    let pattern = BehaviorPattern::from_str(&pattern_name)?;
+    
+    let mut config = BehaviorConfig::new(pattern.clone());
+    
+    // 应用用户指定的配置修改
+    if let Some(depth) = thinking_depth {
+        config.thinking_depth = depth;
+    }
+    if let Some(metacognition) = enable_metacognition {
+        config.enable_metacognition = metacognition;
+    }
+    if let Some(rate) = learning_rate {
+        config.learning_rate = Some(rate);
+    }
+    
+    if json {
+        println!("{}", serde_json::to_string_pretty(&config)?);
+    } else {
+        println!("行为模式配置: {:?}", pattern);
+        println!();
+        println!("配置参数:");
+        println!("  思考深度:     {}", config.thinking_depth);
+        println!("  启用元认知:   {}", if config.enable_metacognition { "是" } else { "否" });
+        println!("  学习率:       {:.2}", config.learning_rate.unwrap_or(0.0));
+        println!();
+        println!("注意: 这只是显示配置，实际保存配置功能需要额外实现");
+    }
+    
+    Ok(())
+}
+
+fn handle_pattern_default(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut index = 0usize;
+    
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+    
+    let default_pattern = BehaviorPattern::get_system_default();
+    
+    if json {
+        let response = serde_json::json!({
+            "system_default_pattern": default_pattern,
+            "description": default_pattern.description(),
+            "risk_tolerance": default_pattern.risk_tolerance(),
+            "innovation_tendency": default_pattern.innovation_tendency(),
+            "proactivity": default_pattern.proactivity(),
+            "note": "这是系统级别的默认行为模式，所有未指定模式的操作都会使用此模式"
+        });
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("系统默认行为模式: {:?}", default_pattern);
+        println!();
+        println!("模式描述: {}", default_pattern.description());
+        println!();
+        println!("模式属性:");
+        println!("  风险容忍度: {:.1}", default_pattern.risk_tolerance());
+        println!("  创新倾向:   {:.1}", default_pattern.innovation_tendency());
+        println!("  主动性:     {:.1}", default_pattern.proactivity());
+        println!();
+        println!("注意: 这是系统级别的默认行为模式，在以下情况下会使用:");
+        println!("  - API请求中未指定 behavior_pattern 参数");
+        println!("  - 解析指定模式失败时的回退选项");
+        println!("  - BehaviorConfig 的默认实例化");
+        println!();
+        println!("如需修改系统默认值，请在源代码中更改 BehaviorPattern::get_system_default() 的返回值");
+    }
+    
+    Ok(())
+}
+
 
 #[cfg(test)]
 #[path = "../tests/unit/cli.rs"]

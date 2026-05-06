@@ -4,6 +4,7 @@ members = [
   "apps/hc-cli",
   "crates/hc-bootstrap",
   "crates/hc-intent",
+  "crates/hc-behavior",
   "crates/hc-agent",
   "crates/hc-capability",
   "crates/hc-claim",

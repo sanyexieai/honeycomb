@@ -168,6 +168,7 @@ fn chat_response_from_context_response(
         tenant_id: Some(request.memory.namespace.tenant_id.clone()),
         user_id: Some(request.memory.namespace.user_id.clone()),
         session_id: request.session_id.clone(),
+        room_id: request.room_id.clone(),
         selected_agent_id: agent_context.map(|context| context.agent.id.clone()),
         selected_domain_id: agent_context.and_then(|context| context.agent.domain_id.clone()),
         recalled_memories: response
@@ -176,6 +177,12 @@ fn chat_response_from_context_response(
             .map(memory_ref_from_retrieved)
             .collect(),
         synthesized_prompt_asset_count: response.synthesized_prompt_assets.len(),
+        room_capabilities_used: Vec::new(),
+        room_tools_used: Vec::new(),
+        room_skills_used: Vec::new(),
+        behavior_pattern_used: None,
+        decision_reasoning: None,
+        decision_confidence: None,
     }
 }
 

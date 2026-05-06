@@ -70,6 +70,12 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_depth: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
     #[serde(default)]
     pub messages: Vec<ApiChatMessage>,
@@ -121,11 +127,25 @@ pub struct ChatResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_domain_id: Option<String>,
     pub recalled_memories: Vec<MemoryRef>,
     pub synthesized_prompt_asset_count: usize,
+    #[serde(default)]
+    pub room_capabilities_used: Vec<String>,
+    #[serde(default)]
+    pub room_tools_used: Vec<String>,
+    #[serde(default)]
+    pub room_skills_used: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_pattern_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

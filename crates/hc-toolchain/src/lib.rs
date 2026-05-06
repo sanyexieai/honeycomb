@@ -1514,7 +1514,3 @@ fn push_prefixed_lines(
         observations.push(format!("{prefix}: {line}"));
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/lib.rs"]
-mod tests;

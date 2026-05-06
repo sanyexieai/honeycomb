@@ -231,10 +231,17 @@ fn chat_response_simple(request: &ChatRequest, namespace: &ApiNamespace, content
                 request.user_id.as_deref().unwrap_or(DEFAULT_USER_ID),
             ))
         }),
+        room_id: request.room_id.clone(),
         selected_agent_id: request.agent_id.clone(),
         selected_domain_id: request.domain_id.clone(),
         recalled_memories: Vec::new(),
         synthesized_prompt_asset_count: 0,
+        room_capabilities_used: Vec::new(),
+        room_tools_used: Vec::new(),
+        room_skills_used: Vec::new(),
+        behavior_pattern_used: None,
+        decision_reasoning: None,
+        decision_confidence: None,
     }
 }
 

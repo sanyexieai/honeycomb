@@ -725,6 +725,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]
@@ -1828,8 +1829,10 @@ dependencies = [
  "anyhow",
  "axum",
  "futures-util",
+ "hc-behavior",
  "hc-bootstrap",
  "hc-conversation",
+ "hc-memory",
  "hc-protocol",
  "hc-scheduler",
  "hc-service",
@@ -1838,6 +1841,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "hc-behavior"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hc-protocol",
+ "hc-store",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1871,12 +1888,14 @@ dependencies = [
  "anyhow",
  "encoding_rs",
  "hc-agent",
+ "hc-behavior",
  "hc-bootstrap",
  "hc-capability",
  "hc-context",
  "hc-conversation",
  "hc-intent",
  "hc-llm",
+ "hc-memory",
  "hc-protocol",
  "hc-scheduler",
  "hc-service",
@@ -5522,6 +5541,7 @@ version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

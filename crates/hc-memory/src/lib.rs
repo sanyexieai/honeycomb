@@ -19,7 +19,7 @@ pub enum MemoryScope {
     Task,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {
     Chat,
@@ -376,6 +376,293 @@ impl MemoryRelation {
     }
 }
 
+// 能力继承相关类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InheritanceType {
+    /// 直接继承
+    Direct,
+    /// 从父级Room继承
+    FromParent,
+    /// 从同级Room继承
+    FromSibling,
+    /// 自动发现继承
+    AutoDiscovered,
+    /// 用户手动添加
+    Manual,
+}
+
+impl Default for InheritanceType {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_room_id: Option<String>,
+    #[serde(default)]
+    pub inheritance_type: InheritanceType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_config: Option<serde_json::Value>,
+}
+
+impl CapabilityRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            source_room_id: None,
+            inheritance_type: InheritanceType::default(),
+            override_config: None,
+        }
+    }
+
+    pub fn with_source_room(mut self, room_id: impl Into<String>) -> Self {
+        self.source_room_id = Some(room_id.into());
+        self
+    }
+
+    pub fn with_inheritance_type(mut self, inheritance_type: InheritanceType) -> Self {
+        self.inheritance_type = inheritance_type;
+        self
+    }
+
+    pub fn with_override_config(mut self, config: serde_json::Value) -> Self {
+        self.override_config = Some(config);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_room_id: Option<String>,
+    #[serde(default)]
+    pub inheritance_type: InheritanceType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_override: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_override: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ToolRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            source_room_id: None,
+            inheritance_type: InheritanceType::default(),
+            command_override: None,
+            args_override: None,
+        }
+    }
+
+    pub fn with_source_room(mut self, room_id: impl Into<String>) -> Self {
+        self.source_room_id = Some(room_id.into());
+        self
+    }
+
+    pub fn with_inheritance_type(mut self, inheritance_type: InheritanceType) -> Self {
+        self.inheritance_type = inheritance_type;
+        self
+    }
+
+    pub fn with_command_override(mut self, command: Vec<String>) -> Self {
+        self.command_override = Some(command);
+        self
+    }
+
+    pub fn with_args_override(mut self, args: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.args_override = Some(args);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_room_id: Option<String>,
+    #[serde(default)]
+    pub inheritance_type: InheritanceType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_override: Option<String>,
+}
+
+impl SkillRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            source_room_id: None,
+            inheritance_type: InheritanceType::default(),
+            instructions_override: None,
+        }
+    }
+
+    pub fn with_source_room(mut self, room_id: impl Into<String>) -> Self {
+        self.source_room_id = Some(room_id.into());
+        self
+    }
+
+    pub fn with_inheritance_type(mut self, inheritance_type: InheritanceType) -> Self {
+        self.inheritance_type = inheritance_type;
+        self
+    }
+
+    pub fn with_instructions_override(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions_override = Some(instructions.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduleRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_room_id: Option<String>,
+    #[serde(default)]
+    pub inheritance_type: InheritanceType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_override: Option<serde_json::Value>, // 将来可以改为具体的 ScheduleSpec 类型
+    #[serde(default = "default_schedule_enabled")]
+    pub enabled_in_room: bool,
+}
+
+impl ScheduleRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            source_room_id: None,
+            inheritance_type: InheritanceType::default(),
+            schedule_override: None,
+            enabled_in_room: default_schedule_enabled(),
+        }
+    }
+
+    pub fn with_source_room(mut self, room_id: impl Into<String>) -> Self {
+        self.source_room_id = Some(room_id.into());
+        self
+    }
+
+    pub fn with_inheritance_type(mut self, inheritance_type: InheritanceType) -> Self {
+        self.inheritance_type = inheritance_type;
+        self
+    }
+
+    pub fn with_schedule_override(mut self, schedule: serde_json::Value) -> Self {
+        self.schedule_override = Some(schedule);
+        self
+    }
+
+    pub fn enabled(mut self) -> Self {
+        self.enabled_in_room = true;
+        self
+    }
+
+    pub fn disabled(mut self) -> Self {
+        self.enabled_in_room = false;
+        self
+    }
+}
+
+fn default_schedule_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RoomConfig {
+    /// 是否自动继承父级 Room 的能力
+    #[serde(default)]
+    pub auto_inherit_parent: bool,
+    /// 是否自动继承同层级相关 Room 的能力
+    #[serde(default)]
+    pub auto_inherit_siblings: bool,
+    /// 能力过滤标签
+    #[serde(default)]
+    pub capability_filter_tags: Vec<String>,
+    /// 工具过滤标签
+    #[serde(default)]
+    pub tool_filter_tags: Vec<String>,
+    /// 技能过滤标签  
+    #[serde(default)]
+    pub skill_filter_tags: Vec<String>,
+    /// 执行上下文配置
+    #[serde(default)]
+    pub execution_context: ExecutionContext,
+}
+
+impl RoomConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_auto_inherit_parent(mut self) -> Self {
+        self.auto_inherit_parent = true;
+        self
+    }
+
+    pub fn with_auto_inherit_siblings(mut self) -> Self {
+        self.auto_inherit_siblings = true;
+        self
+    }
+
+    pub fn with_capability_filter_tag(mut self, tag: impl Into<String>) -> Self {
+        self.capability_filter_tags.push(tag.into());
+        self
+    }
+
+    pub fn with_tool_filter_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tool_filter_tags.push(tag.into());
+        self
+    }
+
+    pub fn with_skill_filter_tag(mut self, tag: impl Into<String>) -> Self {
+        self.skill_filter_tags.push(tag.into());
+        self
+    }
+
+    pub fn with_execution_context(mut self, context: ExecutionContext) -> Self {
+        self.execution_context = context;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionContext {
+    /// 默认命名空间
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_namespace: Option<String>,
+    /// 环境变量
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    /// 工作目录
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+}
+
+impl ExecutionContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_default_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.default_namespace = Some(namespace.into());
+        self
+    }
+
+    pub fn with_environment_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.environment.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_working_directory(mut self, dir: impl Into<String>) -> Self {
+        self.working_directory = Some(dir.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryRoom {
     pub id: String,
@@ -392,6 +679,20 @@ pub struct MemoryRoom {
     pub relations: Vec<MemoryRelation>,
     pub source_docs: Vec<String>,
     pub derived_docs: Vec<String>,
+    
+    // 新增：能力继承
+    #[serde(default)]
+    pub inherited_capabilities: Vec<CapabilityRef>,
+    #[serde(default)]
+    pub inherited_tools: Vec<ToolRef>,
+    #[serde(default)]
+    pub inherited_skills: Vec<SkillRef>,
+    #[serde(default)]
+    pub inherited_schedules: Vec<ScheduleRef>,
+    
+    // 新增：Room 特定配置
+    #[serde(default)]
+    pub room_config: RoomConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -436,6 +737,11 @@ impl MemoryRoom {
             relations: Vec::new(),
             source_docs: Vec::new(),
             derived_docs: Vec::new(),
+            inherited_capabilities: Vec::new(),
+            inherited_tools: Vec::new(),
+            inherited_skills: Vec::new(),
+            inherited_schedules: Vec::new(),
+            room_config: RoomConfig::default(),
         }
     }
 
@@ -477,6 +783,100 @@ impl MemoryRoom {
     pub fn with_derived_doc(mut self, derived_doc: impl Into<String>) -> Self {
         self.derived_docs.push(derived_doc.into());
         self
+    }
+
+    // 能力继承管理方法
+    pub fn with_inherited_capability(mut self, capability_ref: CapabilityRef) -> Self {
+        self.inherited_capabilities.push(capability_ref);
+        self
+    }
+
+    pub fn with_inherited_tool(mut self, tool_ref: ToolRef) -> Self {
+        self.inherited_tools.push(tool_ref);
+        self
+    }
+
+    pub fn with_inherited_skill(mut self, skill_ref: SkillRef) -> Self {
+        self.inherited_skills.push(skill_ref);
+        self
+    }
+
+    pub fn with_inherited_schedule(mut self, schedule_ref: ScheduleRef) -> Self {
+        self.inherited_schedules.push(schedule_ref);
+        self
+    }
+
+    pub fn with_room_config(mut self, config: RoomConfig) -> Self {
+        self.room_config = config;
+        self
+    }
+
+    /// 添加能力引用
+    pub fn add_capability(&mut self, capability_ref: CapabilityRef) {
+        if !self.inherited_capabilities.iter().any(|c| c.id == capability_ref.id) {
+            self.inherited_capabilities.push(capability_ref);
+        }
+    }
+
+    /// 添加工具引用
+    pub fn add_tool(&mut self, tool_ref: ToolRef) {
+        if !self.inherited_tools.iter().any(|t| t.id == tool_ref.id) {
+            self.inherited_tools.push(tool_ref);
+        }
+    }
+
+    /// 添加技能引用
+    pub fn add_skill(&mut self, skill_ref: SkillRef) {
+        if !self.inherited_skills.iter().any(|s| s.id == skill_ref.id) {
+            self.inherited_skills.push(skill_ref);
+        }
+    }
+
+    /// 添加调度引用
+    pub fn add_schedule(&mut self, schedule_ref: ScheduleRef) {
+        if !self.inherited_schedules.iter().any(|s| s.id == schedule_ref.id) {
+            self.inherited_schedules.push(schedule_ref);
+        }
+    }
+
+    /// 移除能力引用
+    pub fn remove_capability(&mut self, capability_id: &str) {
+        self.inherited_capabilities.retain(|c| c.id != capability_id);
+    }
+
+    /// 移除工具引用
+    pub fn remove_tool(&mut self, tool_id: &str) {
+        self.inherited_tools.retain(|t| t.id != tool_id);
+    }
+
+    /// 移除技能引用
+    pub fn remove_skill(&mut self, skill_id: &str) {
+        self.inherited_skills.retain(|s| s.id != skill_id);
+    }
+
+    /// 移除调度引用
+    pub fn remove_schedule(&mut self, schedule_id: &str) {
+        self.inherited_schedules.retain(|s| s.id != schedule_id);
+    }
+
+    /// 检查是否继承了指定的能力
+    pub fn has_capability(&self, capability_id: &str) -> bool {
+        self.inherited_capabilities.iter().any(|c| c.id == capability_id)
+    }
+
+    /// 检查是否继承了指定的工具
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.inherited_tools.iter().any(|t| t.id == tool_id)
+    }
+
+    /// 检查是否继承了指定的技能
+    pub fn has_skill(&self, skill_id: &str) -> bool {
+        self.inherited_skills.iter().any(|s| s.id == skill_id)
+    }
+
+    /// 检查是否继承了指定的调度
+    pub fn has_schedule(&self, schedule_id: &str) -> bool {
+        self.inherited_schedules.iter().any(|s| s.id == schedule_id)
     }
 
     pub fn is_visible_to(&self, namespace: &MemoryNamespace) -> bool {
@@ -952,6 +1352,17 @@ struct MemoryRoomFrontmatter {
     relations: Vec<MemoryRelation>,
     source_docs: Vec<String>,
     derived_docs: Vec<String>,
+    // 新增：能力继承
+    #[serde(default)]
+    inherited_capabilities: Vec<CapabilityRef>,
+    #[serde(default)]
+    inherited_tools: Vec<ToolRef>,
+    #[serde(default)]
+    inherited_skills: Vec<SkillRef>,
+    #[serde(default)]
+    inherited_schedules: Vec<ScheduleRef>,
+    #[serde(default)]
+    room_config: RoomConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1338,6 +1749,120 @@ impl MemoryRoomRepository {
         Ok(MemoryRoom::from_document(stored.frontmatter, stored.body))
     }
 
+    pub fn get_room_by_id(&self, room_id: &str) -> Result<Option<MemoryRoom>> {
+        // 尝试在不同层级中查找房间
+        let layers = [
+            MemoryLayer::Chat,
+            MemoryLayer::Topic, 
+            MemoryLayer::Task,
+            MemoryLayer::Project,
+            MemoryLayer::Global,
+        ];
+        
+        for layer in layers {
+            let room_path = PathBuf::from("memory")
+                .join("rooms")
+                .join(layer_dir_name(&layer))
+                .join(room_id)
+                .join("room.md");
+                
+            if let Ok(room) = self.read_room(&room_path) {
+                if room.id == room_id {
+                    return Ok(Some(room));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    pub fn list_rooms(&self) -> Result<Vec<MemoryRoom>> {
+        let mut rooms = Vec::new();
+        
+        // 遍历所有层级
+        let layers = [
+            MemoryLayer::Chat,
+            MemoryLayer::Topic, 
+            MemoryLayer::Task,
+            MemoryLayer::Project,
+            MemoryLayer::Global,
+        ];
+        
+        for layer in layers {
+            let layer_path = PathBuf::from("memory")
+                .join("rooms")
+                .join(layer_dir_name(&layer));
+                
+            let full_layer_path = self.store.resolve_in_namespace(&self.namespace, &layer_path);
+            
+            // 检查层级目录是否存在
+            if !full_layer_path.exists() {
+                continue;
+            }
+            
+            // 遍历层级目录中的所有房间
+            if let Ok(entries) = std::fs::read_dir(&full_layer_path) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        let room_dir = entry.path();
+                        let room_file = room_dir.join("room.md");
+                        
+                        if room_file.exists() {
+                            let relative_room_path = layer_path.join(entry.file_name()).join("room.md");
+                            if let Ok(room) = self.read_room(&relative_room_path) {
+                                rooms.push(room);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 按层级和ID排序
+        rooms.sort_by(|a, b| {
+            a.layer.cmp(&b.layer).then(a.id.cmp(&b.id))
+        });
+        
+        Ok(rooms)
+    }
+
+    pub fn list_rooms_by_layer(&self, layer: MemoryLayer) -> Result<Vec<MemoryRoom>> {
+        let mut rooms = Vec::new();
+        
+        let layer_path = PathBuf::from("memory")
+            .join("rooms")
+            .join(layer_dir_name(&layer));
+            
+        let full_layer_path = self.store.resolve_in_namespace(&self.namespace, &layer_path);
+        
+        // 检查层级目录是否存在
+        if !full_layer_path.exists() {
+            return Ok(rooms);
+        }
+        
+        // 遍历层级目录中的所有房间
+        if let Ok(entries) = std::fs::read_dir(&full_layer_path) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let room_dir = entry.path();
+                    let room_file = room_dir.join("room.md");
+                    
+                    if room_file.exists() {
+                        let relative_room_path = layer_path.join(entry.file_name()).join("room.md");
+                        if let Ok(room) = self.read_room(&relative_room_path) {
+                            rooms.push(room);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 按ID排序
+        rooms.sort_by(|a, b| a.id.cmp(&b.id));
+        
+        Ok(rooms)
+    }
+
     pub fn read_asset(&self, relative_path: impl AsRef<Path>) -> Result<MemoryRoomAsset> {
         let relative_path = relative_path.as_ref();
         let path = self
@@ -1460,6 +1985,11 @@ impl MemoryRoom {
             relations: frontmatter.relations,
             source_docs: frontmatter.source_docs,
             derived_docs: frontmatter.derived_docs,
+            inherited_capabilities: frontmatter.inherited_capabilities,
+            inherited_tools: frontmatter.inherited_tools,
+            inherited_skills: frontmatter.inherited_skills,
+            inherited_schedules: frontmatter.inherited_schedules,
+            room_config: frontmatter.room_config,
         }
     }
 }
@@ -1551,6 +2081,11 @@ impl MemoryRoomFrontmatter {
             relations: room.relations.clone(),
             source_docs: room.source_docs.clone(),
             derived_docs: room.derived_docs.clone(),
+            inherited_capabilities: room.inherited_capabilities.clone(),
+            inherited_tools: room.inherited_tools.clone(),
+            inherited_skills: room.inherited_skills.clone(),
+            inherited_schedules: room.inherited_schedules.clone(),
+            room_config: room.room_config.clone(),
         }
     }
 }
@@ -1928,5 +2463,366 @@ fn default_memory_asset_form_for_memory_kind(
         MemoryKind::Summary | MemoryKind::Decision => {
             default_memory_asset_form_for_room_asset_kind(kind)
         }
+    }
+}
+
+// Room 能力解析系统
+#[derive(Debug, Clone)]
+pub struct ResolvedRoomCapabilities {
+    pub room_id: String,
+    pub capabilities: Vec<ResolvedCapability>,
+    pub tools: Vec<ResolvedTool>,
+    pub skills: Vec<ResolvedSkill>,
+    pub schedules: Vec<ResolvedSchedule>,
+}
+
+impl ResolvedRoomCapabilities {
+    pub fn new(room_id: impl Into<String>) -> Self {
+        Self {
+            room_id: room_id.into(),
+            capabilities: Vec::new(),
+            tools: Vec::new(),
+            skills: Vec::new(),
+            schedules: Vec::new(),
+        }
+    }
+
+    /// 获取所有工具 ID
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.tool_ref.id.clone()).collect()
+    }
+
+    /// 获取所有技能 ID
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.skills.iter().map(|s| s.skill_ref.id.clone()).collect()
+    }
+
+    /// 获取所有能力 ID
+    pub fn capability_ids(&self) -> Vec<String> {
+        self.capabilities.iter().map(|c| c.capability_ref.id.clone()).collect()
+    }
+
+    /// 获取所有启用的调度 ID
+    pub fn enabled_schedule_ids(&self) -> Vec<String> {
+        self.schedules
+            .iter()
+            .filter(|s| s.schedule_ref.enabled_in_room)
+            .map(|s| s.schedule_ref.id.clone())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedCapability {
+    pub capability_ref: CapabilityRef,
+    pub source_data: Option<serde_json::Value>, // 这里将来可以是具体的 CapabilityProfile 类型
+}
+
+impl ResolvedCapability {
+    pub fn new(capability_ref: CapabilityRef) -> Self {
+        Self {
+            capability_ref,
+            source_data: None,
+        }
+    }
+
+    pub fn with_source_data(mut self, data: serde_json::Value) -> Self {
+        self.source_data = Some(data);
+        self
+    }
+
+    pub fn auto_discovered(capability_id: impl Into<String>) -> Self {
+        Self::new(
+            CapabilityRef::new(capability_id)
+                .with_inheritance_type(InheritanceType::AutoDiscovered),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTool {
+    pub tool_ref: ToolRef,
+    pub source_data: Option<serde_json::Value>, // 这里将来可以是具体的 ToolSpec 类型
+}
+
+impl ResolvedTool {
+    pub fn new(tool_ref: ToolRef) -> Self {
+        Self {
+            tool_ref,
+            source_data: None,
+        }
+    }
+
+    pub fn with_source_data(mut self, data: serde_json::Value) -> Self {
+        self.source_data = Some(data);
+        self
+    }
+
+    pub fn auto_discovered(tool_id: impl Into<String>) -> Self {
+        Self::new(
+            ToolRef::new(tool_id)
+                .with_inheritance_type(InheritanceType::AutoDiscovered),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedSkill {
+    pub skill_ref: SkillRef,
+    pub source_data: Option<serde_json::Value>, // 这里将来可以是具体的 SkillProfile 类型
+}
+
+impl ResolvedSkill {
+    pub fn new(skill_ref: SkillRef) -> Self {
+        Self {
+            skill_ref,
+            source_data: None,
+        }
+    }
+
+    pub fn with_source_data(mut self, data: serde_json::Value) -> Self {
+        self.source_data = Some(data);
+        self
+    }
+
+    pub fn auto_discovered(skill_id: impl Into<String>) -> Self {
+        Self::new(
+            SkillRef::new(skill_id)
+                .with_inheritance_type(InheritanceType::AutoDiscovered),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedSchedule {
+    pub schedule_ref: ScheduleRef,
+    pub source_data: Option<serde_json::Value>, // 这里将来可以是具体的 ScheduledTask 类型
+}
+
+impl ResolvedSchedule {
+    pub fn new(schedule_ref: ScheduleRef) -> Self {
+        Self {
+            schedule_ref,
+            source_data: None,
+        }
+    }
+
+    pub fn with_source_data(mut self, data: serde_json::Value) -> Self {
+        self.source_data = Some(data);
+        self
+    }
+
+    pub fn auto_discovered(schedule_id: impl Into<String>) -> Self {
+        Self::new(
+            ScheduleRef::new(schedule_id)
+                .with_inheritance_type(InheritanceType::AutoDiscovered),
+        )
+    }
+}
+
+/// Room 能力解析器 - 这是一个基础版本，将来需要注入真实的仓库依赖
+#[derive(Debug, Clone)]
+pub struct RoomCapabilityResolver {
+    pub namespace: MemoryNamespace,
+}
+
+impl RoomCapabilityResolver {
+    pub fn new(namespace: MemoryNamespace) -> Self {
+        Self { namespace }
+    }
+
+    /// 解析 Room 的所有可用能力
+    pub fn resolve_room_capabilities(&self, room: &MemoryRoom) -> Result<ResolvedRoomCapabilities> {
+        let mut resolved = ResolvedRoomCapabilities::new(&room.id);
+
+        // 1. 解析直接继承的能力
+        for cap_ref in &room.inherited_capabilities {
+            // TODO: 这里需要从真实的 CapabilityRepository 加载数据
+            resolved.capabilities.push(ResolvedCapability::new(cap_ref.clone()));
+        }
+
+        // 2. 解析继承的工具
+        for tool_ref in &room.inherited_tools {
+            // TODO: 这里需要从真实的 ToolRepository 加载数据
+            resolved.tools.push(ResolvedTool::new(tool_ref.clone()));
+        }
+
+        // 3. 解析继承的技能
+        for skill_ref in &room.inherited_skills {
+            // TODO: 这里需要从真实的 SkillRepository 加载数据
+            resolved.skills.push(ResolvedSkill::new(skill_ref.clone()));
+        }
+
+        // 4. 解析继承的定时任务
+        for schedule_ref in &room.inherited_schedules {
+            if schedule_ref.enabled_in_room {
+                // TODO: 这里需要从真实的 ScheduleRepository 加载数据
+                resolved.schedules.push(ResolvedSchedule::new(schedule_ref.clone()));
+            }
+        }
+
+        // 5. 自动发现相关能力
+        if room.room_config.auto_inherit_parent || room.room_config.auto_inherit_siblings {
+            self.auto_discover_capabilities(room, &mut resolved)?;
+        }
+
+        Ok(resolved)
+    }
+
+    /// 自动发现相关能力 - 基础版本
+    fn auto_discover_capabilities(
+        &self,
+        room: &MemoryRoom,
+        resolved: &mut ResolvedRoomCapabilities,
+    ) -> Result<()> {
+        // 基于标签匹配发现能力
+        for tag in &room.tags {
+            // TODO: 这里需要集成真实的仓库来基于标签查找
+            
+            // 示例：如果标签是 "rust"，自动发现 Rust 相关的工具
+            if tag == "rust" {
+                let rust_tools = vec!["tool.cargo-check", "tool.cargo-test", "tool.cargo-build"];
+                for tool_id in rust_tools {
+                    if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
+                        resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
+                    }
+                }
+            }
+
+            // 示例：如果标签是 "search"，自动发现搜索相关的工具
+            if tag == "search" {
+                let search_tools = vec!["tool.rg", "tool.grep", "tool.find"];
+                for tool_id in search_tools {
+                    if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
+                        resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
+                    }
+                }
+            }
+        }
+
+        // 基于相关实体发现能力
+        for entity in &room.related_entities {
+            match entity.kind {
+                MemoryEntityKind::Project => {
+                    // 继承项目级能力
+                    self.inherit_project_capabilities(&entity.id, resolved)?;
+                }
+                MemoryEntityKind::Task => {
+                    // 继承任务相关能力
+                    self.inherit_task_capabilities(&entity.id, resolved)?;
+                }
+                MemoryEntityKind::Crate => {
+                    // 继承 crate 相关能力
+                    self.inherit_crate_capabilities(&entity.id, resolved)?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 继承项目级能力
+    fn inherit_project_capabilities(
+        &self,
+        project_id: &str,
+        resolved: &mut ResolvedRoomCapabilities,
+    ) -> Result<()> {
+        // TODO: 基于项目 ID 查找相关能力
+        
+        // 示例：Honeycomb 项目的默认工具
+        if project_id.contains("honeycomb") {
+            let honeycomb_tools = vec![
+                "tool.cargo-check",
+                "tool.cargo-test", 
+                "tool.rg",
+                "tool.local-file.read",
+                "tool.local-dir.list"
+            ];
+            
+            for tool_id in honeycomb_tools {
+                if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
+                    resolved.tools.push(
+                        ResolvedTool::auto_discovered(tool_id)
+                    );
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 继承任务相关能力
+    fn inherit_task_capabilities(
+        &self,
+        task_id: &str,
+        resolved: &mut ResolvedRoomCapabilities,
+    ) -> Result<()> {
+        // TODO: 基于任务类型查找相关能力
+        
+        // 示例：重构任务的工具
+        if task_id.contains("refactor") {
+            let refactor_tools = vec!["tool.rg", "tool.ast-grep", "tool.cargo-check"];
+            for tool_id in refactor_tools {
+                if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
+                    resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 继承 crate 相关能力
+    fn inherit_crate_capabilities(
+        &self,
+        crate_id: &str,
+        resolved: &mut ResolvedRoomCapabilities,
+    ) -> Result<()> {
+        // TODO: 基于 crate 类型查找相关能力
+        
+        // 示例：memory crate 的工具
+        if crate_id.contains("memory") {
+            let memory_tools = vec!["tool.cargo-test", "tool.cargo-doc"];
+            for tool_id in memory_tools {
+                if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
+                    resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 为 Room 添加能力引用
+    pub fn add_capability_to_room(
+        &self,
+        room: &mut MemoryRoom,
+        capability_ref: CapabilityRef,
+    ) -> Result<()> {
+        room.add_capability(capability_ref);
+        Ok(())
+    }
+
+    /// 为 Room 添加工具引用
+    pub fn add_tool_to_room(&self, room: &mut MemoryRoom, tool_ref: ToolRef) -> Result<()> {
+        room.add_tool(tool_ref);
+        Ok(())
+    }
+
+    /// 为 Room 添加技能引用
+    pub fn add_skill_to_room(&self, room: &mut MemoryRoom, skill_ref: SkillRef) -> Result<()> {
+        room.add_skill(skill_ref);
+        Ok(())
+    }
+
+    /// 为 Room 添加调度引用
+    pub fn add_schedule_to_room(
+        &self,
+        room: &mut MemoryRoom,
+        schedule_ref: ScheduleRef,
+    ) -> Result<()> {
+        room.add_schedule(schedule_ref);
+        Ok(())
     }
 }
