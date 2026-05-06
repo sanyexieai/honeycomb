@@ -21,6 +21,7 @@ members = [
   "crates/hc-scheduler",
   "crates/hc-skill",
   "crates/hc-store",
+  "crates/hc-tag-system",
   "crates/hc-toolchain",
   "crates/hc-trace",
   "crates/hc-ui",
@@ -43,3 +44,6 @@ rustyline = "14"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+notify = "6.1"

@@ -28,3 +28,4 @@ hc-bootstrap = { path = "../../crates/hc-bootstrap" }
 hc-intent = { path = "../../crates/hc-intent" }
 hc-protocol = { path = "../../crates/hc-protocol" }
 hc-behavior = { path = "../../crates/hc-behavior" }
+hc-tag-system = { path = "../../crates/hc-tag-system" }

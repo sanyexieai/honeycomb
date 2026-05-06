@@ -39,6 +39,7 @@ use hc_behavior::{
     BehaviorPattern, BehaviorConfig, BehaviorContext, BehaviorEngine, DecisionRecord,
     DecisionType, DecisionOption, ExecutionResult,
 };
+use hc_tag_system::{TagSystemManager, TagVector};
 use hc_scheduler::{
     ScheduleRepository, ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledRunStatus,
     ScheduledTarget, ScheduledTargetKind, ScheduledTask, now_unix,
@@ -287,6 +288,93 @@ impl Default for KeywordToolSelector {
     }
 }
 
+/// 标签感知工具选择器 - 结合关键词匹配和标签相似度
+struct TagAwareToolSelector {
+    limit: usize,
+    tag_manager: Option<TagSystemManager>,
+    keyword_weight: f32,
+    tag_weight: f32,
+}
+
+impl TagAwareToolSelector {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            tag_manager: None,
+            keyword_weight: 0.6,
+            tag_weight: 0.4,
+        }
+    }
+
+    pub fn with_tag_manager(mut self, tag_manager: TagSystemManager) -> Self {
+        self.tag_manager = Some(tag_manager);
+        self
+    }
+
+    pub fn with_weights(mut self, keyword_weight: f32, tag_weight: f32) -> Self {
+        self.keyword_weight = keyword_weight;
+        self.tag_weight = tag_weight;
+        self
+    }
+}
+
+impl ToolSelector for TagAwareToolSelector {
+    fn select(&self, input: &str, catalog: &ToolCatalog) -> Result<ToolSelection> {
+        let mut candidates: Vec<ToolSelectionCandidate> = Vec::new();
+
+        // 分析输入生成标签向量
+        let query_tags = if let Some(ref tag_manager) = self.tag_manager {
+            tag_manager.analyze_input_tags(input)
+        } else {
+            TagVector::new()
+        };
+
+        for tool in catalog.list() {
+            // 传统关键词评分
+            let keyword_score = score_tool_for_goal(tool, input) as f32;
+
+            // 标签相似度评分
+            let tag_score = if let Some(ref tag_manager) = self.tag_manager {
+                let similarity = tag_manager.calculate_entity_similarity(
+                    &query_tags,
+                    &tool.id,
+                    "tools"
+                );
+                similarity * 100.0 // 转换为与keyword_score相同的量级
+            } else {
+                0.0
+            };
+
+            // 加权组合评分
+            let combined_score = (keyword_score * self.keyword_weight + tag_score * self.tag_weight) as i32;
+
+            if combined_score > 0 {
+                candidates.push(ToolSelectionCandidate {
+                    tool: tool.clone(),
+                    score: combined_score,
+                });
+            }
+        }
+
+        // 排序并限制数量
+        candidates.sort_by(|left, right| {
+            right.score.cmp(&left.score)
+                .then_with(|| left.tool.id.cmp(&right.tool.id))
+        });
+        candidates.truncate(self.limit);
+
+        let selected = candidates
+            .first()
+            .filter(|candidate| candidate.score > 0)
+            .map(|candidate| candidate.tool.clone());
+
+        Ok(ToolSelection {
+            selected,
+            candidates,
+        })
+    }
+}
+
 impl ToolSelector for KeywordToolSelector {
     fn select(&self, input: &str, catalog: &ToolCatalog) -> Result<ToolSelection> {
         let mut candidates: Vec<ToolSelectionCandidate> = catalog
@@ -377,6 +465,15 @@ struct NaturalLanguageSkillDraft {
 fn main() -> Result<()> {
     configure_console_encoding();
     load_local_env_file()?;
+    
+    // 初始化标签系统
+    let workspace_root = workspace_root();
+    let mut tag_manager = TagSystemManager::new(workspace_root);
+    if let Err(e) = tag_manager.initialize() {
+        eprintln!("Warning: Failed to initialize tag system: {}", e);
+    }
+    let _ = TAG_SYSTEM_MANAGER.set(tag_manager);
+    
     let args: Vec<String> = env::args().skip(1).collect();
     let (context, args) = parse_cli_runtime_context(args)?;
     let _ = CLI_RUNTIME_CONTEXT.set(context);
@@ -411,6 +508,7 @@ fn configure_console_encoding() {
 }
 
 static CLI_RUNTIME_CONTEXT: OnceLock<CliRuntimeContext> = OnceLock::new();
+static TAG_SYSTEM_MANAGER: OnceLock<TagSystemManager> = OnceLock::new();
 
 fn parse_cli_runtime_context(args: Vec<String>) -> Result<(CliRuntimeContext, Vec<String>)> {
     let mut context = CliRuntimeContext::default();
@@ -646,6 +744,9 @@ fn handle_chat(args: &[String]) -> Result<()> {
         output_options.phased_delay_ms
     );
 
+    // 检查API配置
+    validate_llm_configuration(&provider, &model)?;
+
     let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
     let mut history = vec![ChatMessage::new(MessageRole::System, tool_prompt)];
     loop {
@@ -675,6 +776,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
             &memory_options.namespace,
             capture_options.room_id.as_deref(),
         )?;
+        // 暂时使用传统关键词选择器，后续可以扩展为标签感知选择器
         let selector = KeywordToolSelector::default();
         let selection_input = selection_input_from_history(&history, trimmed);
         let recalled_memories = if memory_options.enabled {
@@ -2582,10 +2684,39 @@ fn run_normal_chat_node(
         ModelRef::new(provider.to_owned(), model.to_owned()),
         request_history,
     );
+    
+    // 启动进度指示器
+    use std::io::{self, Write};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::thread;
+    use std::time::Duration;
+    
+    let progress_running = Arc::new(AtomicBool::new(true));
+    let progress_running_clone = progress_running.clone();
+    
+    // 后台线程显示动态进度
+    let _progress_handle = thread::spawn(move || {
+        let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        let mut index = 0;
+        while progress_running_clone.load(Ordering::Relaxed) {
+            eprint!("\r{} 正在调用LLM API...", spinner_chars[index]);
+            io::stderr().flush().unwrap();
+            index = (index + 1) % spinner_chars.len();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    
     let mut streamed = false;
     let response = match registry.generate_stream(&request, &mut |chunk| {
         if !chunk.delta.is_empty() {
-            streamed = true;
+            if !streamed {
+                // 停止进度指示器并清除进度提示
+                progress_running.store(false, Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(120)); // 确保spinner线程退出
+                eprint!("\r\x1b[K"); // 回到行首并清除行
+                io::stderr().flush().unwrap();
+                streamed = true;
+            }
             on_delta(&chunk.delta)
                 .map_err(|error| hc_llm::LlmError::ProviderFailure(error.to_string()))?;
         }
@@ -2593,6 +2724,13 @@ fn run_normal_chat_node(
     }) {
         Ok(response) => response,
         Err(error) => {
+            // 停止进度指示器并清除进度提示
+            progress_running.store(false, Ordering::Relaxed);
+            if !streamed {
+                thread::sleep(Duration::from_millis(120));
+                eprint!("\r\x1b[K");
+                io::stderr().flush().unwrap();
+            }
             return Ok(NormalChatNodeResult::Error {
                 message: render_chat_error(&error),
             });
@@ -4218,17 +4356,44 @@ fn render_tool_execution_context(
 
 fn render_chat_error(error: &hc_llm::LlmError) -> String {
     let message = error.to_string();
+    let lowered = message.to_ascii_lowercase();
+    
     if message.contains("invalid chat setting") {
         return format!(
             "error> provider rejected the chat request: invalid chat setting. Current session is preserved; continue typing or use /clear and retry.\nprovider> {message}"
         );
     }
+    
     if is_timeout_error(error) {
+        let timeout_secs = std::env::var("HC_LLM_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(180);
         return format!(
-            "error> provider request timed out. Current session is preserved; retry, switch HC_LLM_PROVIDER/HC_LLM_MODEL, or try again later.\nprovider> {message}"
+            "error> ⏰ 请求超时 ({}秒)。可能的解决方案:\n  • 检查网络连接\n  • 使用环境变量 HC_LLM_REQUEST_TIMEOUT_SECS 增加超时时间\n  • 切换到更快的模型\n  • 稍后重试\nprovider> {message}",
+            timeout_secs
         );
     }
-    format!("error> {message}")
+    
+    if lowered.contains("api key") || lowered.contains("unauthorized") || lowered.contains("authentication") {
+        return format!(
+            "error> 🔑 API认证失败。请检查:\n  • API密钥是否正确设置 (OPENAI_API_KEY, ANTHROPIC_API_KEY 等)\n  • API密钥是否有效且未过期\n  • 网络是否能访问API服务\nprovider> {message}"
+        );
+    }
+    
+    if lowered.contains("rate limit") || lowered.contains("quota") {
+        return format!(
+            "error> 🚦 API速率限制或配额不足。建议:\n  • 等待几分钟后重试\n  • 检查API账户余额\n  • 考虑升级API套餐\nprovider> {message}"
+        );
+    }
+    
+    if lowered.contains("network") || lowered.contains("connection") || lowered.contains("dns") {
+        return format!(
+            "error> 🌐 网络连接问题。请检查:\n  • 网络连接是否正常\n  • 防火墙设置\n  • 代理配置\nprovider> {message}"
+        );
+    }
+    
+    format!("error> ❌ {message}\n💡 如果问题持续，请检查配置或稍后重试")
 }
 
 fn render_router_warning(error: &anyhow::Error) -> String {
@@ -4973,6 +5138,10 @@ fn default_provider() -> String {
 
 fn default_model() -> String {
     default_model_from_env()
+}
+
+fn get_tag_system_manager() -> Option<&'static TagSystemManager> {
+    TAG_SYSTEM_MANAGER.get()
 }
 
 // Room 能力管理命令
@@ -6039,6 +6208,110 @@ fn handle_pattern_default(args: &[String]) -> Result<()> {
         println!();
         println!("如需修改系统默认值，请在源代码中更改 BehaviorPattern::get_system_default() 的返回值");
     }
+    
+    Ok(())
+}
+
+/// 验证LLM配置是否正确
+fn validate_llm_configuration(provider: &str, model: &str) -> Result<()> {
+    use std::env;
+    use hc_llm::{provider_api_key_var_name, provider_base_url_var_name};
+    
+    println!("🔍 检查LLM配置...");
+    println!("  提供商: {}", provider);
+    println!("  模型: {}", model);
+    
+    // hc-llm的API密钥查找顺序: HC_LLM_API_KEY -> 提供商专用密钥
+    let generic_api_key = "HC_LLM_API_KEY";
+    let provider_api_key = provider_api_key_var_name(provider);
+    let generic_base_url = "HC_LLM_BASE_URL";
+    let provider_base_url = provider_base_url_var_name(provider);
+    
+    // 检查API密钥配置 (通用优先，然后提供商专用)
+    let api_key_vars = match provider.to_lowercase().as_str() {
+        "ollama" => vec![], // ollama通常不需要API密钥
+        "azure" => vec!["AZURE_OPENAI_API_KEY"], // azure使用专用密钥
+        _ => vec![generic_api_key, provider_api_key], // 先检查通用，再检查专用
+    };
+    
+    // 检查Base URL配置 (可选)
+    let base_url_vars = match provider.to_lowercase().as_str() {
+        "azure" => vec!["AZURE_OPENAI_ENDPOINT"],
+        "ollama" => vec![provider_base_url], // ollama主要靠base_url
+        _ => vec![generic_base_url, provider_base_url],
+    };
+    
+    // 检查API密钥配置 - 模拟 hc-llm 的逻辑
+    let mut found_api_key = None;
+    
+    // 使用与 hc-llm::provider_api_key_from_env 相同的逻辑
+    if let Ok(value) = env::var("HC_LLM_API_KEY") {
+        if !value.trim().is_empty() {
+            found_api_key = Some("HC_LLM_API_KEY");
+        }
+    } else if let Ok(value) = env::var(provider_api_key) {
+        if !value.trim().is_empty() {
+            found_api_key = Some(provider_api_key);
+        }
+    }
+    
+    // 检查Base URL配置 - 模拟 hc-llm::provider_base_url_from_env 的逻辑
+    let mut found_base_url = None;
+    
+    if let Ok(value) = env::var("HC_LLM_BASE_URL") {
+        if !value.trim().is_empty() {
+            found_base_url = Some("HC_LLM_BASE_URL");
+        }
+    } else if let Ok(value) = env::var(provider_base_url) {
+        if !value.trim().is_empty() {
+            found_base_url = Some(provider_base_url);
+        }
+    }
+    
+    // 显示结果
+    let mut config_info = Vec::new();
+    
+    if let Some(api_key_var) = found_api_key {
+        config_info.push(format!("API密钥: {}", api_key_var));
+    }
+    
+    if let Some(base_url_var) = found_base_url {
+        config_info.push(format!("Base URL: {}", base_url_var));
+    }
+    
+    if !config_info.is_empty() {
+        println!("  ✅ {}", config_info.join(", "));
+    }
+    
+    // 检查是否缺少必要配置
+    let needs_api_key = match provider.to_lowercase().as_str() {
+        "ollama" => false, // ollama通常不需要API密钥
+        _ => true,
+    };
+    
+    if needs_api_key && found_api_key.is_none() {
+        println!("  ⚠️  缺少API密钥，请设置 HC_LLM_API_KEY 或 {}", provider_api_key);
+    }
+    
+    // ollama需要base_url但没有找到时提示
+    if provider.to_lowercase() == "ollama" && found_base_url.is_none() {
+        println!("  ⚠️  Ollama需要设置 HC_LLM_BASE_URL 或 {}", provider_base_url);
+    }
+    
+    // 检查超时配置
+    let timeout_secs = env::var("HC_LLM_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(180);
+    
+    println!("  ⏰ 请求超时: {}秒", timeout_secs);
+    
+    if timeout_secs > 300 {
+        println!("  💡 提示: 超时时间较长({}秒)，可能导致等待时间过久", timeout_secs);
+    }
+    
+    println!("  🚀 配置检查完成，开始聊天...");
+    println!();
     
     Ok(())
 }
