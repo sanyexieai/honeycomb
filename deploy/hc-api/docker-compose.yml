@@ -1,0 +1,17 @@
+services:
+  hc-api:
+    image: ${HC_API_IMAGE}
+    container_name: hc-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HC_API_BIND: 0.0.0.0:8787
+      HC_WORKSPACE_ROOT: /app/workspace
+    ports:
+      - "${HC_API_PORT:-8787}:8787"
+    volumes:
+      - hc-api-workspace:/app/workspace
+
+volumes:
+  hc-api-workspace:

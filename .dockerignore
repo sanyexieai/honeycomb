@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+target
+target_verify
+workspace
+deploy
+docs
+mcp
+*.log
+.DS_Store
