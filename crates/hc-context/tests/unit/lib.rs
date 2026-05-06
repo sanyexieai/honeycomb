@@ -1048,7 +1048,7 @@ fn infer_tool_execution_signals_marks_success_and_validation() {
         summary: "Found 3 rg match lines.".to_owned(),
         observations: vec![
             "crates/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
-            "apps/hc-context-cli/src/main.rs:10:AssetView".to_owned(),
+            "apps/hc-cli/src/main.rs:10:AssetView".to_owned(),
         ],
     };
 

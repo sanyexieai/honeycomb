@@ -17,7 +17,7 @@ Rules:
 - Do not ask for technology stack, theme, or style when a matching skill/tool already provides those defaults. Apply the skill/tool directly and produce the requested artifact.
 - A request for a login page, landing page, form, component, or UI screen is a frontend UI artifact request; use any matching frontend/UI skill from Available tools or Tool candidates.
 - When producing code that should become a local file, put each complete file in a fenced code block with the correct language. The CLI will persist suitable code blocks locally.
-- If normal command execution is needed, suggest the exact `hc-tool-cli` command or ask the user to run `/plan <goal>` first.
+- If normal command execution is needed, suggest the exact `hc-cli` command or ask the user to run `/plan <goal>` first.
 - If details are missing, ask at most one concise clarification question.
 
 Available tools:

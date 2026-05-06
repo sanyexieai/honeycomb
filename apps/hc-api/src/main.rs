@@ -1,14 +1,16 @@
 #![recursion_limit = "256"]
 
 use std::{
-    collections::BTreeSet, convert::Infallible, env, fs, net::SocketAddr, path::PathBuf,
-    time::Duration,
+    collections::BTreeSet, convert::Infallible, env, net::SocketAddr, time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::{
         Html, IntoResponse, Response,
@@ -17,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt;
+use hc_bootstrap::{default_tenant_id, default_user_id, load_local_env_file, workspace_root};
 use hc_conversation::{ConversationRepository, now_unix};
 use hc_protocol::{
     AgentListResponse, AgentRouteRequest, AgentRouteResponse, ApiNamespace, ChatRequest,
@@ -115,6 +118,7 @@ struct ProposalActionRequest {
     proposal_id: String,
 }
 
+/// Minimal `{ "text": "..." }` body for lightweight clients (legacy `/v1/messages` compatibility).
 #[derive(Debug, Clone, Deserialize)]
 struct UserMessageRequest {
     text: String,
@@ -128,6 +132,126 @@ struct UserMessageRequest {
     agent_id: Option<String>,
     #[serde(default)]
     domain_id: Option<String>,
+}
+
+#[allow(dead_code)]
+fn chat_request_from_user_message(request: UserMessageRequest) -> ChatRequest {
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        request.tenant_id.clone(),
+        request.user_id.clone(),
+    );
+    ChatRequest {
+        tenant_id: Some(namespace.tenant_id.clone()),
+        user_id: Some(namespace.user_id.clone()),
+        session_id: normalized_optional_string(request.session_id),
+        input: Some(request.text),
+        messages: Vec::new(),
+        provider: None,
+        model: None,
+        system_prompt: None,
+        agent_id: normalized_optional_string(request.agent_id),
+        domain_id: normalized_optional_string(request.domain_id),
+        active_agent_id: None,
+        active_task_id: None,
+        memory: hc_protocol::ApiMemoryQuery {
+            namespace,
+            scope: None,
+            kind: None,
+            tag: None,
+            text: None,
+            limit: None,
+        },
+        temperature: None,
+        max_output_tokens: None,
+    }
+}
+
+async fn chat_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.on_upgrade(move |socket| chat_ws_session(socket, state))
+}
+
+async fn chat_ws_session(mut socket: WebSocket, state: AppState) {
+    let first_text = loop {
+        match socket.recv().await {
+            None => return,
+            Some(Ok(Message::Text(t))) => break t,
+            Some(Ok(Message::Ping(p))) => {
+                let _ = socket.send(Message::Pong(p)).await;
+            }
+            Some(Ok(Message::Close(_))) | Some(Err(_)) => return,
+            Some(Ok(_)) => {}
+        }
+    };
+
+    let request: ChatRequest = match serde_json::from_str(&first_text) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = socket
+                .send(Message::Text(
+                    json!({
+                        "event": "chat.error",
+                        "id": format!("chat.error.{}", now_unix()),
+                        "data": {
+                            "type": "chat_error",
+                            "error": format!("invalid ChatRequest JSON: {error}"),
+                        },
+                    })
+                    .to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+    let tx_blocking = tx.clone();
+    let service = state.service.clone();
+    tokio::spawn(async move {
+        let response = tokio::task::spawn_blocking(move || {
+            let mut on_event = |event: TurnStreamEvent| -> Result<()> {
+                let event_name = turn_stream_event_name(&event);
+                let id = format!("{event_name}.{}", now_unix());
+                let payload = serde_json::to_value(&event)?;
+                let message = json!({
+                    "event": event_name,
+                    "id": id,
+                    "data": payload,
+                })
+                .to_string();
+                tx_blocking
+                    .blocking_send(message)
+                    .map_err(|_| anyhow!("chat ws client disconnected"))?;
+                Ok(())
+            };
+            handle_turn_stream_request(&service, request, &mut on_event)
+        })
+        .await
+        .map_err(|error| anyhow!("chat ws worker failed: {error}"))
+        .and_then(|result| result);
+
+        if let Err(error) = response {
+            let _ = tx
+                .send(
+                    json!({
+                        "event": "chat.error",
+                        "id": format!("chat.error.{}", now_unix()),
+                        "data": {
+                            "type": "chat_error",
+                            "error": error.to_string(),
+                        },
+                    })
+                    .to_string(),
+                )
+                .await;
+        }
+    });
+
+    while let Some(text) = rx.recv().await {
+        if socket.send(Message::Text(text)).await.is_err() {
+            break;
+        }
+    }
 }
 
 #[tokio::main]
@@ -179,10 +303,7 @@ async fn main() -> Result<()> {
         .route("/v1/agents/route", post(agent_route))
         .route("/v1/chat", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
-        .route("/v1/turn", post(turn))
-        .route("/v1/turn/stream", post(turn_stream))
-        .route("/v1/messages", post(message))
-        .route("/v1/messages/stream", post(message_stream))
+        .route("/v1/chat/ws", get(chat_ws))
         .with_state(state);
 
     println!("hc-api listening on http://{bind_addr}");
@@ -563,40 +684,7 @@ async fn chat(
     Ok(Json(response))
 }
 
-async fn turn(
-    State(state): State<AppState>,
-    Json(request): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    let response =
-        tokio::task::spawn_blocking(move || handle_turn_request(&state.service, request))
-            .await
-            .map_err(|error| ApiError(anyhow!("turn worker failed: {error}")))?
-            .map_err(ApiError::from)?;
-    Ok(Json(response))
-}
-
-async fn message(
-    State(state): State<AppState>,
-    Json(request): Json<UserMessageRequest>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    turn(State(state), Json(chat_request_from_user_message(request))).await
-}
-
 async fn chat_stream(
-    State(state): State<AppState>,
-    Json(request): Json<ChatRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    turn_stream(State(state), Json(request)).await
-}
-
-async fn message_stream(
-    State(state): State<AppState>,
-    Json(request): Json<UserMessageRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    turn_stream(State(state), Json(chat_request_from_user_message(request))).await
-}
-
-async fn turn_stream(
     State(state): State<AppState>,
     Json(request): Json<ChatRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -638,38 +726,6 @@ async fn turn_stream(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
-}
-
-fn chat_request_from_user_message(request: UserMessageRequest) -> ChatRequest {
-    let namespace = normalized_request_namespace(
-        ApiNamespace::default(),
-        request.tenant_id.clone(),
-        request.user_id.clone(),
-    );
-    ChatRequest {
-        tenant_id: Some(namespace.tenant_id.clone()),
-        user_id: Some(namespace.user_id.clone()),
-        session_id: normalized_optional_string(request.session_id),
-        input: Some(request.text),
-        messages: Vec::new(),
-        provider: None,
-        model: None,
-        system_prompt: None,
-        agent_id: normalized_optional_string(request.agent_id),
-        domain_id: normalized_optional_string(request.domain_id),
-        active_agent_id: None,
-        active_task_id: None,
-        memory: hc_protocol::ApiMemoryQuery {
-            namespace,
-            scope: None,
-            kind: None,
-            tag: None,
-            text: None,
-            limit: None,
-        },
-        temperature: None,
-        max_output_tokens: None,
-    }
 }
 
 fn chat_stream_event_name(event: &ChatStreamEvent) -> &'static str {
@@ -1013,7 +1069,7 @@ fn openapi_document() -> Value {
                 "post": {
                     "summary": "Generate a chat response over Server-Sent Events",
                     "operationId": "streamChat",
-                    "description": "Streams chat lifecycle events and model deltas. Events include chat.started, chat.delta, chat.completed, and chat.error.",
+                    "description": "Streams chat lifecycle events and model deltas. Events include turn.started, turn.tool, turn.completed, chat.started, chat.delta, chat.completed, and chat.error.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -1034,115 +1090,11 @@ fn openapi_document() -> Value {
                     }
                 }
             },
-            "/v1/turn": {
-                "post": {
-                    "summary": "Run one conversational turn",
-                    "operationId": "runTurn",
-                    "description": "Canonical non-streaming turn endpoint. It currently delegates to chat generation and is the stable API surface for moving CLI turn nodes into the service layer.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/ChatRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Completed turn response",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/ChatResponse" }
-                                }
-                            }
-                        },
-                        "400": { "$ref": "#/components/responses/BadRequest" },
-                        "500": { "$ref": "#/components/responses/InternalError" }
-                    }
-                }
-            },
-            "/v1/turn/stream": {
-                "post": {
-                    "summary": "Run one conversational turn over Server-Sent Events",
-                    "operationId": "streamTurn",
-                    "description": "Canonical streaming turn endpoint. Events include turn.started, chat.started, chat.delta, chat.completed, turn.completed, and chat.error.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/ChatRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "SSE stream of turn and chat events",
-                            "content": {
-                                "text/event-stream": {
-                                    "schema": { "type": "string" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/v1/messages": {
-                "post": {
-                    "summary": "Send a user message",
-                    "operationId": "sendMessage",
-                    "description": "Lightweight user-facing message endpoint. Server-side runtime variables and routing decide provider, model, memory, and agent behavior.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/UserMessageRequest" },
-                                "examples": {
-                                    "simple": {
-                                        "value": {
-                                            "text": "中午推荐我吃什么"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Completed message response",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/ChatResponse" }
-                                }
-                            }
-                        },
-                        "400": { "$ref": "#/components/responses/BadRequest" },
-                        "500": { "$ref": "#/components/responses/InternalError" }
-                    }
-                }
-            },
-            "/v1/messages/stream": {
-                "post": {
-                    "summary": "Send a user message over Server-Sent Events",
-                    "operationId": "streamMessage",
-                    "description": "Lightweight streaming message endpoint. Events are the same as /v1/turn/stream.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/UserMessageRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "SSE stream of turn and chat events",
-                            "content": {
-                                "text/event-stream": {
-                                    "schema": { "type": "string" }
-                                }
-                            }
-                        }
-                    }
+            "/v1/chat/ws": {
+                "get": {
+                    "summary": "WebSocket chat stream",
+                    "operationId": "streamChatWebSocket",
+                    "description": "Open WebSocket upgrade on GET. After the handshake, send one text frame containing a ChatRequest JSON body; the server streams JSON event messages with the same payload shape as SSE /v1/chat/stream (fields event, id, data). OpenAPI cannot fully describe WebSocket frames; use this entry as a capability marker."
                 }
             },
             "/v1/agents": {
@@ -1567,36 +1519,6 @@ fn openapi_document() -> Value {
                         }
                     }
                 },
-                "UserMessageRequest": {
-                    "type": "object",
-                    "required": ["text"],
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "User-visible message text."
-                        },
-                        "tenant_id": {
-                            "type": "string",
-                            "default": "local"
-                        },
-                        "user_id": {
-                            "type": "string",
-                            "default": "default"
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "Optional conversation/session id. Empty values use a namespace-scoped default session."
-                        },
-                        "agent_id": {
-                            "type": "string",
-                            "description": "Optional explicit agent id."
-                        },
-                        "domain_id": {
-                            "type": "string",
-                            "description": "Optional domain hint."
-                        }
-                    }
-                },
                 "MemoryRef": {
                     "type": "object",
                     "required": [
@@ -1886,61 +1808,6 @@ fn bind_addr() -> Result<SocketAddr> {
         .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
         .parse()
         .context("invalid HC_API_BIND")
-}
-
-fn workspace_root() -> PathBuf {
-    env::var("HC_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("workspace"))
-}
-
-fn default_tenant_id() -> String {
-    "local".to_owned()
-}
-
-fn default_user_id() -> String {
-    "default".to_owned()
-}
-
-fn load_local_env_file() -> Result<()> {
-    let env_path = env::current_dir()
-        .context("failed to read current directory")?
-        .join(".env");
-    if !env_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&env_path)
-        .with_context(|| format!("failed to read {}", env_path.display()))?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() || env::var_os(key).is_some() {
-            continue;
-        }
-        unsafe {
-            env::set_var(key, clean_env_value(value));
-        }
-    }
-    Ok(())
-}
-
-fn clean_env_value(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        trimmed[1..trimmed.len() - 1].to_owned()
-    } else {
-        trimmed.to_owned()
-    }
 }
 
 const SWAGGER_UI_HTML: &str = r##"<!doctype html>

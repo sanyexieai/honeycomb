@@ -1,13 +1,15 @@
 use super::{
-    KeywordToolSelector, TimedSequenceRule, ToolSelector, build_chat_request_history,
-    build_from_create_tool_command, code_block_extension, execute_builtin_tool,
-    expand_default_command_token_in_root, extract_code_blocks, extract_create_tool_command,
-    extract_i64_numbers, looks_like_complete_artifact, parse_tool_build_response,
-    parse_tool_route_response, reminder_delay_seconds, render_chat_error,
+    KeywordToolSelector, ToolSelector, build_chat_request_history, build_from_create_tool_command,
+    code_block_extension, execute_builtin_tool, expand_default_command_token_in_root,
+    extract_code_blocks, extract_create_tool_command, looks_like_complete_artifact,
+    parse_tool_build_response, parse_tool_route_response, render_chat_error,
     render_tool_execution_context, render_tool_selection_context, sanitize_model_response,
     score_tool_for_goal, selection_input_from_history, skill_from_natural_language_draft,
-    timed_sequence_end, tool_from_natural_language_draft,
-    try_execute_create_tool_command_from_response, write_generated_tool_files_under,
+    tool_from_natural_language_draft, try_execute_create_tool_command_from_response,
+    write_generated_tool_files_under,
+};
+use hc_service::timed_turn::{
+    TimedSequenceRule, extract_i64_numbers, reminder_delay_seconds, timed_sequence_end,
 };
 use hc_capability::ModelDependence;
 use hc_llm::{ChatMessage, LlmError, MessageRole};
@@ -71,7 +73,7 @@ fn selection_context_surfaces_candidates_even_without_keyword_hit() {
         .expect("tool selection should run");
     let context =
         render_tool_selection_context(&selection).expect("candidate context should be available");
-    assert!(context.contains("Tool candidates"));
+    assert!(context.contains("Internal tool candidates"));
     assert!(context.contains("tool.frontend-red-theme"));
 }
 
@@ -215,7 +217,7 @@ fn renders_tool_execution_context_for_llm_followup() {
 
     let context = render_tool_execution_context(&plan, &outcome);
 
-    assert!(context.contains("Executed tool"));
+    assert!(context.contains("Internal execution record"));
     assert!(context.contains("tool.local-file.read"));
     assert!(context.contains("content: hello"));
 }
@@ -243,7 +245,7 @@ fn tool_builder_can_return_generated_files() {
 
 #[test]
 fn generated_tool_files_are_workspace_relative_and_expandable() {
-    let root = unique_temp_dir("hc-tool-cli-generated-files");
+    let root = unique_temp_dir("hc-cli-generated-files");
     let files = vec![super::NaturalLanguageToolFileDraft {
         path: "tools/bin/demo.sh".to_owned(),
         content: "#!/usr/bin/env bash\necho demo\n".to_owned(),
@@ -358,7 +360,7 @@ fn builds_tool_creation_from_command_fallback() {
 
 #[test]
 fn builtin_local_file_tool_writes_and_reads_content() {
-    let root = unique_temp_dir("hc-tool-cli-file-tool");
+    let root = unique_temp_dir("hc-cli-file-tool");
     fs::create_dir_all(&root).expect("temp dir should create");
     let path = root.join("login.html");
     let write_tool = local_file_tool("tool.local-file.write", "hc.local-file.write");
@@ -419,7 +421,7 @@ fn builtin_local_file_tool_writes_and_reads_content() {
 
 #[test]
 fn builtin_local_dir_tool_lists_entries() {
-    let root = unique_temp_dir("hc-tool-cli-dir-tool");
+    let root = unique_temp_dir("hc-cli-dir-tool");
     fs::create_dir_all(root.join("nested")).expect("nested dir should create");
     fs::write(root.join("alpha.txt"), "alpha").expect("file should write");
     let tool = local_file_tool("tool.local-dir.list", "hc.local-dir.list");

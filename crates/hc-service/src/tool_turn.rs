@@ -10,11 +10,12 @@ use serde_json::{Map, Value};
 
 use crate::{
     ServiceConfig,
+    timed_turn::{ReminderRule, TimedSequenceRule},
     tool::{McpToolCallRequest, McpToolListRequest, call_configured_mcp_tool, list_mcp_tools},
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
-struct ToolRoutingTags {
+pub(crate) struct ToolRoutingTags {
     #[serde(default)]
     intent_rules: Vec<ToolIntentRoutingRule>,
     #[serde(default)]
@@ -29,6 +30,19 @@ struct ToolRoutingTags {
     tool_argument_rules: Vec<ToolScopedArgumentRule>,
     #[serde(default)]
     confirmation_flows: Vec<ToolConfirmationFlowRule>,
+    #[serde(default)]
+    pub(crate) timed_sequence_rules: Vec<TimedSequenceRule>,
+    #[serde(default)]
+    pub(crate) reminder_rules: Vec<ReminderRule>,
+}
+
+impl ToolRoutingTags {
+    pub(crate) fn ensure_builtin_timed_sequences(&mut self) {
+        if !self.timed_sequence_rules.is_empty() {
+            return;
+        }
+        self.timed_sequence_rules = crate::timed_turn::builtin_timed_sequence_rules();
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -208,6 +222,14 @@ pub fn try_handle_configured_mcp_turn(
     if let Some(tool_result) = try_handle_persisted_pending_confirmation(config, request)? {
         return Ok(Some(tool_result));
     }
+    try_handle_configured_mcp_route_turn(config, request)
+}
+
+/// Configured MCP route only (no pending-confirmation branch). Use when confirmation was handled earlier.
+pub fn try_handle_configured_mcp_route_turn(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+) -> Result<Option<ToolTurnResult>> {
     let Some(route) = resolve_configured_mcp_route(config, request)? else {
         return Ok(None);
     };
@@ -557,7 +579,7 @@ pub fn is_confirmation_turn(config: &ServiceConfig, namespace: &ApiNamespace, in
     })
 }
 
-fn request_input(request: &ChatRequest) -> Result<String> {
+pub(crate) fn request_input(request: &ChatRequest) -> Result<String> {
     if let Some(input) = request.input.as_deref()
         && !input.trim().is_empty()
     {
@@ -572,7 +594,7 @@ fn request_input(request: &ChatRequest) -> Result<String> {
         .context("turn request requires input or a user message")
 }
 
-fn request_namespace(request: &ChatRequest) -> ApiNamespace {
+pub(crate) fn request_namespace(request: &ChatRequest) -> ApiNamespace {
     let mut namespace = request.memory.namespace.clone();
     if let Some(tenant_id) = request
         .tenant_id
@@ -1200,11 +1222,13 @@ fn compact(value: &str, max_len: usize) -> String {
         + "…"
 }
 
-fn load_tool_routing_tags(
+pub(crate) fn load_tool_routing_tags(
     config: &ServiceConfig,
     namespace: &ApiNamespace,
 ) -> Result<ToolRoutingTags> {
-    load_frontmatter(config, namespace, "routing/tool-routing-tags.md")
+    let mut tags: ToolRoutingTags = load_frontmatter(config, namespace, "routing/tool-routing-tags.md")?;
+    tags.ensure_builtin_timed_sequences();
+    Ok(tags)
 }
 
 fn load_tool_response_rendering(

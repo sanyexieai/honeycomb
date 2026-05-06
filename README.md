@@ -21,7 +21,8 @@ Honeycomb is a Rust-first ecosystem centered on a cross-platform command runtime
 
 ```text
 apps/
-  hc/                 Core CLI entry
+  hc-cli/             Unified CLI entry
+  hc-api/             Unified API entry
 crates/
   hc-protocol/        Shared schemas and traits
   hc-core/            Runtime model and orchestration
@@ -71,10 +72,10 @@ This repository currently contains:
 
 ## Run
 
-Core terminal:
+Unified CLI entry:
 
 ```powershell
-cargo run -p hc
+cargo run -p hc-cli -- help
 ```
 
 With an explicit tenant/user namespace:
@@ -82,27 +83,16 @@ With an explicit tenant/user namespace:
 ```powershell
 $env:HC_TENANT_ID="local"
 $env:HC_USER_ID="alice"
-cargo run -p hc
+cargo run -p hc-cli -- chat
 ```
 
-Standalone LLM CLI:
+Unified API entry:
 
 ```powershell
-cargo run -p hc-llm-cli -- config llm --provider openai --api-key <your-key>
-cargo run -p hc-llm-cli -- config show
-cargo run -p hc-llm-cli -- providers
-cargo run -p hc-llm-cli -- generate "hello"
+cargo run -p hc-api
 ```
 
-You can also copy [.env.example](/mnt/code_disk/code/rust/honeycomb/.env.example) to `.env` in the repo root. `hc-llm-cli` and `hc-context-cli` both auto-load that file from the current working directory.
-
-With a real OpenAI-compatible endpoint:
-
-```powershell
-$env:OPENAI_API_KEY="..."
-cargo run -p hc-llm-cli -- providers
-cargo run -p hc-llm-cli -- generate "hello" --provider openai --model gpt-4.1-mini
-```
+You can also copy [.env.example](/mnt/code_disk/code/rust/honeycomb/.env.example) to `.env` in the repo root. `hc-cli` and `hc-api` both auto-load that file from the current working directory.
 
 Desktop multi-window shell:
 

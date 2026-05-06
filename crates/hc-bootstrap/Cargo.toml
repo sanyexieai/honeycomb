@@ -1,5 +1,5 @@
 [package]
-name = "hc-responder-cli"
+name = "hc-bootstrap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,5 +7,3 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-hc-responder = { path = "../../crates/hc-responder" }
-hc-store = { path = "../../crates/hc-store" }

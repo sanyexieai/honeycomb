@@ -11,6 +11,7 @@ hc-agent = { path = "../hc-agent" }
 hc-capability = { path = "../hc-capability" }
 hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }
+hc-intent = { path = "../hc-intent" }
 hc-llm = { path = "../hc-llm" }
 hc-protocol = { path = "../hc-protocol" }
 hc-scheduler = { path = "../hc-scheduler" }

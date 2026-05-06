@@ -285,14 +285,14 @@ target:
 5. Add tool/MCP adapter through `hc-toolchain`.
 6. Add agent adapter through `hc-agent` or `hc-service`.
 7. Add CLI commands:
-   - `hc-tool-cli schedule add`
-   - `hc-tool-cli schedule list`
-   - `hc-tool-cli schedule run-due`
-   - `hc-tool-cli schedule pause`
-   - `hc-tool-cli schedule resume`
-   - `hc-tool-cli schedule dispatch-queued`
-   - `hc-tool-cli schedule dispatch-due`
-   - `hc-tool-cli schedule watch`
+   - `hc-cli schedule add`
+   - `hc-cli schedule list`
+   - `hc-cli schedule run-due`
+   - `hc-cli schedule pause`
+   - `hc-cli schedule resume`
+   - `hc-cli schedule dispatch-queued`
+   - `hc-cli schedule dispatch-due`
+   - `hc-cli schedule watch`
 8. Later, run the scheduler loop inside `hc-api` or a dedicated daemon.
 
 ## Current CLI Surface
@@ -300,15 +300,15 @@ target:
 The first implementation exposes a small generic control plane:
 
 ```text
-hc-tool-cli schedule add --id <id> --title <text> --kind <once|interval> --run-at-unix <ts> [--interval-seconds <n>] --target-kind <agent|tool|mcp|command|event> --target-ref <id> [--target-action <name>] [--arg key=value] [--json]
-hc-tool-cli schedule list [--json]
-hc-tool-cli schedule run-due [--now-unix <ts>] [--json]
-hc-tool-cli schedule runs [--json]
-hc-tool-cli schedule pause --id <id> [--json]
-hc-tool-cli schedule resume --id <id> [--json]
-hc-tool-cli schedule dispatch-queued [--now-unix <ts>] [--json]
-hc-tool-cli schedule dispatch-due [--now-unix <ts>] [--json]
-hc-tool-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]
+hc-cli schedule add --id <id> --title <text> --kind <once|interval> --run-at-unix <ts> [--interval-seconds <n>] --target-kind <agent|tool|mcp|command|event> --target-ref <id> [--target-action <name>] [--arg key=value] [--json]
+hc-cli schedule list [--json]
+hc-cli schedule run-due [--now-unix <ts>] [--json]
+hc-cli schedule runs [--json]
+hc-cli schedule pause --id <id> [--json]
+hc-cli schedule resume --id <id> [--json]
+hc-cli schedule dispatch-queued [--now-unix <ts>] [--json]
+hc-cli schedule dispatch-due [--now-unix <ts>] [--json]
+hc-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]
 ```
 
 `dispatch-due` is restart-friendly: it first creates any due run records, then dispatches queued runs. `watch` is a thin polling loop over the same behavior and is intentionally not business-aware.

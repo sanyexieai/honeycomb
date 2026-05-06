@@ -1,5 +1,5 @@
 [package]
-name = "hc-tool-cli"
+name = "hc-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,4 +23,6 @@ hc-service = { path = "../../crates/hc-service" }
 hc-skill = { path = "../../crates/hc-skill" }
 hc-store = { path = "../../crates/hc-store" }
 hc-toolchain = { path = "../../crates/hc-toolchain" }
+hc-bootstrap = { path = "../../crates/hc-bootstrap" }
+hc-intent = { path = "../../crates/hc-intent" }
 hc-protocol = { path = "../../crates/hc-protocol" }
