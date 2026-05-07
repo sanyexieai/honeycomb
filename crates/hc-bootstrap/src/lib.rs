@@ -77,6 +77,22 @@ pub fn load_local_env_file() -> Result<()> {
     Ok(())
 }
 
+/// 初始化控制台 tracing 输出：`RUST_LOG` 优先，否则读取 `HC_LOG`，默认 `info,hyper=warn,reqwest=warn`。
+///
+/// 使用 `try_init`，忽略重复初始化（例如测试或多次调用）。
+pub fn init_console_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let directive =
+            env::var("HC_LOG").unwrap_or_else(|_| "info,hyper=warn,reqwest=warn".to_owned());
+        tracing_subscriber::EnvFilter::try_new(&directive)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
+
 fn clean_env_value(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.len() >= 2

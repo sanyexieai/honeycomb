@@ -10,7 +10,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::GB18030;
-use hc_bootstrap::{load_local_env_file, tenant_id_from_env, user_id_from_env, workspace_root};
+use hc_bootstrap::{
+    init_console_tracing, load_local_env_file, tenant_id_from_env, user_id_from_env, workspace_root,
+};
 use hc_intent::{IntentInput, IntentResolution, IntentRouter};
 use hc_agent::phrase_match_score;
 use hc_capability::ModelDependence;
@@ -465,12 +467,13 @@ struct NaturalLanguageSkillDraft {
 fn main() -> Result<()> {
     configure_console_encoding();
     load_local_env_file()?;
-    
+    init_console_tracing();
+
     // 初始化标签系统
     let workspace_root = workspace_root();
     let mut tag_manager = TagSystemManager::new(workspace_root);
     if let Err(e) = tag_manager.initialize() {
-        eprintln!("Warning: Failed to initialize tag system: {}", e);
+        tracing::warn!(error = %e, "failed to initialize tag system");
     }
     let _ = TAG_SYSTEM_MANAGER.set(tag_manager);
     
@@ -806,11 +809,11 @@ fn handle_chat(args: &[String]) -> Result<()> {
             intent_resolution,
         );
         if env_flag("HC_CHAT_DEBUG_INTENT") {
-            eprintln!(
-                "intent> {} conf={:.2} | {}",
-                frame.intent_resolution.primary_intent,
-                frame.intent_resolution.confidence,
-                frame.intent_resolution.reason
+            tracing::info!(
+                intent = %frame.intent_resolution.primary_intent,
+                confidence = frame.intent_resolution.confidence,
+                reason = %frame.intent_resolution.reason,
+                "intent resolution"
             );
         }
         if let Some(room) = &chat_room

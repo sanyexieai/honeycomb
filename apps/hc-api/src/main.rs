@@ -20,8 +20,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use hc_bootstrap::{
-    default_tenant_id, default_user_id, load_local_env_file, tenant_id_from_env, user_id_from_env,
-    workspace_root,
+    default_tenant_id, default_user_id, init_console_tracing, load_local_env_file, tenant_id_from_env,
+    user_id_from_env, workspace_root,
 };
 use hc_conversation::{ConversationRepository, now_unix};
 use hc_memory::{
@@ -301,6 +301,7 @@ async fn chat_ws_session(mut socket: WebSocket, state: AppState) {
 #[tokio::main]
 async fn main() -> Result<()> {
     load_local_env_file()?;
+    init_console_tracing();
     let runtime_config = ApiRuntimeConfig::from_env()?;
     let state = AppState {
         service: ServiceConfig::new(workspace_root()),
@@ -739,8 +740,13 @@ async fn chat(
     
     // 添加房间信息到响应
     response.room_id = request.room_id.clone();
+    let chat_namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        request.tenant_id.clone(),
+        request.user_id.clone(),
+    );
     if let Some(room_id) = &request.room_id {
-        let capabilities_info = get_room_capabilities_info(&state, room_id).await?;
+        let capabilities_info = get_room_capabilities_info(room_id, &chat_namespace).await?;
         response.room_capabilities_used = capabilities_info.capabilities;
         response.room_tools_used = capabilities_info.tools;
         response.room_skills_used = capabilities_info.skills;
@@ -2750,12 +2756,12 @@ async fn enhance_chat_request_with_room_capabilities(
 }
 
 async fn get_room_capabilities_info(
-    state: &AppState,
     room_id: &str,
+    namespace: &ApiNamespace,
 ) -> Result<RoomCapabilitiesInfo, ApiError> {
-    // 使用默认命名空间（可以考虑从请求上下文获取）
-    let namespace = hc_store::store::WorkspaceNamespace::local_default();
-    let repository = MemoryRoomRepository::with_namespace(workspace_root(), namespace);
+    let workspace_ns =
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_ns);
     
     // 查找房间
     let room = match repository.get_room_by_id(room_id)
@@ -2771,8 +2777,8 @@ async fn get_room_capabilities_info(
         }
     };
     
-    // 构建内存命名空间
-    let memory_namespace = MemoryNamespace::new("local", "default");
+    let memory_namespace =
+        MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
     
     // 解析房间能力
     let resolver = RoomCapabilityResolver::new(memory_namespace);
