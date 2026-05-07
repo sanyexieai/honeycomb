@@ -108,9 +108,9 @@ Implementation should proceed in phases:
 2. `hc-ui`
 3. `hc-agent`, `hc-persona`, `hc-memory`, `hc-capability`, and optional higher-level extensions
 
-See [docs/architecture.md](/D:/code/honeycomb/docs/architecture.md), [docs/core.md](/D:/code/honeycomb/docs/core.md), [docs/storage.md](/D:/code/honeycomb/docs/storage.md), and [docs/ui-workbench.md](/D:/code/honeycomb/docs/ui-workbench.md).
+See [docs/architecture.md](docs/architecture.md), [docs/core.md](docs/core.md), [docs/storage.md](docs/storage.md), and [docs/ui-workbench.md](docs/ui-workbench.md).
 
 Implementation guardrails and task-first product flow are documented in:
 
-- [docs/task-driven-product.md](/D:/code/honeycomb/docs/task-driven-product.md)
-- [docs/working-rules.md](/D:/code/honeycomb/docs/working-rules.md)
+- [docs/task-driven-product.md](docs/task-driven-product.md)
+- [docs/working-rules.md](docs/working-rules.md)

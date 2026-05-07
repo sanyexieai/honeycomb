@@ -1,11 +1,11 @@
 //! 向量化匹配模块 - 集成轻量级模型进行语义匹配
 
-use std::collections::HashMap;
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::{TagVector, Dimension};
+use crate::{Dimension, TagVector};
 
 /// 向量化匹配器
 pub struct VectorMatcher {
@@ -30,9 +30,9 @@ pub struct VectorMatcherConfig {
 /// 模型类型
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelType {
-    Local(LocalModelConfig),      // 本地模型
-    Remote(RemoteModelConfig),    // 远程API模型
-    Mock(MockModelConfig),        // 模拟模型（用于测试）
+    Local(LocalModelConfig),   // 本地模型
+    Remote(RemoteModelConfig), // 远程API模型
+    Mock(MockModelConfig),     // 模拟模型（用于测试）
 }
 
 /// 本地模型配置
@@ -82,13 +82,13 @@ impl Default for VectorMatcherConfig {
 pub trait EmbeddingModel: Send + Sync {
     /// 生成文本嵌入向量
     fn encode(&self, text: &str) -> Result<Array1<f32>, EmbeddingError>;
-    
+
     /// 批量生成嵌入向量
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Array1<f32>>, EmbeddingError>;
-    
+
     /// 获取嵌入维度
     fn embedding_dim(&self) -> usize;
-    
+
     /// 模型名称
     fn model_name(&self) -> &str;
 }
@@ -144,7 +144,7 @@ impl VectorMatcher {
     /// 创建新的向量匹配器
     pub fn new(config: VectorMatcherConfig) -> Result<Self, EmbeddingError> {
         let embedding_model = Self::create_embedding_model(&config)?;
-        
+
         Ok(Self {
             embedding_model,
             dimension_embeddings: HashMap::new(),
@@ -154,7 +154,9 @@ impl VectorMatcher {
     }
 
     /// 创建嵌入模型
-    fn create_embedding_model(config: &VectorMatcherConfig) -> Result<Box<dyn EmbeddingModel>, EmbeddingError> {
+    fn create_embedding_model(
+        config: &VectorMatcherConfig,
+    ) -> Result<Box<dyn EmbeddingModel>, EmbeddingError> {
         match &config.model_type {
             ModelType::Mock(mock_config) => {
                 if !config.allow_mock_model {
@@ -169,38 +171,42 @@ impl VectorMatcher {
                 Ok(Box::new(RemoteEmbeddingModel::new(remote_config.clone())?))
             }
             #[cfg(not(feature = "embedding"))]
-            ModelType::Remote(_) => {
-                Err(EmbeddingError::ModelLoadError(
-                    "远程嵌入功能需要启用 'embedding' 特性".to_string()
-                ))
-            }
-            ModelType::Local(_) => {
-                Err(EmbeddingError::ModelLoadError(
-                    "本地模型支持尚未实现".to_string()
-                ))
-            }
+            ModelType::Remote(_) => Err(EmbeddingError::ModelLoadError(
+                "远程嵌入功能需要启用 'embedding' 特性".to_string(),
+            )),
+            ModelType::Local(_) => Err(EmbeddingError::ModelLoadError(
+                "本地模型支持尚未实现".to_string(),
+            )),
         }
     }
 
     /// 预计算维度和关键词的嵌入向量
-    pub fn precompute_embeddings(&mut self, dimensions: &HashMap<String, Dimension>) -> Result<(), EmbeddingError> {
+    pub fn precompute_embeddings(
+        &mut self,
+        dimensions: &HashMap<String, Dimension>,
+    ) -> Result<(), EmbeddingError> {
         for (dimension_id, dimension) in dimensions {
             // 预计算维度描述的嵌入
             let dimension_text = format!("{}: {}", dimension.name, dimension.description);
             let dimension_embedding = self.embedding_model.encode(&dimension_text)?;
-            self.dimension_embeddings.insert(dimension_id.clone(), dimension_embedding);
+            self.dimension_embeddings
+                .insert(dimension_id.clone(), dimension_embedding);
 
             // 预计算关键词嵌入
-            let all_keywords: Vec<&str> = dimension.keywords.high.iter()
+            let all_keywords: Vec<&str> = dimension
+                .keywords
+                .high
+                .iter()
                 .chain(dimension.keywords.medium.iter())
                 .chain(dimension.keywords.low.iter())
                 .map(|s| s.as_str())
                 .collect();
 
             let keyword_embeddings = self.embedding_model.encode_batch(&all_keywords)?;
-            
+
             for (keyword, embedding) in all_keywords.iter().zip(keyword_embeddings.into_iter()) {
-                self.keyword_embeddings.insert(keyword.to_string(), embedding);
+                self.keyword_embeddings
+                    .insert(keyword.to_string(), embedding);
             }
         }
 
@@ -208,12 +214,16 @@ impl VectorMatcher {
     }
 
     /// 基于向量相似度进行匹配
-    pub fn vector_match(&self, input: &str, dimensions: &HashMap<String, Dimension>) -> Result<Vec<VectorMatchResult>, EmbeddingError> {
+    pub fn vector_match(
+        &self,
+        input: &str,
+        dimensions: &HashMap<String, Dimension>,
+    ) -> Result<Vec<VectorMatchResult>, EmbeddingError> {
         // 生成输入文本的嵌入向量
         let input_embedding = self.embedding_model.encode(input)?;
-        
+
         let mut results = Vec::new();
-        
+
         for (dimension_id, dimension) in dimensions {
             let match_result = self.match_dimension(&input_embedding, dimension_id, dimension)?;
             if match_result.similarity_score >= self.config.similarity_threshold {
@@ -222,13 +232,22 @@ impl VectorMatcher {
         }
 
         // 按相似度排序
-        results.sort_by(|a, b| b.similarity_score.partial_cmp(&a.similarity_score).unwrap_or(std::cmp::Ordering::Equal));
-        
+        results.sort_by(|a, b| {
+            b.similarity_score
+                .partial_cmp(&a.similarity_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         Ok(results)
     }
 
     /// 匹配单个维度
-    fn match_dimension(&self, input_embedding: &Array1<f32>, dimension_id: &str, dimension: &Dimension) -> Result<VectorMatchResult, EmbeddingError> {
+    fn match_dimension(
+        &self,
+        input_embedding: &Array1<f32>,
+        dimension_id: &str,
+        dimension: &Dimension,
+    ) -> Result<VectorMatchResult, EmbeddingError> {
         let mut matched_keywords = Vec::new();
         let mut total_similarity = 0.0f32;
         let mut keyword_count = 0;
@@ -282,11 +301,12 @@ impl VectorMatcher {
         }
 
         // 计算维度级别的相似度
-        let dimension_similarity = if let Some(dimension_embedding) = self.dimension_embeddings.get(dimension_id) {
-            self.cosine_similarity(input_embedding, dimension_embedding)
-        } else {
-            0.0
-        };
+        let dimension_similarity =
+            if let Some(dimension_embedding) = self.dimension_embeddings.get(dimension_id) {
+                self.cosine_similarity(input_embedding, dimension_embedding)
+            } else {
+                0.0
+            };
 
         // 综合相似度分数
         let final_similarity = if keyword_count > 0 {
@@ -327,7 +347,8 @@ impl VectorMatcher {
     /// 分析语义上下文
     fn analyze_semantic_context(&self, matched_keywords: &[KeywordMatch]) -> SemanticContext {
         // 简化的语义分析
-        let dominant_themes = matched_keywords.iter()
+        let dominant_themes = matched_keywords
+            .iter()
             .filter(|m| m.similarity > 0.8)
             .map(|m| m.keyword.clone())
             .collect();
@@ -335,24 +356,29 @@ impl VectorMatcher {
         let semantic_density = if matched_keywords.is_empty() {
             0.0
         } else {
-            matched_keywords.iter().map(|m| m.similarity).sum::<f32>() / matched_keywords.len() as f32
+            matched_keywords.iter().map(|m| m.similarity).sum::<f32>()
+                / matched_keywords.len() as f32
         };
 
         let context_coherence = if matched_keywords.len() >= 2 {
             // 计算关键词之间的一致性
             let mut coherence_sum = 0.0f32;
             let mut pairs = 0;
-            
+
             for i in 0..matched_keywords.len() {
-                for j in (i+1)..matched_keywords.len() {
+                for j in (i + 1)..matched_keywords.len() {
                     if matched_keywords[i].weight_category == matched_keywords[j].weight_category {
                         coherence_sum += 0.1;
                     }
                     pairs += 1;
                 }
             }
-            
-            if pairs > 0 { coherence_sum / pairs as f32 } else { 0.0 }
+
+            if pairs > 0 {
+                coherence_sum / pairs as f32
+            } else {
+                0.0
+            }
         } else {
             0.5
         };
@@ -365,7 +391,11 @@ impl VectorMatcher {
     }
 
     /// 将向量匹配结果转换为标签向量
-    pub fn vector_results_to_tag_vector(&self, vector_results: &[VectorMatchResult], dimensions: &HashMap<String, Dimension>) -> TagVector {
+    pub fn vector_results_to_tag_vector(
+        &self,
+        vector_results: &[VectorMatchResult],
+        dimensions: &HashMap<String, Dimension>,
+    ) -> TagVector {
         let mut tag_vector = TagVector::new();
 
         for result in vector_results {
@@ -374,12 +404,13 @@ impl VectorMatcher {
                 let base_score = result.similarity_score;
                 let semantic_boost = result.semantic_context.semantic_density * 0.2;
                 let coherence_boost = result.semantic_context.context_coherence * 0.1;
-                
+
                 let final_score = (base_score + semantic_boost + coherence_boost).min(1.0);
-                
+
                 // 应用维度默认值加权
-                let adjusted_score = (dimension.default_value * 0.3 + final_score * 0.7).clamp(0.0, 1.0);
-                
+                let adjusted_score =
+                    (dimension.default_value * 0.3 + final_score * 0.7).clamp(0.0, 1.0);
+
                 tag_vector.set(&result.dimension_id, adjusted_score);
             }
         }
@@ -427,17 +458,65 @@ impl MockEmbeddingModel {
     fn initialize_mock_embeddings(&mut self) {
         let keywords = [
             // 创造性相关
-            "create", "创建", "design", "设计", "innovative", "创新", "invent", "发明",
-            "original", "原创", "creative", "创造", "brainstorm", "头脑风暴",
+            "create",
+            "创建",
+            "design",
+            "设计",
+            "innovative",
+            "创新",
+            "invent",
+            "发明",
+            "original",
+            "原创",
+            "creative",
+            "创造",
+            "brainstorm",
+            "头脑风暴",
             // 复杂性相关
-            "complex", "复杂", "difficult", "困难", "advanced", "高级", "sophisticated", "精密",
-            "intricate", "复杂的", "technical", "技术", "detailed", "详细",
+            "complex",
+            "复杂",
+            "difficult",
+            "困难",
+            "advanced",
+            "高级",
+            "sophisticated",
+            "精密",
+            "intricate",
+            "复杂的",
+            "technical",
+            "技术",
+            "detailed",
+            "详细",
             // 紧急性相关
-            "urgent", "紧急", "critical", "关键", "important", "重要", "priority", "优先",
-            "asap", "立即", "quickly", "快速", "immediate", "马上",
+            "urgent",
+            "紧急",
+            "critical",
+            "关键",
+            "important",
+            "重要",
+            "priority",
+            "优先",
+            "asap",
+            "立即",
+            "quickly",
+            "快速",
+            "immediate",
+            "马上",
             // 基础词汇
-            "simple", "简单", "easy", "容易", "basic", "基础", "routine", "例行",
-            "standard", "标准", "normal", "正常", "regular", "常规",
+            "simple",
+            "简单",
+            "easy",
+            "容易",
+            "basic",
+            "基础",
+            "routine",
+            "例行",
+            "standard",
+            "标准",
+            "normal",
+            "正常",
+            "regular",
+            "常规",
         ];
 
         for (i, keyword) in keywords.iter().enumerate() {
@@ -453,10 +532,10 @@ impl MockEmbeddingModel {
     /// 生成确定性的嵌入向量（用于测试）
     fn generate_deterministic_embedding(&self, word: &str, index: usize) -> Array1<f32> {
         let mut embedding = Array1::zeros(self.config.embedding_dim);
-        
+
         // 基于词汇特征生成向量
         let word_hash = word.chars().map(|c| c as u32).sum::<u32>() as f32;
-        
+
         for i in 0..self.config.embedding_dim {
             let value = ((word_hash + i as f32 + index as f32).sin() * 0.5).abs();
             embedding[i] = value;
@@ -551,7 +630,9 @@ impl EmbeddingModel for RemoteEmbeddingModel {
     fn encode(&self, text: &str) -> Result<Array1<f32>, EmbeddingError> {
         // 这里应该实现实际的远程API调用
         // 为了简化，现在返回模拟结果
-        Err(EmbeddingError::EncodingError("远程嵌入服务尚未实现".to_string()))
+        Err(EmbeddingError::EncodingError(
+            "远程嵌入服务尚未实现".to_string(),
+        ))
     }
 
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Array1<f32>>, EmbeddingError> {
@@ -578,20 +659,27 @@ mod tests {
 
     fn create_test_dimensions() -> HashMap<String, Dimension> {
         let mut dimensions = HashMap::new();
-        
-        dimensions.insert("creativity_level".to_string(), Dimension {
-            id: "creativity_level".to_string(),
-            name: "Creativity Level".to_string(),
-            description: "Measures creative and innovative aspects".to_string(),
-            scale_min: 0.0,
-            scale_max: 1.0,
-            default_value: 0.3,
-            keywords: DimensionKeywords {
-                low: vec!["copy".to_string(), "duplicate".to_string()],
-                medium: vec!["modify".to_string(), "improve".to_string()],
-                high: vec!["create".to_string(), "innovative".to_string(), "design".to_string()],
+
+        dimensions.insert(
+            "creativity_level".to_string(),
+            Dimension {
+                id: "creativity_level".to_string(),
+                name: "Creativity Level".to_string(),
+                description: "Measures creative and innovative aspects".to_string(),
+                scale_min: 0.0,
+                scale_max: 1.0,
+                default_value: 0.3,
+                keywords: DimensionKeywords {
+                    low: vec!["copy".to_string(), "duplicate".to_string()],
+                    medium: vec!["modify".to_string(), "improve".to_string()],
+                    high: vec![
+                        "create".to_string(),
+                        "innovative".to_string(),
+                        "design".to_string(),
+                    ],
+                },
             },
-        });
+        );
 
         dimensions
     }
@@ -610,12 +698,14 @@ mod tests {
             use_random: false,
         };
         let model = MockEmbeddingModel::new(config);
-        
+
         let embedding = model.encode("create innovative design").unwrap();
         assert_eq!(embedding.len(), 128);
-        
+
         // 测试批量编码
-        let batch_result = model.encode_batch(&["create", "design", "innovative"]).unwrap();
+        let batch_result = model
+            .encode_batch(&["create", "design", "innovative"])
+            .unwrap();
         assert_eq!(batch_result.len(), 3);
         assert_eq!(batch_result[0].len(), 128);
     }
@@ -624,19 +714,22 @@ mod tests {
     fn test_vector_matching() {
         let dimensions = create_test_dimensions();
         let mut matcher = VectorMatcher::new(VectorMatcherConfig::default()).unwrap();
-        
+
         // 预计算嵌入向量
         assert!(matcher.precompute_embeddings(&dimensions).is_ok());
-        
+
         // 测试向量匹配
-        let results = matcher.vector_match("create innovative design solutions", &dimensions).unwrap();
+        let results = matcher
+            .vector_match("create innovative design solutions", &dimensions)
+            .unwrap();
         assert!(!results.is_empty());
-        
+
         // 验证结果包含创造性维度
-        let creativity_result = results.iter()
+        let creativity_result = results
+            .iter()
             .find(|r| r.dimension_id == "creativity_level");
         assert!(creativity_result.is_some());
-        
+
         let creativity_match = creativity_result.unwrap();
         assert!(creativity_match.similarity_score > 0.0);
         assert!(!creativity_match.matched_keywords.is_empty());
@@ -646,11 +739,13 @@ mod tests {
     fn test_vector_to_tag_conversion() {
         let dimensions = create_test_dimensions();
         let mut matcher = VectorMatcher::new(VectorMatcherConfig::default()).unwrap();
-        
+
         matcher.precompute_embeddings(&dimensions).unwrap();
-        let results = matcher.vector_match("design creative solutions", &dimensions).unwrap();
+        let results = matcher
+            .vector_match("design creative solutions", &dimensions)
+            .unwrap();
         let tag_vector = matcher.vector_results_to_tag_vector(&results, &dimensions);
-        
+
         assert!(tag_vector.get("creativity_level") > 0.0);
         assert!(tag_vector.get("creativity_level") <= 1.0);
     }
@@ -658,14 +753,14 @@ mod tests {
     #[test]
     fn test_cosine_similarity() {
         let matcher = VectorMatcher::new(VectorMatcherConfig::default()).unwrap();
-        
+
         let vec1 = Array1::from(vec![1.0, 0.0, 0.0]);
         let vec2 = Array1::from(vec![0.0, 1.0, 0.0]);
         let vec3 = Array1::from(vec![1.0, 0.0, 0.0]);
-        
+
         let sim1 = matcher.cosine_similarity(&vec1, &vec2);
         let sim2 = matcher.cosine_similarity(&vec1, &vec3);
-        
+
         assert_eq!(sim1, 0.0); // 垂直向量
         assert_eq!(sim2, 1.0); // 相同向量
     }

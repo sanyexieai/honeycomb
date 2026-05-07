@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// 行为模式 - 定义系统的思考和执行方式
@@ -32,12 +32,12 @@ impl BehaviorPattern {
     pub const fn get_system_default() -> Self {
         BehaviorPattern::Creative
     }
-    
+
     /// 从字符串解析行为模式，失败时返回系统默认值
     pub fn from_str_or_default(s: &str) -> Self {
         Self::from_str(s).unwrap_or_else(|_| Self::get_system_default())
     }
-    
+
     /// 从字符串解析行为模式
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
@@ -184,9 +184,7 @@ pub enum SwitchCondition {
         time_window_minutes: u32,
     },
     /// 基于用户反馈
-    UserFeedback {
-        positive_threshold: f32,
-    },
+    UserFeedback { positive_threshold: f32 },
     /// 基于时间
     TimeBasedSchedule {
         start_hour: u8,
@@ -194,9 +192,7 @@ pub enum SwitchCondition {
         days_of_week: Vec<u8>, // 0=Sunday, 1=Monday, ...
     },
     /// 自定义条件表达式
-    Expression {
-        expression: String,
-    },
+    Expression { expression: String },
 }
 
 /// 行为上下文 - 影响模式选择的环境信息
@@ -345,11 +341,11 @@ impl DecisionOption {
     }
 
     pub fn with_metrics(
-        mut self, 
-        effort: f32, 
-        success_prob: f32, 
-        innovation: f32, 
-        risk: f32
+        mut self,
+        effort: f32,
+        success_prob: f32,
+        innovation: f32,
+        risk: f32,
     ) -> Self {
         self.estimated_effort = Some(effort.clamp(0.0, 1.0));
         self.success_probability = Some(success_prob.clamp(0.0, 1.0));
@@ -417,7 +413,8 @@ impl BehaviorEngine {
             self.context.clone(),
             self.config.pattern.clone(),
             decision_type,
-        ).with_options(options.clone());
+        )
+        .with_options(options.clone());
 
         let chosen_option = match self.config.pattern {
             BehaviorPattern::Passive => self.passive_decision(&options)?,
@@ -434,7 +431,7 @@ impl BehaviorEngine {
         );
 
         self.decision_history.push(decision.clone());
-        
+
         // 限制历史记录数量
         if self.decision_history.len() > 1000 {
             self.decision_history.remove(0);
@@ -445,44 +442,56 @@ impl BehaviorEngine {
 
     /// 被动模式决策 - 选择最直接、风险最低的选项
     fn passive_decision<'a>(&self, options: &'a [DecisionOption]) -> Result<&'a DecisionOption> {
-        options.iter()
+        options
+            .iter()
             .min_by(|a, b| {
                 let risk_a = a.risk_level.unwrap_or(0.5);
                 let risk_b = b.risk_level.unwrap_or(0.5);
-                risk_a.partial_cmp(&risk_b).unwrap_or(std::cmp::Ordering::Equal)
+                risk_a
+                    .partial_cmp(&risk_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| anyhow!("No options available"))
     }
 
     /// 稳定模式决策 - 平衡风险和收益，优选已验证的方法
     fn stable_decision<'a>(&self, options: &'a [DecisionOption]) -> Result<&'a DecisionOption> {
-        options.iter()
+        options
+            .iter()
             .max_by(|a, b| {
                 let score_a = self.calculate_stability_score(a);
                 let score_b = self.calculate_stability_score(b);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| anyhow!("No options available"))
     }
 
     /// 学习模式决策 - 在稳定的基础上适度创新
     fn learning_decision<'a>(&self, options: &'a [DecisionOption]) -> Result<&'a DecisionOption> {
-        options.iter()
+        options
+            .iter()
             .max_by(|a, b| {
                 let score_a = self.calculate_learning_score(a);
                 let score_b = self.calculate_learning_score(b);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| anyhow!("No options available"))
     }
 
     /// 创造模式决策 - 追求创新和最优解
     fn creative_decision<'a>(&self, options: &'a [DecisionOption]) -> Result<&'a DecisionOption> {
-        options.iter()
+        options
+            .iter()
             .max_by(|a, b| {
                 let score_a = self.calculate_creative_score(a);
                 let score_b = self.calculate_creative_score(b);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| anyhow!("No options available"))
     }
@@ -504,7 +513,7 @@ impl BehaviorEngine {
         let success_prob = option.success_probability.unwrap_or(0.5);
         let risk = option.risk_level.unwrap_or(0.5);
         let effort = option.estimated_effort.unwrap_or(0.5);
-        
+
         // 稳定模式重视成功概率，避免高风险和高成本
         success_prob * 0.5 + (1.0 - risk) * 0.3 + (1.0 - effort) * 0.2
     }
@@ -514,7 +523,7 @@ impl BehaviorEngine {
         let success_prob = option.success_probability.unwrap_or(0.5);
         let innovation = option.innovation_level.unwrap_or(0.3);
         let risk = option.risk_level.unwrap_or(0.5);
-        
+
         // 学习模式平衡稳定性和创新性
         success_prob * 0.4 + innovation * 0.3 + (1.0 - risk) * 0.3
     }
@@ -523,7 +532,7 @@ impl BehaviorEngine {
     fn calculate_creative_score(&self, option: &DecisionOption) -> f32 {
         let innovation = option.innovation_level.unwrap_or(0.3);
         let success_prob = option.success_probability.unwrap_or(0.5);
-        
+
         // 创造模式重视创新程度，对风险有较高容忍度
         innovation * 0.6 + success_prob * 0.4
     }
@@ -559,8 +568,11 @@ impl BehaviorEngine {
     fn generate_reasoning(&self, option: &DecisionOption, pattern: &BehaviorPattern) -> String {
         match pattern {
             BehaviorPattern::Passive => {
-                format!("选择 '{}' 因为这是最直接的执行方式，风险最低。", option.description)
-            },
+                format!(
+                    "选择 '{}' 因为这是最直接的执行方式，风险最低。",
+                    option.description
+                )
+            }
             BehaviorPattern::Stable => {
                 format!(
                     "选择 '{}' 基于稳定性考虑：成功概率 {:.1}%，风险水平 {:.1}%。这是经过验证的可靠方案。",
@@ -568,7 +580,7 @@ impl BehaviorEngine {
                     option.success_probability.unwrap_or(0.5) * 100.0,
                     option.risk_level.unwrap_or(0.5) * 100.0
                 )
-            },
+            }
             BehaviorPattern::Learning => {
                 format!(
                     "选择 '{}' 用于学习和改进：在保证 {:.1}% 成功率的基础上，引入 {:.1}% 的创新元素。",
@@ -576,27 +588,27 @@ impl BehaviorEngine {
                     option.success_probability.unwrap_or(0.5) * 100.0,
                     option.innovation_level.unwrap_or(0.3) * 100.0
                 )
-            },
+            }
             BehaviorPattern::Creative => {
                 format!(
                     "选择 '{}' 以追求最佳解决方案：创新程度 {:.1}%，虽有一定风险但潜在收益最大。",
                     option.description,
                     option.innovation_level.unwrap_or(0.3) * 100.0
                 )
-            },
+            }
             BehaviorPattern::Adaptive => {
                 format!(
                     "选择 '{}' 基于当前上下文的自适应分析，这是在当前情况下的最优选择。",
                     option.description
                 )
-            },
+            }
         }
     }
 
     /// 计算决策信心度
     fn calculate_confidence(&self, option: &DecisionOption) -> f32 {
         let base_confidence = match self.config.pattern {
-            BehaviorPattern::Passive => 0.9, // 被动模式很确定
+            BehaviorPattern::Passive => 0.9,  // 被动模式很确定
             BehaviorPattern::Stable => 0.8,   // 稳定模式较确定
             BehaviorPattern::Learning => 0.6, // 学习模式适度确定
             BehaviorPattern::Creative => 0.5, // 创造模式不太确定
@@ -605,7 +617,7 @@ impl BehaviorEngine {
 
         let success_factor = option.success_probability.unwrap_or(0.5);
         let risk_factor = 1.0 - option.risk_level.unwrap_or(0.5);
-        
+
         (base_confidence + success_factor + risk_factor) / 3.0
     }
 
@@ -626,7 +638,9 @@ impl BehaviorEngine {
 
     /// 评估当前模式的有效性
     pub fn evaluate_pattern_effectiveness(&self) -> PatternEffectiveness {
-        let recent_decisions = self.decision_history.iter()
+        let recent_decisions = self
+            .decision_history
+            .iter()
             .rev()
             .take(10)
             .collect::<Vec<_>>();
@@ -635,25 +649,32 @@ impl BehaviorEngine {
             return PatternEffectiveness::default();
         }
 
-        let avg_confidence = recent_decisions.iter()
-            .map(|d| d.confidence)
-            .sum::<f32>() / recent_decisions.len() as f32;
+        let avg_confidence = recent_decisions.iter().map(|d| d.confidence).sum::<f32>()
+            / recent_decisions.len() as f32;
 
-        let success_rate = recent_decisions.iter()
+        let success_rate = recent_decisions
+            .iter()
             .filter_map(|d| d.execution_result.as_ref())
             .map(|r| if r.success { 1.0 } else { 0.0 })
-            .sum::<f32>() / recent_decisions.len() as f32;
+            .sum::<f32>()
+            / recent_decisions.len() as f32;
 
-        let avg_satisfaction = recent_decisions.iter()
+        let avg_satisfaction = recent_decisions
+            .iter()
             .filter_map(|d| d.execution_result.as_ref())
             .filter_map(|r| r.user_satisfaction)
-            .sum::<f32>() / recent_decisions.len() as f32;
+            .sum::<f32>()
+            / recent_decisions.len() as f32;
 
         PatternEffectiveness {
             pattern: self.config.pattern.clone(),
             avg_confidence,
             success_rate,
-            avg_user_satisfaction: if avg_satisfaction > 0.0 { Some(avg_satisfaction) } else { None },
+            avg_user_satisfaction: if avg_satisfaction > 0.0 {
+                Some(avg_satisfaction)
+            } else {
+                None
+            },
             decision_count: recent_decisions.len() as u32,
             recommended_adjustments: self.generate_pattern_recommendations(&recent_decisions),
         }
@@ -663,9 +684,8 @@ impl BehaviorEngine {
     fn generate_pattern_recommendations(&self, decisions: &[&DecisionRecord]) -> Vec<String> {
         let mut recommendations = Vec::new();
 
-        let avg_confidence = decisions.iter()
-            .map(|d| d.confidence)
-            .sum::<f32>() / decisions.len() as f32;
+        let avg_confidence =
+            decisions.iter().map(|d| d.confidence).sum::<f32>() / decisions.len() as f32;
 
         if avg_confidence < 0.5 {
             recommendations.push("考虑切换到更保守的模式以提高决策信心".to_string());
@@ -676,7 +696,7 @@ impl BehaviorEngine {
                 if !result.success {
                     recommendations.push("最近的执行失败，建议暂时使用稳定模式".to_string());
                 }
-                
+
                 if let Some(satisfaction) = result.user_satisfaction {
                     if satisfaction < 0.5 {
                         recommendations.push("用户满意度较低，考虑调整响应风格".to_string());
@@ -725,7 +745,9 @@ mod tests {
     fn test_behavior_pattern_metrics() {
         assert_eq!(BehaviorPattern::Passive.risk_tolerance(), 0.0);
         assert_eq!(BehaviorPattern::Creative.innovation_tendency(), 0.9);
-        assert!(BehaviorPattern::Stable.risk_tolerance() < BehaviorPattern::Learning.risk_tolerance());
+        assert!(
+            BehaviorPattern::Stable.risk_tolerance() < BehaviorPattern::Learning.risk_tolerance()
+        );
     }
 
     #[test]
@@ -739,7 +761,9 @@ mod tests {
             DecisionOption::new("risky", "Risky option").with_metrics(0.8, 0.3, 0.9, 0.8),
         ];
 
-        let decision = engine.make_decision(DecisionType::ToolSelection, options).unwrap();
+        let decision = engine
+            .make_decision(DecisionType::ToolSelection, options)
+            .unwrap();
         assert_eq!(decision.chosen_option, "safe");
         assert!(decision.confidence > 0.5);
     }
@@ -750,7 +774,7 @@ mod tests {
             keywords: vec!["create".to_string(), "innovate".to_string()],
             case_sensitive: false,
         };
-        
+
         // 这里可以添加条件匹配测试
         match condition {
             SwitchCondition::KeywordMatch { keywords, .. } => {

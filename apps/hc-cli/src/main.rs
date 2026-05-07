@@ -8,13 +8,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use encoding_rs::GB18030;
+use hc_agent::phrase_match_score;
+use hc_behavior::{
+    BehaviorConfig, BehaviorContext, BehaviorEngine, BehaviorPattern, DecisionOption,
+    DecisionRecord, DecisionType, ExecutionResult,
+};
 use hc_bootstrap::{
     init_console_tracing, load_local_env_file, tenant_id_from_env, user_id_from_env, workspace_root,
 };
-use hc_intent::{IntentInput, IntentResolution, IntentRouter};
-use hc_agent::phrase_match_score;
 use hc_capability::ModelDependence;
 use hc_context::{
     ChatCaptureOptions, ChatMemoryOptions, MemoryNamespace, MemoryRetriever, MemoryRoom,
@@ -26,28 +29,26 @@ use hc_context::{
     runtime::{RuntimeIdentity, RuntimeVariableRepository, RuntimeVariables},
     workspace_namespace_from_memory_namespace,
 };
+use hc_intent::{IntentInput, IntentResolution, IntentRouter};
 use hc_llm::{
     ChatMessage, GenerateRequest, MessageRole, ModelRef, ProviderRegistry, default_model_from_env,
     default_provider_from_env, default_registry_from_env, is_timeout_error,
     sanitize_assistant_text,
 };
 use hc_memory::{
-    MemoryRoom as MemoryRoomStorage, MemoryRoomRepository, RoomCapabilityResolver, 
-    ResolvedRoomCapabilities, CapabilityRef, ToolRef, SkillRef, ScheduleRef, 
-    MemoryNamespace as MemoryNamespaceStorage, InheritanceType, RoomConfig, ExecutionContext,
+    CapabilityRef, ExecutionContext, InheritanceType, MemoryNamespace as MemoryNamespaceStorage,
+    MemoryRoom as MemoryRoomStorage, MemoryRoomRepository, ResolvedRoomCapabilities,
+    RoomCapabilityResolver, RoomConfig, ScheduleRef, SkillRef, ToolRef,
 };
 use hc_protocol::{ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest};
-use hc_behavior::{
-    BehaviorPattern, BehaviorConfig, BehaviorContext, BehaviorEngine, DecisionRecord,
-    DecisionType, DecisionOption, ExecutionResult,
-};
-use hc_tag_system::{TagSystemManager, TagVector};
 use hc_scheduler::{
-    ScheduleRepository, ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledRunStatus,
-    ScheduledTarget, ScheduledTargetKind, ScheduledTask, now_unix,
+    ScheduleRepository, ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledTarget,
+    ScheduledTargetKind, ScheduledTask, now_unix,
 };
 use hc_service::{
     ServiceConfig,
+    conversation::{conversation_inbox_snapshot, process_conversation_inbox},
+    human_inbox::{complete_human_inbox_item, list_human_inbox_pending},
     tool_turn::{
         PendingToolConfirmation, ToolTurnSessionState, load_tool_turn_session_state,
         save_tool_turn_session_state, try_handle_configured_mcp_route_turn,
@@ -63,6 +64,7 @@ use hc_store::{
     },
     store::{WorkspaceNamespace, WorkspaceStore},
 };
+use hc_tag_system::{TagSystemManager, TagVector};
 use hc_toolchain::{
     CommandToolExecutor, McpServerRepository, McpServerSpec, McpTransportKind, ToolCatalog,
     ToolComposition, ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository,
@@ -337,18 +339,16 @@ impl ToolSelector for TagAwareToolSelector {
 
             // 标签相似度评分
             let tag_score = if let Some(ref tag_manager) = self.tag_manager {
-                let similarity = tag_manager.calculate_entity_similarity(
-                    &query_tags,
-                    &tool.id,
-                    "tools"
-                );
+                let similarity =
+                    tag_manager.calculate_entity_similarity(&query_tags, &tool.id, "tools");
                 similarity * 100.0 // 转换为与keyword_score相同的量级
             } else {
                 0.0
             };
 
             // 加权组合评分
-            let combined_score = (keyword_score * self.keyword_weight + tag_score * self.tag_weight) as i32;
+            let combined_score =
+                (keyword_score * self.keyword_weight + tag_score * self.tag_weight) as i32;
 
             if combined_score > 0 {
                 candidates.push(ToolSelectionCandidate {
@@ -360,7 +360,9 @@ impl ToolSelector for TagAwareToolSelector {
 
         // 排序并限制数量
         candidates.sort_by(|left, right| {
-            right.score.cmp(&left.score)
+            right
+                .score
+                .cmp(&left.score)
                 .then_with(|| left.tool.id.cmp(&right.tool.id))
         });
         candidates.truncate(self.limit);
@@ -476,7 +478,7 @@ fn main() -> Result<()> {
         tracing::warn!(error = %e, "failed to initialize tag system");
     }
     let _ = TAG_SYSTEM_MANAGER.set(tag_manager);
-    
+
     let args: Vec<String> = env::args().skip(1).collect();
     let (context, args) = parse_cli_runtime_context(args)?;
     let _ = CLI_RUNTIME_CONTEXT.set(context);
@@ -494,6 +496,8 @@ fn main() -> Result<()> {
         [cmd, rest @ ..] if cmd == "run" => handle_run(rest),
         [cmd, rest @ ..] if cmd == "mcp" => handle_mcp(rest),
         [cmd, rest @ ..] if cmd == "schedule" => handle_schedule(rest),
+        [cmd, rest @ ..] if cmd == "human-inbox" => handle_human_inbox(rest),
+        [cmd, rest @ ..] if cmd == "conversation" => handle_conversation(rest),
         [cmd, rest @ ..] if cmd == "index" => handle_index(rest),
         [cmd, rest @ ..] if cmd == "room" => handle_room(rest),
         [cmd, rest @ ..] if cmd == "pattern" => handle_pattern(rest),
@@ -796,8 +800,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
             .filter(|message| message.role == MessageRole::User)
             .count()
             + 1;
-        let intent_resolution =
-            cli_intent_router().resolve(&IntentInput { user_text: trimmed });
+        let intent_resolution = cli_intent_router().resolve(&IntentInput { user_text: trimmed });
         let mut frame = TurnFrame::new(
             trimmed.to_owned(),
             memory_options.namespace.clone(),
@@ -904,7 +907,9 @@ fn handle_chat(args: &[String]) -> Result<()> {
             &frame,
             &mut |delta| {
                 print!("{delta}");
-                io::stdout().flush().context("failed to flush stream output")
+                io::stdout()
+                    .flush()
+                    .context("failed to flush stream output")
             },
         )? {
             NormalChatNodeResult::CreatedTool { path } => {
@@ -1070,6 +1075,201 @@ fn handle_schedule(args: &[String]) -> Result<()> {
         ),
         [other, ..] => bail!("unknown schedule command: {other}"),
     }
+}
+
+fn handle_human_inbox(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "list" => handle_human_inbox_list(rest),
+        [cmd, rest @ ..] if cmd == "complete" => handle_human_inbox_complete(rest),
+        [] => {
+            println!("human-inbox commands:");
+            println!("  list     [--json]   pending items for current tenant/user namespace");
+            println!("  complete --id <item-id> --body <text> [--json]");
+            Ok(())
+        }
+        [other, ..] => bail!("unknown human-inbox command: {other}"),
+    }
+}
+
+fn handle_human_inbox_list(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected human-inbox list argument: {other}"),
+        }
+    }
+    let config = ServiceConfig::new(workspace_root());
+    let items = list_human_inbox_pending(&config, cli_api_namespace_from_runtime())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else if items.is_empty() {
+        println!("human-inbox> no pending items");
+    } else {
+        for item in items {
+            println!(
+                "{} | {} ({}) | {}",
+                item.id,
+                item.replying_agent_name,
+                item.replying_role,
+                compact_single_line(&item.source_body, 100)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_human_inbox_complete(args: &[String]) -> Result<()> {
+    let mut item_id: Option<String> = None;
+    let mut response_body: Option<String> = None;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                item_id = Some(
+                    args.get(index + 1)
+                        .context("missing value for --id")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--body" => {
+                response_body = Some(
+                    args.get(index + 1)
+                        .context("missing value for --body")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected human-inbox complete argument: {other}"),
+        }
+    }
+    let item_id = item_id.context("human-inbox complete requires --id")?;
+    let body = response_body.context("human-inbox complete requires --body")?;
+    let answered_ms = human_inbox_wall_clock_ms();
+    let path = complete_human_inbox_item(
+        &ServiceConfig::new(workspace_root()),
+        cli_api_namespace_from_runtime(),
+        &item_id,
+        &body,
+        answered_ms,
+    )?;
+    if json {
+        println!("{}", serde_json::json!({ "path": path }));
+    } else {
+        println!("human-inbox> completed {} -> {}", item_id, path);
+    }
+    Ok(())
+}
+
+fn cli_api_namespace_from_runtime() -> ApiNamespace {
+    let ns = runtime_namespace();
+    ApiNamespace {
+        tenant_id: ns.tenant_id,
+        user_id: ns.user_id,
+    }
+}
+
+fn human_inbox_wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn handle_conversation(args: &[String]) -> Result<()> {
+    match args {
+        [cmd, rest @ ..] if cmd == "inbox" => handle_conversation_inbox(rest),
+        [cmd, rest @ ..] if cmd == "process" => handle_conversation_process(rest),
+        [] => {
+            println!("conversation commands:");
+            println!("  inbox   [--now-unix <ts>] [--json]");
+            println!("  process [--now-unix <ts>] [--json]");
+            Ok(())
+        }
+        [other, ..] => bail!("unknown conversation command: {other}"),
+    }
+}
+
+fn handle_conversation_inbox(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut now_unix_opt: Option<u64> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--now-unix" => {
+                now_unix_opt = Some(parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --now-unix")?,
+                    "--now-unix",
+                )?);
+                index += 2;
+            }
+            other => bail!("unexpected conversation inbox argument: {other}"),
+        }
+    }
+    let config = ServiceConfig::new(workspace_root());
+    let snapshot =
+        conversation_inbox_snapshot(&config, cli_api_namespace_from_runtime(), now_unix_opt)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        println!("conversation> now_unix={}", snapshot.now_unix);
+        println!("  pending_events: {}", snapshot.pending_events.len());
+        println!("  due_followups: {}", snapshot.due_followups.len());
+        println!("  pending_proposals: {}", snapshot.pending_proposals.len());
+    }
+    Ok(())
+}
+
+fn handle_conversation_process(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut now_unix_opt: Option<u64> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--now-unix" => {
+                now_unix_opt = Some(parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --now-unix")?,
+                    "--now-unix",
+                )?);
+                index += 2;
+            }
+            other => bail!("unexpected conversation process argument: {other}"),
+        }
+    }
+    let config = ServiceConfig::new(workspace_root());
+    let report =
+        process_conversation_inbox(&config, cli_api_namespace_from_runtime(), now_unix_opt)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "conversation> processed_events={} fired_followups={} proposals_out={}",
+            report.processed_events,
+            report.fired_followups,
+            report.proposals.len()
+        );
+    }
+    Ok(())
 }
 
 fn handle_index(args: &[String]) -> Result<()> {
@@ -1761,81 +1961,13 @@ fn print_schedule_dispatch_receipts(receipts: Vec<serde_json::Value>, json: bool
     Ok(())
 }
 
-fn dispatch_scheduled_run(mut run: ScheduledRun, now: u64) -> Result<serde_json::Value> {
-    run.status = ScheduledRunStatus::Running;
-    run.started_at_unix = Some(now);
-    schedule_repository().write_run(&run)?;
-
-    let result = match run.target.kind {
-        ScheduledTargetKind::Mcp => dispatch_scheduled_mcp_run(&run),
-        _ => Err(anyhow!(
-            "scheduled target kind {:?} is not dispatchable by hc-cli yet",
-            run.target.kind
-        )),
-    };
-
-    let finished_at = now_unix();
-    match result {
-        Ok(result_ref) => {
-            run.status = ScheduledRunStatus::Succeeded;
-            run.finished_at_unix = Some(finished_at);
-            run.result_ref = Some(result_ref.clone());
-            run.error = None;
-            schedule_repository().write_run(&run)?;
-            Ok(serde_json::json!({
-                "run_id": run.id,
-                "target_kind": "mcp",
-                "target_ref": run.target.r#ref,
-                "status": "succeeded",
-                "result_ref": result_ref,
-            }))
-        }
-        Err(error) => {
-            run.status = ScheduledRunStatus::Failed;
-            run.finished_at_unix = Some(finished_at);
-            run.error = Some(error.to_string());
-            schedule_repository().write_run(&run)?;
-            Ok(serde_json::json!({
-                "run_id": run.id,
-                "target_kind": format!("{:?}", run.target.kind),
-                "target_ref": run.target.r#ref,
-                "status": "failed",
-                "error": error.to_string(),
-            }))
-        }
-    }
-}
-
-fn dispatch_scheduled_mcp_run(run: &ScheduledRun) -> Result<String> {
-    let tool_name = run
-        .target
-        .action
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .context("mcp scheduled target requires target.action")?;
-    let server = mcp_server_repository().get_server(&run.target.r#ref)?;
-    let mut arguments = serde_json::Map::new();
-    for (key, value) in &server.default_args {
-        arguments.insert(key.clone(), value.clone());
-    }
-    for (key, value) in &run.target.args {
-        arguments.insert(key.clone(), value.clone());
-    }
-    let runtime =
-        runtime_variables_for_workspace_namespace(&runtime_namespace(), Some(&run.schedule_id));
-    runtime.inject_mcp_arguments(&mut arguments);
-    let result = call_mcp_tool(&server, tool_name, serde_json::Value::Object(arguments))?;
-    if result
-        .get("isError")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!(
-            "scheduled mcp call returned an error: {}",
-            compact_single_line(&result.to_string(), 300)
-        );
-    }
-    Ok(format!("mcp:{}:{}", run.target.r#ref, tool_name))
+fn dispatch_scheduled_run(run: ScheduledRun, now: u64) -> Result<serde_json::Value> {
+    let config = ServiceConfig::new(workspace_root());
+    let namespace = runtime_namespace();
+    let repository = schedule_repository();
+    let receipt =
+        hc_service::scheduler::dispatch_scheduled_run(&config, &namespace, &repository, run, now)?;
+    serde_json::to_value(&receipt).map_err(|error| anyhow::anyhow!(error))
 }
 
 fn handle_mcp_add(args: &[String]) -> Result<()> {
@@ -2687,16 +2819,19 @@ fn run_normal_chat_node(
         ModelRef::new(provider.to_owned(), model.to_owned()),
         request_history,
     );
-    
+
     // 启动进度指示器
     use std::io::{self, Write};
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::thread;
     use std::time::Duration;
-    
+
     let progress_running = Arc::new(AtomicBool::new(true));
     let progress_running_clone = progress_running.clone();
-    
+
     // 后台线程显示动态进度
     let _progress_handle = thread::spawn(move || {
         let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -2708,7 +2843,7 @@ fn run_normal_chat_node(
             thread::sleep(Duration::from_millis(100));
         }
     });
-    
+
     let mut streamed = false;
     let response = match registry.generate_stream(&request, &mut |chunk| {
         if !chunk.delta.is_empty() {
@@ -2831,7 +2966,9 @@ fn print_assistant_reply_content(content: &str, output_options: ChatOutputOption
         } else {
             print!("\n{line}");
         }
-        io::stdout().flush().context("failed to flush assistant output")?;
+        io::stdout()
+            .flush()
+            .context("failed to flush assistant output")?;
         if index + 1 < lines.len() {
             std::thread::sleep(Duration::from_millis(output_options.phased_delay_ms));
         }
@@ -4360,13 +4497,13 @@ fn render_tool_execution_context(
 fn render_chat_error(error: &hc_llm::LlmError) -> String {
     let message = error.to_string();
     let lowered = message.to_ascii_lowercase();
-    
+
     if message.contains("invalid chat setting") {
         return format!(
             "error> provider rejected the chat request: invalid chat setting. Current session is preserved; continue typing or use /clear and retry.\nprovider> {message}"
         );
     }
-    
+
     if is_timeout_error(error) {
         let timeout_secs = std::env::var("HC_LLM_REQUEST_TIMEOUT_SECS")
             .ok()
@@ -4377,25 +4514,28 @@ fn render_chat_error(error: &hc_llm::LlmError) -> String {
             timeout_secs
         );
     }
-    
-    if lowered.contains("api key") || lowered.contains("unauthorized") || lowered.contains("authentication") {
+
+    if lowered.contains("api key")
+        || lowered.contains("unauthorized")
+        || lowered.contains("authentication")
+    {
         return format!(
             "error> 🔑 API认证失败。请检查:\n  • API密钥是否正确设置 (OPENAI_API_KEY, ANTHROPIC_API_KEY 等)\n  • API密钥是否有效且未过期\n  • 网络是否能访问API服务\nprovider> {message}"
         );
     }
-    
+
     if lowered.contains("rate limit") || lowered.contains("quota") {
         return format!(
             "error> 🚦 API速率限制或配额不足。建议:\n  • 等待几分钟后重试\n  • 检查API账户余额\n  • 考虑升级API套餐\nprovider> {message}"
         );
     }
-    
+
     if lowered.contains("network") || lowered.contains("connection") || lowered.contains("dns") {
         return format!(
             "error> 🌐 网络连接问题。请检查:\n  • 网络连接是否正常\n  • 防火墙设置\n  • 代理配置\nprovider> {message}"
         );
     }
-    
+
     format!("error> ❌ {message}\n💡 如果问题持续，请检查配置或稍后重试")
 }
 
@@ -5174,7 +5314,7 @@ fn handle_room_create(args: &[String]) -> Result<()> {
     let mut tags = Vec::new();
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--id" => {
@@ -5229,16 +5369,19 @@ fn handle_room_create(args: &[String]) -> Result<()> {
     let layer = layer.context("missing --layer")?;
     let title = title.context("missing --title")?;
     let summary = summary.unwrap_or_else(|| format!("Memory room for {}", title));
-    
+
     let memory_layer = match layer.as_str() {
         "chat" => hc_memory::MemoryLayer::Chat,
         "topic" => hc_memory::MemoryLayer::Topic,
         "task" => hc_memory::MemoryLayer::Task,
         "project" => hc_memory::MemoryLayer::Project,
         "global" => hc_memory::MemoryLayer::Global,
-        _ => bail!("invalid layer: {} (must be chat, topic, task, project, or global)", layer),
+        _ => bail!(
+            "invalid layer: {} (must be chat, topic, task, project, or global)",
+            layer
+        ),
     };
-    
+
     let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
     let memory_namespace = MemoryNamespaceStorage::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
@@ -5248,23 +5391,23 @@ fn handle_room_create(args: &[String]) -> Result<()> {
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
-    
-    let mut room = MemoryRoomStorage::new(id, memory_layer, title, summary)
-        .with_namespace(memory_namespace);
-    
+
+    let mut room =
+        MemoryRoomStorage::new(id, memory_layer, title, summary).with_namespace(memory_namespace);
+
     for tag in tags {
         room = room.with_tag(tag);
     }
-    
+
     let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace);
     let path = repository.write_room(&room)?;
-    
+
     if json {
         println!("{}", serde_json::to_string_pretty(&room)?);
     } else {
         println!("Created room {} at {}", room.id, path.display());
     }
-    
+
     Ok(())
 }
 
@@ -5275,12 +5418,13 @@ fn handle_room_list(args: &[String]) -> Result<()> {
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
-    
+
     let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace);
-    
-    let rooms = repository.list_rooms()
+
+    let rooms = repository
+        .list_rooms()
         .context("Failed to list memory rooms")?;
-    
+
     if options.json {
         let room_data: Vec<_> = rooms
             .iter()
@@ -5315,16 +5459,20 @@ fn handle_room_list(args: &[String]) -> Result<()> {
                 if !room.status.is_empty() {
                     println!("    Status: {}", room.status);
                 }
-                
+
                 if !room.tags.is_empty() {
                     println!("    Tags: {}", room.tags.join(", "));
                 }
-                
-                let capabilities_count = room.inherited_capabilities.len() + room.inherited_tools.len() + room.inherited_skills.len() + room.inherited_schedules.len();
+
+                let capabilities_count = room.inherited_capabilities.len()
+                    + room.inherited_tools.len()
+                    + room.inherited_skills.len()
+                    + room.inherited_schedules.len();
                 if capabilities_count > 0 {
-                    println!("    Capabilities: {} capabilities, {} tools, {} skills, {} schedules",
+                    println!(
+                        "    Capabilities: {} capabilities, {} tools, {} skills, {} schedules",
                         room.inherited_capabilities.len(),
-                        room.inherited_tools.len(), 
+                        room.inherited_tools.len(),
                         room.inherited_skills.len(),
                         room.inherited_schedules.len()
                     );
@@ -5333,7 +5481,7 @@ fn handle_room_list(args: &[String]) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -5341,7 +5489,7 @@ fn handle_room_show(args: &[String]) -> Result<()> {
     let mut room_id = None;
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--id" => {
@@ -5363,17 +5511,17 @@ fn handle_room_show(args: &[String]) -> Result<()> {
             arg => bail!("unknown argument: {arg}"),
         }
     }
-    
+
     let room_id = room_id.context("missing room ID")?;
-    
+
     let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
     let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
-    
+
     let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace);
-    
+
     match repository.get_room_by_id(&room_id)? {
         Some(room) => {
             if json {
@@ -5427,11 +5575,11 @@ fn handle_room_show(args: &[String]) -> Result<()> {
                 if !room.status.is_empty() {
                     println!("  Status: {}", room.status);
                 }
-                
+
                 if !room.tags.is_empty() {
                     println!("  Tags: {}", room.tags.join(", "));
                 }
-                
+
                 println!();
                 println!("Execution Context:");
                 if let Some(wd) = &room.room_config.execution_context.working_directory {
@@ -5446,16 +5594,19 @@ fn handle_room_show(args: &[String]) -> Result<()> {
                         println!("    {}: {}", key, value);
                     }
                 }
-                
+
                 println!();
                 if !room.inherited_capabilities.is_empty() {
-                    println!("Inherited Capabilities ({}):", room.inherited_capabilities.len());
+                    println!(
+                        "Inherited Capabilities ({}):",
+                        room.inherited_capabilities.len()
+                    );
                     for cap in &room.inherited_capabilities {
                         println!("  - {} ({:?})", cap.id, cap.inheritance_type);
                     }
                     println!();
                 }
-                
+
                 if !room.inherited_tools.is_empty() {
                     println!("Inherited Tools ({}):", room.inherited_tools.len());
                     for tool in &room.inherited_tools {
@@ -5463,7 +5614,7 @@ fn handle_room_show(args: &[String]) -> Result<()> {
                     }
                     println!();
                 }
-                
+
                 if !room.inherited_skills.is_empty() {
                     println!("Inherited Skills ({}):", room.inherited_skills.len());
                     for skill in &room.inherited_skills {
@@ -5471,7 +5622,7 @@ fn handle_room_show(args: &[String]) -> Result<()> {
                     }
                     println!();
                 }
-                
+
                 if !room.inherited_schedules.is_empty() {
                     println!("Inherited Schedules ({}):", room.inherited_schedules.len());
                     for schedule in &room.inherited_schedules {
@@ -5488,7 +5639,7 @@ fn handle_room_show(args: &[String]) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -5496,7 +5647,7 @@ fn handle_room_capabilities(args: &[String]) -> Result<()> {
     let mut room_id = None;
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--id" => {
@@ -5518,17 +5669,18 @@ fn handle_room_capabilities(args: &[String]) -> Result<()> {
             arg => bail!("unknown argument: {arg}"),
         }
     }
-    
+
     let room_id = room_id.context("missing room ID")?;
-    
+
     let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
     let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
-    
-    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace.clone());
-    
+
+    let repository =
+        MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace.clone());
+
     match repository.get_room_by_id(&room_id)? {
         Some(room) => {
             // 构建内存命名空间
@@ -5536,7 +5688,7 @@ fn handle_room_capabilities(args: &[String]) -> Result<()> {
                 runtime_context.tenant_id.as_deref().unwrap_or("local"),
                 runtime_context.user_id.as_deref().unwrap_or("default"),
             );
-            
+
             // 解析房间能力
             let resolver = RoomCapabilityResolver::new(memory_namespace);
             match resolver.resolve_room_capabilities(&room) {
@@ -5577,40 +5729,59 @@ fn handle_room_capabilities(args: &[String]) -> Result<()> {
                     } else {
                         println!("Room Capabilities for: {}", room_id);
                         println!();
-                        
+
                         if !capabilities.capabilities.is_empty() {
-                            println!("Resolved Capabilities ({}):", capabilities.capabilities.len());
+                            println!(
+                                "Resolved Capabilities ({}):",
+                                capabilities.capabilities.len()
+                            );
                             for cap in &capabilities.capabilities {
-                                println!("  - {} ({:?})", cap.capability_ref.id, cap.capability_ref.inheritance_type);
+                                println!(
+                                    "  - {} ({:?})",
+                                    cap.capability_ref.id, cap.capability_ref.inheritance_type
+                                );
                             }
                             println!();
                         }
-                        
+
                         if !capabilities.tools.is_empty() {
                             println!("Resolved Tools ({}):", capabilities.tools.len());
                             for tool in &capabilities.tools {
-                                println!("  - {} ({:?})", tool.tool_ref.id, tool.tool_ref.inheritance_type);
+                                println!(
+                                    "  - {} ({:?})",
+                                    tool.tool_ref.id, tool.tool_ref.inheritance_type
+                                );
                             }
                             println!();
                         }
-                        
+
                         if !capabilities.skills.is_empty() {
                             println!("Resolved Skills ({}):", capabilities.skills.len());
                             for skill in &capabilities.skills {
-                                println!("  - {} ({:?})", skill.skill_ref.id, skill.skill_ref.inheritance_type);
+                                println!(
+                                    "  - {} ({:?})",
+                                    skill.skill_ref.id, skill.skill_ref.inheritance_type
+                                );
                             }
                             println!();
                         }
-                        
+
                         if !capabilities.schedules.is_empty() {
                             println!("Resolved Schedules ({}):", capabilities.schedules.len());
                             for schedule in &capabilities.schedules {
-                                println!("  - {} ({:?})", schedule.schedule_ref.id, schedule.schedule_ref.inheritance_type);
+                                println!(
+                                    "  - {} ({:?})",
+                                    schedule.schedule_ref.id,
+                                    schedule.schedule_ref.inheritance_type
+                                );
                             }
                             println!();
                         }
-                        
-                        let total_count = capabilities.capabilities.len() + capabilities.tools.len() + capabilities.skills.len() + capabilities.schedules.len();
+
+                        let total_count = capabilities.capabilities.len()
+                            + capabilities.tools.len()
+                            + capabilities.skills.len()
+                            + capabilities.schedules.len();
                         if total_count == 0 {
                             println!("No resolved capabilities found for this room.");
                         } else {
@@ -5620,9 +5791,15 @@ fn handle_room_capabilities(args: &[String]) -> Result<()> {
                 }
                 Err(err) => {
                     if json {
-                        println!(r#"{{"room_id": "{}", "error": "Failed to resolve capabilities: {}"}}"#, room_id, err);
+                        println!(
+                            r#"{{"room_id": "{}", "error": "Failed to resolve capabilities: {}"}}"#,
+                            room_id, err
+                        );
                     } else {
-                        println!("Failed to resolve capabilities for room {}: {}", room_id, err);
+                        println!(
+                            "Failed to resolve capabilities for room {}: {}",
+                            room_id, err
+                        );
                     }
                 }
             }
@@ -5635,7 +5812,7 @@ fn handle_room_capabilities(args: &[String]) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -5646,7 +5823,7 @@ fn handle_room_inherit(args: &[String]) -> Result<()> {
     let mut inheritance_type = None;
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--room-id" => {
@@ -5688,30 +5865,32 @@ fn handle_room_inherit(args: &[String]) -> Result<()> {
             arg => bail!("unknown argument: {arg}"),
         }
     }
-    
+
     let room_id = room_id.context("missing --room-id")?;
-    let capability_type = capability_type.context("missing --type (capability, tool, skill, schedule)")?;
+    let capability_type =
+        capability_type.context("missing --type (capability, tool, skill, schedule)")?;
     let capability_id = capability_id.context("missing --id")?;
     let inheritance_type = inheritance_type.unwrap_or_else(|| "manual".to_string());
-    
+
     let inheritance = match inheritance_type.as_str() {
         "manual" => InheritanceType::Manual,
         "auto" => InheritanceType::AutoDiscovered,
         "parent" => InheritanceType::FromParent,
         "sibling" => InheritanceType::FromSibling,
         "direct" => InheritanceType::Direct,
-        _ => bail!("invalid inheritance type: {} (must be manual, auto, parent, sibling, or direct)", inheritance_type),
+        _ => bail!(
+            "invalid inheritance type: {} (must be manual, auto, parent, sibling, or direct)",
+            inheritance_type
+        ),
     };
-    
+
     let workspace_namespace = runtime_namespace();
     let memory_namespace = MemoryNamespaceStorage::new(
         workspace_namespace.tenant_id.clone(),
         workspace_namespace.user_id.clone(),
     );
-    let repository = MemoryRoomRepository::with_namespace(
-        workspace_root(),
-        workspace_namespace.clone(),
-    );
+    let repository =
+        MemoryRoomRepository::with_namespace(workspace_root(), workspace_namespace.clone());
     let resolver = RoomCapabilityResolver::new(memory_namespace);
     let mut room = repository
         .get_room_by_id(&room_id)?
@@ -5734,7 +5913,10 @@ fn handle_room_inherit(args: &[String]) -> Result<()> {
             &mut room,
             ScheduleRef::new(&capability_id).with_inheritance_type(inheritance),
         )?,
-        _ => bail!("invalid type: {} (must be capability, tool, skill, or schedule)", capability_type),
+        _ => bail!(
+            "invalid type: {} (must be capability, tool, skill, or schedule)",
+            capability_type
+        ),
     }
 
     let path = repository.write_room(&room)?;
@@ -5761,7 +5943,7 @@ fn handle_room_inherit(args: &[String]) -> Result<()> {
             path.display()
         );
     }
-    
+
     Ok(())
 }
 
@@ -5794,15 +5976,25 @@ fn print_help() {
     println!("hc-cli schedule dispatch-due [--now-unix <ts>] [--json]");
     println!("hc-cli schedule dispatch-queued [--now-unix <ts>] [--json]");
     println!("hc-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]");
-    println!("hc-cli room create --id <id> --layer <chat|topic|task|project|global> --title <text> [--summary <text>] [--tag <tag>] [--json]");
+    println!("hc-cli human-inbox list [--json]");
+    println!("hc-cli human-inbox complete --id <item-id> --body <text> [--json]");
+    println!("hc-cli conversation inbox [--now-unix <ts>] [--json]");
+    println!("hc-cli conversation process [--now-unix <ts>] [--json]");
+    println!(
+        "hc-cli room create --id <id> --layer <chat|topic|task|project|global> --title <text> [--summary <text>] [--tag <tag>] [--json]"
+    );
     println!("hc-cli room list [--json]");
     println!("hc-cli room show <room-id> [--json]");
     println!("hc-cli room capabilities <room-id> [--json]");
-    println!("hc-cli room inherit --room-id <id> --type <capability|tool|skill|schedule> --id <capability-id> [--inheritance <manual|auto|parent|sibling|direct>] [--json]");
+    println!(
+        "hc-cli room inherit --room-id <id> --type <capability|tool|skill|schedule> --id <capability-id> [--inheritance <manual|auto|parent|sibling|direct>] [--json]"
+    );
     println!("hc-cli pattern list [--json]");
     println!("hc-cli pattern show <pattern-name> [--json]");
     println!("hc-cli pattern test <pattern-name> [--context key=value] [--json]");
-    println!("hc-cli pattern config <pattern-name> [--thinking-depth <n>] [--metacognition <true|false>] [--learning-rate <f>] [--json]");
+    println!(
+        "hc-cli pattern config <pattern-name> [--thinking-depth <n>] [--metacognition <true|false>] [--learning-rate <f>] [--json]"
+    );
     println!("hc-cli pattern default [--json]");
     println!("hc-cli index rebuild [--vector] [--dims <n>] [--json]");
     println!(
@@ -5844,7 +6036,7 @@ fn handle_pattern(args: &[String]) -> Result<()> {
 fn handle_pattern_list(args: &[String]) -> Result<()> {
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {
@@ -5854,7 +6046,7 @@ fn handle_pattern_list(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument: {other}"),
         }
     }
-    
+
     let patterns = vec![
         BehaviorPattern::Passive,
         BehaviorPattern::Stable,
@@ -5862,7 +6054,7 @@ fn handle_pattern_list(args: &[String]) -> Result<()> {
         BehaviorPattern::Creative,
         BehaviorPattern::Adaptive,
     ];
-    
+
     if json {
         let pattern_data: Vec<_> = patterns
             .iter()
@@ -5882,10 +6074,13 @@ fn handle_pattern_list(args: &[String]) -> Result<()> {
                 })
             })
             .collect();
-        
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "patterns": pattern_data
-        }))?);
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "patterns": pattern_data
+            }))?
+        );
     } else {
         println!("可用的行为模式:");
         for pattern in patterns {
@@ -5905,7 +6100,7 @@ fn handle_pattern_list(args: &[String]) -> Result<()> {
             );
         }
     }
-    
+
     Ok(())
 }
 
@@ -5913,7 +6108,7 @@ fn handle_pattern_show(args: &[String]) -> Result<()> {
     let mut pattern_name = None;
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {
@@ -5927,41 +6122,47 @@ fn handle_pattern_show(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument: {other}"),
         }
     }
-    
+
     let pattern_name = pattern_name.context("missing pattern name")?;
     let pattern = BehaviorPattern::from_str(&pattern_name)?;
     let config = BehaviorConfig::new(pattern.clone());
-    
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "pattern": format!("{:?}", pattern).to_lowercase(),
-            "description": match pattern {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "pattern": format!("{:?}", pattern).to_lowercase(),
+                "description": match pattern {
+                    BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
+                    BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
+                    BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
+                    BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
+                    BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
+                },
+                "attributes": {
+                    "risk_tolerance": pattern.risk_tolerance(),
+                    "innovation_tendency": pattern.innovation_tendency(),
+                    "proactivity": pattern.proactivity(),
+                },
+                "config": {
+                    "thinking_depth": config.thinking_depth,
+                    "enable_metacognition": config.enable_metacognition,
+                    "learning_rate": config.learning_rate,
+                }
+            }))?
+        );
+    } else {
+        println!("行为模式: {:?}", pattern);
+        println!(
+            "描述: {}",
+            match pattern {
                 BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
                 BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
                 BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
                 BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
                 BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
-            },
-            "attributes": {
-                "risk_tolerance": pattern.risk_tolerance(),
-                "innovation_tendency": pattern.innovation_tendency(),
-                "proactivity": pattern.proactivity(),
-            },
-            "config": {
-                "thinking_depth": config.thinking_depth,
-                "enable_metacognition": config.enable_metacognition,
-                "learning_rate": config.learning_rate,
             }
-        }))?);
-    } else {
-        println!("行为模式: {:?}", pattern);
-        println!("描述: {}", match pattern {
-            BehaviorPattern::Passive => "被动执行模式 - 严格按照指令执行",
-            BehaviorPattern::Stable => "稳定模式 - 保守且可靠的决策",
-            BehaviorPattern::Learning => "学习模式 - 保守新建功能，注重学习",
-            BehaviorPattern::Creative => "创造模式 - 注重创新和探索",
-            BehaviorPattern::Adaptive => "自适应模式 - 根据情况动态调整",
-        });
+        );
         println!();
         println!("属性:");
         println!("  风险容忍度: {:.1}", pattern.risk_tolerance());
@@ -5970,10 +6171,17 @@ fn handle_pattern_show(args: &[String]) -> Result<()> {
         println!();
         println!("默认配置:");
         println!("  思考深度:     {}", config.thinking_depth);
-        println!("  启用元认知:   {}", if config.enable_metacognition { "是" } else { "否" });
+        println!(
+            "  启用元认知:   {}",
+            if config.enable_metacognition {
+                "是"
+            } else {
+                "否"
+            }
+        );
         println!("  学习率:       {:.2}", config.learning_rate.unwrap_or(0.0));
     }
-    
+
     Ok(())
 }
 
@@ -5982,7 +6190,7 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
     let mut context_pairs = Vec::new();
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {
@@ -5990,9 +6198,8 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
                 index += 1;
             }
             "--context" => {
-                let context_value = args.get(index + 1)
-                    .context("missing value for --context")?;
-                
+                let context_value = args.get(index + 1).context("missing value for --context")?;
+
                 if let Some((key, value)) = context_value.split_once('=') {
                     context_pairs.push((key.to_string(), value.to_string()));
                 } else {
@@ -6007,10 +6214,10 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument: {other}"),
         }
     }
-    
+
     let pattern_name = pattern_name.context("missing pattern name")?;
     let pattern = BehaviorPattern::from_str(&pattern_name)?;
-    
+
     // 构建测试上下文
     let mut context = BehaviorContext {
         user_id: Some("test-user".to_string()),
@@ -6024,7 +6231,7 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
         user_preferences: BTreeMap::new(),
         environment: BTreeMap::new(),
     };
-    
+
     // 应用用户提供的上下文
     for (key, value) in context_pairs {
         match key.as_str() {
@@ -6032,28 +6239,40 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
             "room_id" => context.room_id = Some(value),
             "task_type" => context.task_type = Some(value),
             "complexity" => {
-                context.estimated_complexity = Some(value.parse()
-                    .context("invalid complexity value (expected number)")?);
+                context.estimated_complexity = Some(
+                    value
+                        .parse()
+                        .context("invalid complexity value (expected number)")?,
+                );
             }
             "success_rate" => {
-                context.historical_success_rate = Some(value.parse()
-                    .context("invalid success_rate value (expected number 0.0-1.0)")?);
+                context.historical_success_rate = Some(
+                    value
+                        .parse()
+                        .context("invalid success_rate value (expected number 0.0-1.0)")?,
+                );
             }
             "time_pressure" => {
-                context.time_pressure = Some(value.parse()
-                    .context("invalid time_pressure value (expected number)")?);
+                context.time_pressure = Some(
+                    value
+                        .parse()
+                        .context("invalid time_pressure value (expected number)")?,
+                );
             }
             "available_tools_count" => {
-                context.available_tools_count = Some(value.parse()
-                    .context("invalid available_tools_count value (expected number)")?);
+                context.available_tools_count = Some(
+                    value
+                        .parse()
+                        .context("invalid available_tools_count value (expected number)")?,
+                );
             }
             other => bail!("unknown context key: {other}"),
         }
     }
-    
+
     let config = BehaviorConfig::new(pattern.clone());
     let mut engine = BehaviorEngine::new(config, context.clone());
-    
+
     // 创建一些测试选项
     let options = vec![
         DecisionOption::new("conservative", "保守方案 - 使用已知可靠的方法")
@@ -6078,12 +6297,9 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
             .with_innovation_level(Some(0.9))
             .with_risk_level(Some(0.7)),
     ];
-    
-    let decision_record = engine.make_decision(
-        DecisionType::StrategySelection,
-        options.clone(),
-    )?;
-    
+
+    let decision_record = engine.make_decision(DecisionType::StrategySelection, options.clone())?;
+
     if json {
         println!("{}", serde_json::to_string_pretty(&decision_record)?);
     } else {
@@ -6106,18 +6322,19 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
             println!("  历史成功率: {:.1}%", success_rate * 100.0);
         }
         println!();
-        
+
         println!("决策结果:");
         println!("  选择的方案: {}", decision_record.chosen_option);
         println!("  决策理由: {}", decision_record.reasoning);
         println!("  信心度: {:.1}%", decision_record.confidence * 100.0);
-        
+
         if !decision_record.options_considered.is_empty() {
             println!();
             println!("考虑的选项:");
             for option in &decision_record.options_considered {
                 println!("  {} - {}", option.id, option.description);
-                println!("    工作量: {:.1}, 成功率: {:.1}%, 创新性: {:.1}, 风险: {:.1}",
+                println!(
+                    "    工作量: {:.1}, 成功率: {:.1}%, 创新性: {:.1}, 风险: {:.1}",
                     option.estimated_effort.unwrap_or(0.0),
                     option.success_probability.unwrap_or(0.0) * 100.0,
                     option.innovation_level.unwrap_or(0.0),
@@ -6126,7 +6343,7 @@ fn handle_pattern_test(args: &[String]) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -6137,7 +6354,7 @@ fn handle_pattern_config(args: &[String]) -> Result<()> {
     let mut learning_rate = None;
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {
@@ -6154,12 +6371,16 @@ fn handle_pattern_config(args: &[String]) -> Result<()> {
                 index += 2;
             }
             "--metacognition" => {
-                let value = args.get(index + 1)
+                let value = args
+                    .get(index + 1)
                     .context("missing value for --metacognition")?;
                 enable_metacognition = Some(match value.as_str() {
                     "true" | "1" | "yes" => true,
                     "false" | "0" | "no" => false,
-                    _ => bail!("invalid metacognition value: {} (expected true/false)", value),
+                    _ => bail!(
+                        "invalid metacognition value: {} (expected true/false)",
+                        value
+                    ),
                 });
                 index += 2;
             }
@@ -6179,12 +6400,12 @@ fn handle_pattern_config(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument: {other}"),
         }
     }
-    
+
     let pattern_name = pattern_name.context("missing pattern name")?;
     let pattern = BehaviorPattern::from_str(&pattern_name)?;
-    
+
     let mut config = BehaviorConfig::new(pattern.clone());
-    
+
     // 应用用户指定的配置修改
     if let Some(depth) = thinking_depth {
         config.thinking_depth = depth;
@@ -6195,7 +6416,7 @@ fn handle_pattern_config(args: &[String]) -> Result<()> {
     if let Some(rate) = learning_rate {
         config.learning_rate = Some(rate);
     }
-    
+
     if json {
         println!("{}", serde_json::to_string_pretty(&config)?);
     } else {
@@ -6203,19 +6424,26 @@ fn handle_pattern_config(args: &[String]) -> Result<()> {
         println!();
         println!("配置参数:");
         println!("  思考深度:     {}", config.thinking_depth);
-        println!("  启用元认知:   {}", if config.enable_metacognition { "是" } else { "否" });
+        println!(
+            "  启用元认知:   {}",
+            if config.enable_metacognition {
+                "是"
+            } else {
+                "否"
+            }
+        );
         println!("  学习率:       {:.2}", config.learning_rate.unwrap_or(0.0));
         println!();
         println!("注意: 这只是显示配置，实际保存配置功能需要额外实现");
     }
-    
+
     Ok(())
 }
 
 fn handle_pattern_default(args: &[String]) -> Result<()> {
     let mut json = false;
     let mut index = 0usize;
-    
+
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {
@@ -6225,9 +6453,9 @@ fn handle_pattern_default(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument: {other}"),
         }
     }
-    
+
     let default_pattern = BehaviorPattern::get_system_default();
-    
+
     if json {
         let response = serde_json::json!({
             "system_default_pattern": default_pattern,
@@ -6253,72 +6481,82 @@ fn handle_pattern_default(args: &[String]) -> Result<()> {
         println!("  - 解析指定模式失败时的回退选项");
         println!("  - BehaviorConfig 的默认实例化");
         println!();
-        println!("如需修改系统默认值，请在源代码中更改 BehaviorPattern::get_system_default() 的返回值");
+        println!(
+            "如需修改系统默认值，请在源代码中更改 BehaviorPattern::get_system_default() 的返回值"
+        );
     }
-    
+
     Ok(())
 }
 
 /// 验证LLM配置是否正确
 fn validate_llm_configuration(provider: &str, model: &str) -> Result<()> {
-    use std::env;
     use hc_llm::{
         provider_api_key_env_source, provider_api_key_var_name, provider_base_url_env_source,
         provider_base_url_var_name, provider_requires_api_key,
     };
-    
+    use std::env;
+
     println!("🔍 检查LLM配置...");
     println!("  提供商: {}", provider);
     println!("  模型: {}", model);
-    
+
     let provider_api_key = provider_api_key_var_name(provider);
     let provider_base_url = provider_base_url_var_name(provider);
     let found_api_key = provider_api_key_env_source(provider);
     let found_base_url = provider_base_url_env_source(provider);
-    
+
     // 显示结果
     let mut config_info = Vec::new();
-    
+
     if let Some(api_key_var) = found_api_key {
         config_info.push(format!("API密钥: {}", api_key_var));
     }
-    
+
     if let Some(base_url_var) = found_base_url {
         config_info.push(format!("Base URL: {}", base_url_var));
     }
-    
+
     if !config_info.is_empty() {
         println!("  ✅ {}", config_info.join(", "));
     }
-    
+
     // 检查是否缺少必要配置
     if provider_requires_api_key(provider) && found_api_key.is_none() {
-        println!("  ⚠️  缺少API密钥，请设置 HC_LLM_API_KEY 或 {}", provider_api_key);
+        println!(
+            "  ⚠️  缺少API密钥，请设置 HC_LLM_API_KEY 或 {}",
+            provider_api_key
+        );
     }
-    
+
     // ollama需要base_url但没有找到时提示
     if provider.to_lowercase() == "ollama" && found_base_url.is_none() {
-        println!("  ⚠️  Ollama需要设置 HC_LLM_BASE_URL 或 {}", provider_base_url);
+        println!(
+            "  ⚠️  Ollama需要设置 HC_LLM_BASE_URL 或 {}",
+            provider_base_url
+        );
     }
-    
+
     // 检查超时配置
     let timeout_secs = env::var("HC_LLM_REQUEST_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(180);
-    
+
     println!("  ⏰ 请求超时: {}秒", timeout_secs);
-    
+
     if timeout_secs > 300 {
-        println!("  💡 提示: 超时时间较长({}秒)，可能导致等待时间过久", timeout_secs);
+        println!(
+            "  💡 提示: 超时时间较长({}秒)，可能导致等待时间过久",
+            timeout_secs
+        );
     }
-    
+
     println!("  🚀 配置检查完成，开始聊天...");
     println!();
-    
+
     Ok(())
 }
-
 
 #[cfg(test)]
 #[path = "../tests/unit/cli.rs"]

@@ -32,7 +32,7 @@ use hc_llm::{
 };
 use hc_responder::{
     HumanInboxRepository, HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse,
-    ResponderBackend, ResponderBinding, require_human, require_llm,
+    ResponderBackend, ResponderBinding, require_human,
 };
 use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
@@ -608,29 +608,85 @@ struct RegistryReplyBackend {
 
 impl ResponderBackend for RegistryReplyBackend {
     fn generate_reply(&self, request: &ReplyRequest) -> Result<ReplyResponse> {
-        let llm = require_llm(&request.responder)?;
-        let mut messages = Vec::new();
-        if let Some(system_prompt) = &llm.system_prompt {
-            messages.push(hc_llm::ChatMessage::new(
-                hc_llm::MessageRole::System,
-                system_prompt.clone(),
-            ));
+        match &request.responder {
+            ResponderBinding::Llm(llm) => {
+                let mut messages = Vec::new();
+                if let Some(system_prompt) = &llm.system_prompt {
+                    messages.push(hc_llm::ChatMessage::new(
+                        hc_llm::MessageRole::System,
+                        system_prompt.clone(),
+                    ));
+                }
+                messages.push(hc_llm::ChatMessage::new(
+                    hc_llm::MessageRole::User,
+                    request.source_body.clone(),
+                ));
+
+                let response = self
+                    .registry
+                    .generate(&hc_llm::GenerateRequest::new(
+                        hc_llm::ModelRef::new(llm.provider.clone(), llm.model.clone()),
+                        messages,
+                    ))
+                    .map_err(|error| anyhow::anyhow!(error))?;
+
+                Ok(ReplyResponse::new(response.message.content))
+            }
+            ResponderBinding::Human(_) => {
+                bail!(
+                    "human responder cannot auto-generate replies; complete items in the human inbox"
+                );
+            }
+            ResponderBinding::Rule(config) => {
+                let profile = config.profile.as_deref().unwrap_or("default");
+                Ok(ReplyResponse::new(format!(
+                    "[rule:{profile}] {}",
+                    request.source_body.trim()
+                )))
+            }
+            ResponderBinding::Script(config) => {
+                let body = run_script_responder_command(&config.command, request)?;
+                if body.is_empty() {
+                    Ok(ReplyResponse::new(
+                        "[script] (empty stdout — set script to print reply text)",
+                    ))
+                } else {
+                    Ok(ReplyResponse::new(body))
+                }
+            }
         }
-        messages.push(hc_llm::ChatMessage::new(
-            hc_llm::MessageRole::User,
-            request.source_body.clone(),
-        ));
-
-        let response = self
-            .registry
-            .generate(&hc_llm::GenerateRequest::new(
-                hc_llm::ModelRef::new(llm.provider.clone(), llm.model.clone()),
-                messages,
-            ))
-            .map_err(|error| anyhow::anyhow!(error))?;
-
-        Ok(ReplyResponse::new(response.message.content))
     }
+}
+
+fn run_script_responder_command(command: &str, request: &ReplyRequest) -> Result<String> {
+    if command.trim().is_empty() {
+        bail!("script responder command cannot be empty");
+    }
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/C").arg(command);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    cmd.env("HC_SOURCE_BODY", &request.source_body);
+    cmd.env("HC_SOURCE_MESSAGE_ID", &request.source_message_id);
+    cmd.env("HC_SOURCE_SESSION_ID", &request.source_session_id);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to run script responder: {command}"))?;
+    if !output.status.success() {
+        bail!(
+            "script responder exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 enum UiEvent {
@@ -1508,7 +1564,7 @@ fn send_window_message(
                         .transcript_lines
                         .push(format!("[pending] {} will reply manually", to_name));
                 }
-                Some(ResponderBinding::Llm(_)) => {
+                Some(responder) if !responder.is_human() => {
                     let reply_backend = default_reply_backend();
                     match orchestrator.generate_and_post_direct_reply(
                         &reply_backend,
@@ -1537,15 +1593,6 @@ fn send_window_message(
                                 .push(format!("[llm error] {} could not reply: {error}", to_name));
                         }
                     }
-                }
-                Some(other) => {
-                    registry_ref.windows[from_index]
-                        .transcript_lines
-                        .push(format!(
-                            "[responder] {} is using {}, auto reply not implemented yet",
-                            to_name,
-                            other.label()
-                        ));
                 }
                 None => {
                     registry_ref.windows[from_index]
@@ -1639,7 +1686,7 @@ fn broadcast_window_message(
                             .push(format!("[pending] {} will reply manually", speaker_name));
                     }
                 }
-                Some(ResponderBinding::Llm(_)) => {
+                Some(responder) if !responder.is_human() => {
                     let reply_backend = default_reply_backend();
                     match orchestrator.generate_and_post_reply(
                         &reply_backend,
@@ -1687,15 +1734,6 @@ fn broadcast_window_message(
                                 ));
                             }
                         }
-                    }
-                }
-                Some(other) => {
-                    for window in &mut registry_ref.windows {
-                        window.transcript_lines.push(format!(
-                            "[responder] {} is using {}, auto reply not implemented yet",
-                            speaker_name,
-                            other.label()
-                        ));
                     }
                 }
                 None => {}
@@ -1929,7 +1967,7 @@ fn send_channel_message(
                             .push(format!("[pending] {} will reply manually", speaker_name));
                     }
                 }
-                Some(ResponderBinding::Llm(_)) => {
+                Some(responder) if !responder.is_human() => {
                     let reply_backend = default_reply_backend();
                     match orchestrator.generate_and_post_reply(
                         &reply_backend,
@@ -1971,15 +2009,6 @@ fn send_channel_message(
                                 ));
                             }
                         }
-                    }
-                }
-                Some(other) => {
-                    for window in &mut registry_ref.windows {
-                        window.transcript_lines.push(format!(
-                            "[responder] {} is using {}, auto reply not implemented yet",
-                            speaker_name,
-                            other.label()
-                        ));
                     }
                 }
                 None => {}
@@ -2086,11 +2115,20 @@ fn run_local_command_async(registry: Rc<RefCell<UiRegistry>>, window_index: i32,
     let sender = registry.borrow().events_tx.clone();
 
     thread::spawn(move || {
-        let spawn_result = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &line])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        let spawn_result = if cfg!(windows) {
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command", &line])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        } else {
+            Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
 
         let mut child = match spawn_result {
             Ok(child) => child,
@@ -3256,7 +3294,7 @@ fn run_planner_natural_language_input(
             .clone()
             .ok_or_else(|| anyhow::anyhow!("planner responder not bound"))?;
 
-        if !matches!(responder, ResponderBinding::Llm(_)) {
+        if matches!(&responder, ResponderBinding::Human(_)) {
             drop(registry_ref);
             return apply_manual_planner_input(registry, input, initial, responder.label());
         }
@@ -3666,7 +3704,7 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
                 .transcript_lines
                 .push(format!("[pending] {target_name} will execute manually"));
         }
-        Some(ResponderBinding::Llm(_)) => {
+        Some(responder) if !responder.is_human() => {
             let reply_backend = default_reply_backend();
             match orchestrator.generate_and_post_direct_reply(
                 &reply_backend,
@@ -3701,15 +3739,6 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
                         ));
                 }
             }
-        }
-        Some(other) => {
-            registry_ref.windows[source_index]
-                .transcript_lines
-                .push(format!(
-                    "[responder] {} is using {}, execution auto reply not implemented yet",
-                    target_name,
-                    other.label()
-                ));
         }
         None => {
             registry_ref.windows[source_index]
@@ -3901,7 +3930,7 @@ fn execute_work_item(
                     .transcript_lines
                     .push(format!("[pending] {target_name} will execute manually"));
             }
-            Some(ResponderBinding::Llm(_)) => {
+            Some(responder) if !responder.is_human() => {
                 let reply_backend = default_reply_backend();
                 match orchestrator.generate_and_post_direct_reply(
                     &reply_backend,
@@ -3936,15 +3965,6 @@ fn execute_work_item(
                             ));
                     }
                 }
-            }
-            Some(other) => {
-                registry_ref.windows[source_index]
-                    .transcript_lines
-                    .push(format!(
-                        "[responder] {} is using {}, execution auto reply not implemented yet",
-                        target_name,
-                        other.label()
-                    ));
             }
             None => {
                 registry_ref.windows[source_index]

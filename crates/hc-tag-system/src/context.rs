@@ -1,8 +1,8 @@
 //! 上下文感知模块 - 考虑对话历史、任务序列和时间模式
 
-use std::collections::HashMap;
-use chrono::{DateTime, Utc, Duration, Timelike, Datelike};
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::TagVector;
 
@@ -82,10 +82,10 @@ pub struct TaskSequencePattern {
 /// 序列模式类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SequencePatternType {
-    Progressive,    // 递进式（复杂度递增）
-    Cyclical,      // 循环式（重复模式）
-    Exploratory,   // 探索式（随机性高）
-    Focused,       // 专注式（单一领域）
+    Progressive, // 递进式（复杂度递增）
+    Cyclical,    // 循环式（重复模式）
+    Exploratory, // 探索式（随机性高）
+    Focused,     // 专注式（单一领域）
 }
 
 /// 时间模式
@@ -113,28 +113,26 @@ impl ContextAwareAnalyzer {
 
     /// 基于上下文分析输入
     pub fn analyze_with_context(
-        &mut self, 
-        input: &str, 
-        context: &ExtendedContext
+        &mut self,
+        input: &str,
+        context: &ExtendedContext,
     ) -> ContextAnalysisResult {
         // 分析对话历史影响
-        let conversation_influence = self.conversation_analyzer.analyze_conversation(
-            input, 
-            &context.conversation_history
-        );
+        let conversation_influence = self
+            .conversation_analyzer
+            .analyze_conversation(input, &context.conversation_history);
 
         // 分析任务序列模式
-        let sequence_pattern = self.task_sequence_analyzer.analyze_sequence(
-            input,
-            &context.task_history
-        );
+        let sequence_pattern = self
+            .task_sequence_analyzer
+            .analyze_sequence(input, &context.task_history);
 
         // 分析时间模式（如果启用）
         let temporal_pattern = if self.config.enable_temporal_patterns {
             self.temporal_analyzer.analyze_temporal_context(
                 input,
                 context.current_time,
-                &context.session_info
+                &context.session_info,
             )
         } else {
             TemporalPattern {
@@ -150,14 +148,14 @@ impl ContextAwareAnalyzer {
             input,
             &conversation_influence,
             &sequence_pattern,
-            &temporal_pattern
+            &temporal_pattern,
         );
 
         // 计算整体置信度
         let overall_confidence = self.calculate_context_confidence(
             &conversation_influence,
             &sequence_pattern,
-            &temporal_pattern
+            &temporal_pattern,
         );
 
         ContextAnalysisResult {
@@ -175,7 +173,7 @@ impl ContextAwareAnalyzer {
         input: &str,
         conversation: &ConversationInfluence,
         sequence: &TaskSequencePattern,
-        temporal: &TemporalPattern
+        temporal: &TemporalPattern,
     ) -> TagVector {
         let mut boost_vector = TagVector::new();
 
@@ -210,7 +208,9 @@ impl ContextAwareAnalyzer {
     fn concept_to_dimension(&self, concept: &str) -> String {
         match concept.to_lowercase().as_str() {
             "create" | "design" | "invent" | "innovative" => "creativity_level".to_string(),
-            "complex" | "difficult" | "advanced" | "sophisticated" => "technical_complexity".to_string(),
+            "complex" | "difficult" | "advanced" | "sophisticated" => {
+                "technical_complexity".to_string()
+            }
             "urgent" | "asap" | "quickly" | "immediate" => "urgency".to_string(),
             _ => "general".to_string(),
         }
@@ -221,15 +221,15 @@ impl ContextAwareAnalyzer {
         &self,
         conversation: &ConversationInfluence,
         sequence: &TaskSequencePattern,
-        temporal: &TemporalPattern
+        temporal: &TemporalPattern,
     ) -> f32 {
         let conversation_confidence = conversation.topic_consistency;
         let sequence_confidence = sequence.confidence;
         let temporal_confidence = temporal.urgency_trend.abs().min(1.0);
 
-        conversation_confidence * self.config.conversation_weight +
-         sequence_confidence * self.config.sequence_weight +
-         temporal_confidence * self.config.temporal_weight
+        conversation_confidence * self.config.conversation_weight
+            + sequence_confidence * self.config.sequence_weight
+            + temporal_confidence * self.config.temporal_weight
     }
 }
 
@@ -250,7 +250,7 @@ impl ConversationAnalyzer {
     pub fn analyze_conversation(
         &mut self,
         current_input: &str,
-        history: &[ConversationTurn]
+        history: &[ConversationTurn],
     ) -> ConversationInfluence {
         // 提取历史主题
         let recurring_themes = self.theme_extractor.extract_themes(history);
@@ -272,7 +272,11 @@ impl ConversationAnalyzer {
         }
     }
 
-    fn calculate_topic_consistency(&self, current_input: &str, history: &[ConversationTurn]) -> f32 {
+    fn calculate_topic_consistency(
+        &self,
+        current_input: &str,
+        history: &[ConversationTurn],
+    ) -> f32 {
         if history.is_empty() {
             return 0.0;
         }
@@ -280,7 +284,8 @@ impl ConversationAnalyzer {
         let current_words: Vec<&str> = current_input.split_whitespace().collect();
         let mut total_similarity = 0.0f32;
 
-        for turn in history.iter().take(5) { // 只考虑最近5轮对话
+        for turn in history.iter().take(5) {
+            // 只考虑最近5轮对话
             let turn_words: Vec<&str> = turn.user_input.split_whitespace().collect();
             let similarity = self.calculate_word_overlap(&current_words, &turn_words);
             total_similarity += similarity;
@@ -292,10 +297,10 @@ impl ConversationAnalyzer {
     fn calculate_word_overlap(&self, words1: &[&str], words2: &[&str]) -> f32 {
         let set1: std::collections::HashSet<&str> = words1.iter().cloned().collect();
         let set2: std::collections::HashSet<&str> = words2.iter().cloned().collect();
-        
+
         let intersection = set1.intersection(&set2).count();
         let union = set1.union(&set2).count();
-        
+
         if union == 0 {
             0.0
         } else {
@@ -303,14 +308,19 @@ impl ConversationAnalyzer {
         }
     }
 
-    fn extract_key_concepts(&self, current_input: &str, history: &[ConversationTurn]) -> HashMap<String, f32> {
+    fn extract_key_concepts(
+        &self,
+        current_input: &str,
+        history: &[ConversationTurn],
+    ) -> HashMap<String, f32> {
         let mut concepts = HashMap::new();
         let mut word_counts = HashMap::new();
 
         // 统计当前输入的词汇
         for word in current_input.split_whitespace() {
             let clean_word = word.to_lowercase();
-            if clean_word.len() > 3 { // 过滤短词
+            if clean_word.len() > 3 {
+                // 过滤短词
                 *word_counts.entry(clean_word).or_insert(0) += 2; // 当前输入权重更高
             }
         }
@@ -329,7 +339,8 @@ impl ConversationAnalyzer {
         // 转换为概念权重
         let total_count: i32 = word_counts.values().sum();
         for (word, count) in word_counts {
-            if count > 1 { // 只保留出现多次的概念
+            if count > 1 {
+                // 只保留出现多次的概念
                 let weight = count as f32 / total_count as f32;
                 concepts.insert(word, weight.min(1.0));
             }
@@ -354,7 +365,7 @@ impl TaskSequenceAnalyzer {
     pub fn analyze_sequence(
         &mut self,
         current_input: &str,
-        task_history: &[TaskRecord]
+        task_history: &[TaskRecord],
     ) -> TaskSequencePattern {
         // 检测序列模式
         let pattern_type = self.pattern_detector.detect_pattern(task_history);
@@ -376,7 +387,11 @@ impl TaskSequenceAnalyzer {
         }
     }
 
-    fn calculate_pattern_confidence(&self, history: &[TaskRecord], pattern: &SequencePatternType) -> f32 {
+    fn calculate_pattern_confidence(
+        &self,
+        history: &[TaskRecord],
+        pattern: &SequencePatternType,
+    ) -> f32 {
         if history.len() < 3 {
             return 0.3; // 历史不足，置信度较低
         }
@@ -389,7 +404,7 @@ impl TaskSequenceAnalyzer {
                 for window in history.windows(2) {
                     if let (Some(prev_complexity), Some(curr_complexity)) = (
                         window[0].tag_vector.dimensions.get("technical_complexity"),
-                        window[1].tag_vector.dimensions.get("technical_complexity")
+                        window[1].tag_vector.dimensions.get("technical_complexity"),
                     ) {
                         if curr_complexity > prev_complexity {
                             increases += 1;
@@ -405,15 +420,15 @@ impl TaskSequenceAnalyzer {
                     let mut count = 0;
 
                     for dimension in first_record.tag_vector.dimensions.keys() {
-                        let values: Vec<f32> = history.iter()
+                        let values: Vec<f32> = history
+                            .iter()
                             .map(|r| r.tag_vector.get(dimension))
                             .collect();
-                        
+
                         let avg = values.iter().sum::<f32>() / values.len() as f32;
-                        let variance = values.iter()
-                            .map(|v| (v - avg).powi(2))
-                            .sum::<f32>() / values.len() as f32;
-                        
+                        let variance = values.iter().map(|v| (v - avg).powi(2)).sum::<f32>()
+                            / values.len() as f32;
+
                         consistency_sum += 1.0 / (1.0 + variance);
                         count += 1;
                     }
@@ -431,17 +446,23 @@ impl TaskSequenceAnalyzer {
         }
     }
 
-    fn predict_next_dimensions(&self, _current_input: &str, history: &[TaskRecord]) -> Vec<(String, f32)> {
+    fn predict_next_dimensions(
+        &self,
+        _current_input: &str,
+        history: &[TaskRecord],
+    ) -> Vec<(String, f32)> {
         if history.is_empty() {
             return Vec::new();
         }
 
         // 基于历史频率预测
         let mut dimension_frequencies = HashMap::new();
-        
-        for record in history.iter().rev().take(5) { // 最近5条记录
+
+        for record in history.iter().rev().take(5) {
+            // 最近5条记录
             for (dimension, value) in &record.tag_vector.dimensions {
-                if *value > 0.5 { // 只考虑高分维度
+                if *value > 0.5 {
+                    // 只考虑高分维度
                     *dimension_frequencies.entry(dimension.clone()).or_insert(0) += 1;
                 }
             }
@@ -465,15 +486,19 @@ impl TaskSequenceAnalyzer {
         }
 
         let recent_records = history.iter().rev().take(3).collect::<Vec<_>>();
-        
+
         // 简化的工作流阶段判断
-        let avg_creativity: f32 = recent_records.iter()
+        let avg_creativity: f32 = recent_records
+            .iter()
             .map(|r| r.tag_vector.get("creativity_level"))
-            .sum::<f32>() / recent_records.len() as f32;
-            
-        let avg_complexity: f32 = recent_records.iter()
+            .sum::<f32>()
+            / recent_records.len() as f32;
+
+        let avg_complexity: f32 = recent_records
+            .iter()
             .map(|r| r.tag_vector.get("technical_complexity"))
-            .sum::<f32>() / recent_records.len() as f32;
+            .sum::<f32>()
+            / recent_records.len() as f32;
 
         if avg_creativity > 0.7 {
             "创意构思阶段".to_string()
@@ -497,10 +522,10 @@ impl TemporalAnalyzer {
         &self,
         _input: &str,
         current_time: DateTime<Utc>,
-        session_info: &SessionInfo
+        session_info: &SessionInfo,
     ) -> TemporalPattern {
         let mut time_of_day_bias = HashMap::new();
-        
+
         // 基于时间的偏好分析
         let hour = current_time.hour();
         match hour {
@@ -535,11 +560,12 @@ impl TemporalAnalyzer {
         };
 
         // 紧急度趋势（基于时间压力）
-        let urgency_trend = if current_time.hour() >= 17 && current_time.weekday().number_from_monday() <= 5 {
-            0.2 // 工作日下班前
-        } else {
-            0.0
-        };
+        let urgency_trend =
+            if current_time.hour() >= 17 && current_time.weekday().number_from_monday() <= 5 {
+                0.2 // 工作日下班前
+            } else {
+                0.0
+            };
 
         TemporalPattern {
             time_of_day_bias,
@@ -589,7 +615,9 @@ pub struct SessionInfo {
 // 辅助分析器
 struct ThemeExtractor;
 impl ThemeExtractor {
-    fn new() -> Self { Self }
+    fn new() -> Self {
+        Self
+    }
     fn extract_themes(&self, _history: &[ConversationTurn]) -> Vec<String> {
         // 简化实现
         vec!["创意设计".to_string(), "技术开发".to_string()]
@@ -598,7 +626,9 @@ impl ThemeExtractor {
 
 struct SentimentAnalyzer;
 impl SentimentAnalyzer {
-    fn new() -> Self { Self }
+    fn new() -> Self {
+        Self
+    }
     fn analyze_trend(&self, _history: &[ConversationTurn]) -> String {
         // 简化实现
         "积极".to_string()
@@ -607,7 +637,9 @@ impl SentimentAnalyzer {
 
 struct PatternDetector;
 impl PatternDetector {
-    fn new() -> Self { Self }
+    fn new() -> Self {
+        Self
+    }
     fn detect_pattern(&self, history: &[TaskRecord]) -> SequencePatternType {
         if history.len() < 3 {
             return SequencePatternType::Exploratory;
@@ -638,16 +670,14 @@ mod tests {
     #[test]
     fn test_context_analyzer() {
         let mut analyzer = ContextAwareAnalyzer::with_defaults();
-        
+
         let context = ExtendedContext {
-            conversation_history: vec![
-                ConversationTurn {
-                    timestamp: Utc::now(),
-                    user_input: "I want to create something innovative".to_string(),
-                    assistant_response: "Great idea!".to_string(),
-                    turn_id: 1,
-                }
-            ],
+            conversation_history: vec![ConversationTurn {
+                timestamp: Utc::now(),
+                user_input: "I want to create something innovative".to_string(),
+                assistant_response: "Great idea!".to_string(),
+                turn_id: 1,
+            }],
             task_history: vec![],
             current_time: Utc::now(),
             session_info: SessionInfo {
@@ -660,7 +690,7 @@ mod tests {
         };
 
         let result = analyzer.analyze_with_context("design a new product", &context);
-        
+
         assert!(result.overall_confidence >= 0.0);
         assert!(!result.conversation_influence.key_concepts.is_empty());
     }
@@ -668,15 +698,13 @@ mod tests {
     #[test]
     fn test_conversation_analyzer() {
         let mut analyzer = ConversationAnalyzer::new();
-        
-        let history = vec![
-            ConversationTurn {
-                timestamp: Utc::now(),
-                user_input: "create design innovative".to_string(),
-                assistant_response: "Ok".to_string(),
-                turn_id: 1,
-            }
-        ];
+
+        let history = vec![ConversationTurn {
+            timestamp: Utc::now(),
+            user_input: "create design innovative".to_string(),
+            assistant_response: "Ok".to_string(),
+            turn_id: 1,
+        }];
 
         let result = analyzer.analyze_conversation("design something creative", &history);
         assert!(result.topic_consistency > 0.0);

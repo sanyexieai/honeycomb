@@ -1,12 +1,12 @@
 //! 动态权重学习和反馈优化模块
 
-use std::collections::{HashMap, VecDeque};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc, Duration as ChronoDuration};
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::PathBuf;
 
-use crate::{TagVector, HybridAnalysisResult};
+use crate::{HybridAnalysisResult, TagVector};
 
 /// 动态学习管理器
 pub struct DynamicLearningManager {
@@ -111,7 +111,7 @@ pub struct ProcessedFeedback {
     pub input: String,
     pub predicted_tags: TagVector,
     pub expected_tags: TagVector,
-    pub user_satisfaction: f32, // 0.0 - 1.0
+    pub user_satisfaction: f32,  // 0.0 - 1.0
     pub error_vector: TagVector, // predicted - expected
     pub component_contributions: ComponentContributions,
     pub feedback_type: FeedbackType,
@@ -131,10 +131,10 @@ pub struct ComponentContributions {
 /// 反馈类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FeedbackType {
-    Explicit,    // 用户明确提供反馈
-    Implicit,    // 从用户行为推断的反馈
-    System,      // 系统内部自动评估
-    Correction,  // 用户纠错
+    Explicit,   // 用户明确提供反馈
+    Implicit,   // 从用户行为推断的反馈
+    System,     // 系统内部自动评估
+    Correction, // 用户纠错
 }
 
 /// 反馈统计
@@ -166,12 +166,12 @@ pub struct PerformanceRecord {
 /// 性能指标
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceMetrics {
-    pub accuracy: f32,           // 整体准确度
-    pub precision: f32,          // 精确度
-    pub recall: f32,             // 召回率
-    pub f1_score: f32,           // F1分数
-    pub user_satisfaction: f32,  // 用户满意度
-    pub response_time: f32,      // 响应时间(ms)
+    pub accuracy: f32,                            // 整体准确度
+    pub precision: f32,                           // 精确度
+    pub recall: f32,                              // 召回率
+    pub f1_score: f32,                            // F1分数
+    pub user_satisfaction: f32,                   // 用户满意度
+    pub response_time: f32,                       // 响应时间(ms)
     pub dimension_accuracy: HashMap<String, f32>, // 各维度准确度
 }
 
@@ -241,14 +241,16 @@ impl DynamicLearningManager {
 
         // 4. 记录学习结果
         let learning_duration = start_time.elapsed();
-        
+
         let result = LearningResult {
             feedback_processed: true,
             performance_improved: performance_update.improvement > 0.0,
             weights_updated: weight_update.is_some(),
             current_weights: self.weight_optimizer.current_weights.clone(),
             performance_change: performance_update.improvement,
-            learning_rate_adjusted: weight_update.map(|u| u.learning_rate_adjusted).unwrap_or(false),
+            learning_rate_adjusted: weight_update
+                .map(|u| u.learning_rate_adjusted)
+                .unwrap_or(false),
             processing_time: learning_duration,
             recommendations: self.generate_learning_recommendations(),
         };
@@ -269,7 +271,7 @@ impl DynamicLearningManager {
         feedback_type: FeedbackType,
     ) -> Result<ProcessedFeedback, String> {
         let predicted_tags = &predicted_result.final_result;
-        
+
         let expected_tags = expected_tags.unwrap_or(predicted_tags).clone();
         let satisfaction = user_satisfaction.unwrap_or(0.5);
 
@@ -291,7 +293,9 @@ impl DynamicLearningManager {
         };
 
         // 添加到反馈队列
-        self.feedback_processor.feedback_queue.push_back(processed_feedback.clone());
+        self.feedback_processor
+            .feedback_queue
+            .push_back(processed_feedback.clone());
 
         // 保持队列大小
         if self.feedback_processor.feedback_queue.len() > self.config.performance_window_size {
@@ -304,7 +308,7 @@ impl DynamicLearningManager {
     /// 计算误差向量
     fn calculate_error_vector(&self, predicted: &TagVector, expected: &TagVector) -> TagVector {
         let mut error_vector = TagVector::new();
-        
+
         // 收集所有维度
         let mut all_dimensions = std::collections::HashSet::new();
         for dim in predicted.dimensions.keys() {
@@ -314,40 +318,66 @@ impl DynamicLearningManager {
             all_dimensions.insert(dim.clone());
         }
 
-        // 计算各维度误差
+        // 计算各维度误差（可为负；不使用 TagVector::set 以免被限幅到 [0,1]）
         for dimension in all_dimensions {
             let predicted_value = predicted.get(&dimension);
             let expected_value = expected.get(&dimension);
             let error = predicted_value - expected_value;
-            error_vector.set(&dimension, error);
+            error_vector.dimensions.insert(dimension, error);
         }
 
         error_vector
     }
 
     /// 分析组件贡献度
-    fn analyze_component_contributions(&self, result: &HybridAnalysisResult) -> ComponentContributions {
+    fn analyze_component_contributions(
+        &self,
+        result: &HybridAnalysisResult,
+    ) -> ComponentContributions {
         // 基于融合策略分析各组件的实际贡献
         let weights = &self.weight_optimizer.current_weights;
-        
+
         ComponentContributions {
-            legacy_contribution: self.calculate_component_influence(&result.legacy_result, &result.final_result) * weights.legacy_weight,
-            enhanced_contribution: self.calculate_component_influence(&result.enhanced_result, &result.final_result) * weights.enhanced_weight,
-            vector_contribution: result.vector_result.as_ref()
-                .map(|v| self.calculate_component_influence(&v.tag_vector, &result.final_result) * weights.vector_weight)
+            legacy_contribution: self
+                .calculate_component_influence(&result.legacy_result, &result.final_result)
+                * weights.legacy_weight,
+            enhanced_contribution: self
+                .calculate_component_influence(&result.enhanced_result, &result.final_result)
+                * weights.enhanced_weight,
+            vector_contribution: result
+                .vector_result
+                .as_ref()
+                .map(|v| {
+                    self.calculate_component_influence(&v.tag_vector, &result.final_result)
+                        * weights.vector_weight
+                })
                 .unwrap_or(0.0),
-            multipath_contribution: result.multipath_result.as_ref()
-                .map(|m| self.calculate_component_influence(&m.final_tag_vector, &result.final_result) * weights.multipath_weight)
+            multipath_contribution: result
+                .multipath_result
+                .as_ref()
+                .map(|m| {
+                    self.calculate_component_influence(&m.final_tag_vector, &result.final_result)
+                        * weights.multipath_weight
+                })
                 .unwrap_or(0.0),
-            personalized_contribution: result.personalized_result.as_ref()
-                .map(|p| self.calculate_component_influence(&p.personalized_vector, &result.final_result) * weights.personalized_weight)
+            personalized_contribution: result
+                .personalized_result
+                .as_ref()
+                .map(|p| {
+                    self.calculate_component_influence(&p.personalized_vector, &result.final_result)
+                        * weights.personalized_weight
+                })
                 .unwrap_or(0.0),
             intent_adjustment: weights.intent_influence,
         }
     }
 
     /// 计算组件影响度
-    fn calculate_component_influence(&self, component_result: &TagVector, final_result: &TagVector) -> f32 {
+    fn calculate_component_influence(
+        &self,
+        component_result: &TagVector,
+        final_result: &TagVector,
+    ) -> f32 {
         // 使用余弦相似度衡量组件对最终结果的影响
         component_result.cosine_similarity(final_result)
     }
@@ -355,7 +385,8 @@ impl DynamicLearningManager {
     /// 更新性能指标
     fn update_performance_metrics(&mut self, feedback: &ProcessedFeedback) -> PerformanceUpdate {
         // 计算当前样本的指标
-        let sample_accuracy = self.calculate_accuracy(&feedback.predicted_tags, &feedback.expected_tags);
+        let sample_accuracy =
+            self.calculate_accuracy(&feedback.predicted_tags, &feedback.expected_tags);
         let sample_satisfaction = feedback.user_satisfaction;
 
         // 更新累积指标
@@ -364,9 +395,9 @@ impl DynamicLearningManager {
 
         // 使用指数移动平均更新指标
         let alpha = 0.1; // 平滑因子
-        self.performance_tracker.current_metrics.accuracy = 
+        self.performance_tracker.current_metrics.accuracy =
             old_accuracy * (1.0 - alpha) + sample_accuracy * alpha;
-        self.performance_tracker.current_metrics.user_satisfaction = 
+        self.performance_tracker.current_metrics.user_satisfaction =
             old_satisfaction * (1.0 - alpha) + sample_satisfaction * alpha;
 
         // 计算其他指标
@@ -374,8 +405,8 @@ impl DynamicLearningManager {
         self.update_dimension_accuracy(feedback);
 
         // 计算改进程度
-        let improvement = (self.performance_tracker.current_metrics.accuracy - old_accuracy) +
-                         (self.performance_tracker.current_metrics.user_satisfaction - old_satisfaction);
+        let improvement = (self.performance_tracker.current_metrics.accuracy - old_accuracy)
+            + (self.performance_tracker.current_metrics.user_satisfaction - old_satisfaction);
 
         PerformanceUpdate {
             improvement,
@@ -411,14 +442,14 @@ impl DynamicLearningManager {
     fn update_precision_recall(&mut self, feedback: &ProcessedFeedback) {
         // 简化的精确度和召回率计算
         let threshold = 0.5;
-        
+
         let mut true_positives = 0;
         let mut false_positives = 0;
         let mut false_negatives = 0;
 
         for (dimension, expected_value) in &feedback.expected_tags.dimensions {
             let predicted_value = feedback.predicted_tags.get(dimension);
-            
+
             let predicted_positive = predicted_value > threshold;
             let actual_positive = *expected_value > threshold;
 
@@ -431,12 +462,12 @@ impl DynamicLearningManager {
         }
 
         if true_positives + false_positives > 0 {
-            self.performance_tracker.current_metrics.precision = 
+            self.performance_tracker.current_metrics.precision =
                 true_positives as f32 / (true_positives + false_positives) as f32;
         }
 
         if true_positives + false_negatives > 0 {
-            self.performance_tracker.current_metrics.recall = 
+            self.performance_tracker.current_metrics.recall =
                 true_positives as f32 / (true_positives + false_negatives) as f32;
         }
 
@@ -444,7 +475,7 @@ impl DynamicLearningManager {
         let precision = self.performance_tracker.current_metrics.precision;
         let recall = self.performance_tracker.current_metrics.recall;
         if precision + recall > 0.0 {
-            self.performance_tracker.current_metrics.f1_score = 
+            self.performance_tracker.current_metrics.f1_score =
                 2.0 * (precision * recall) / (precision + recall);
         }
     }
@@ -454,23 +485,31 @@ impl DynamicLearningManager {
         for (dimension, expected_value) in &feedback.expected_tags.dimensions {
             let predicted_value = feedback.predicted_tags.get(dimension);
             let accuracy = 1.0 - (predicted_value - expected_value).abs();
-            
-            let current_accuracy = self.performance_tracker.current_metrics.dimension_accuracy
-                .get(dimension).unwrap_or(&0.5);
-            
+
+            let current_accuracy = self
+                .performance_tracker
+                .current_metrics
+                .dimension_accuracy
+                .get(dimension)
+                .unwrap_or(&0.5);
+
             let alpha = 0.1;
             let updated_accuracy = current_accuracy * (1.0 - alpha) + accuracy * alpha;
-            
-            self.performance_tracker.current_metrics.dimension_accuracy
+
+            self.performance_tracker
+                .current_metrics
+                .dimension_accuracy
                 .insert(dimension.clone(), updated_accuracy);
         }
     }
 
     /// 检查是否应该更新权重
     fn should_update_weights(&self) -> bool {
-        let enough_samples = self.feedback_processor.feedback_queue.len() >= self.config.min_samples_for_update;
-        let time_elapsed = Utc::now().signed_duration_since(self.weight_optimizer.last_update) >= self.config.weight_update_frequency;
-        
+        let enough_samples =
+            self.feedback_processor.feedback_queue.len() >= self.config.min_samples_for_update;
+        let time_elapsed = Utc::now().signed_duration_since(self.weight_optimizer.last_update)
+            >= self.config.weight_update_frequency;
+
         enough_samples && time_elapsed
     }
 
@@ -535,8 +574,10 @@ impl DynamicLearningManager {
                 gradients.legacy_weight += -error_magnitude * contributions.legacy_contribution;
                 gradients.enhanced_weight += -error_magnitude * contributions.enhanced_contribution;
                 gradients.vector_weight += -error_magnitude * contributions.vector_contribution;
-                gradients.multipath_weight += -error_magnitude * contributions.multipath_contribution;
-                gradients.personalized_weight += -error_magnitude * contributions.personalized_contribution;
+                gradients.multipath_weight +=
+                    -error_magnitude * contributions.multipath_contribution;
+                gradients.personalized_weight +=
+                    -error_magnitude * contributions.personalized_contribution;
 
                 gradient_count += 1;
             }
@@ -557,10 +598,12 @@ impl DynamicLearningManager {
 
     /// 计算误差幅度
     fn calculate_error_magnitude(&self, error_vector: &TagVector) -> f32 {
-        let sum_squares: f32 = error_vector.dimensions.values()
+        let sum_squares: f32 = error_vector
+            .dimensions
+            .values()
             .map(|error| error * error)
             .sum();
-        
+
         if error_vector.dimensions.is_empty() {
             0.0
         } else {
@@ -575,28 +618,41 @@ impl DynamicLearningManager {
         let decay = self.config.decay_factor;
 
         // 更新速度（动量）
-        self.weight_optimizer.velocity.legacy_weight = 
+        self.weight_optimizer.velocity.legacy_weight =
             momentum * self.weight_optimizer.velocity.legacy_weight + lr * gradients.legacy_weight;
-        self.weight_optimizer.velocity.enhanced_weight = 
-            momentum * self.weight_optimizer.velocity.enhanced_weight + lr * gradients.enhanced_weight;
-        self.weight_optimizer.velocity.vector_weight = 
+        self.weight_optimizer.velocity.enhanced_weight = momentum
+            * self.weight_optimizer.velocity.enhanced_weight
+            + lr * gradients.enhanced_weight;
+        self.weight_optimizer.velocity.vector_weight =
             momentum * self.weight_optimizer.velocity.vector_weight + lr * gradients.vector_weight;
-        self.weight_optimizer.velocity.multipath_weight = 
-            momentum * self.weight_optimizer.velocity.multipath_weight + lr * gradients.multipath_weight;
-        self.weight_optimizer.velocity.personalized_weight = 
-            momentum * self.weight_optimizer.velocity.personalized_weight + lr * gradients.personalized_weight;
+        self.weight_optimizer.velocity.multipath_weight = momentum
+            * self.weight_optimizer.velocity.multipath_weight
+            + lr * gradients.multipath_weight;
+        self.weight_optimizer.velocity.personalized_weight = momentum
+            * self.weight_optimizer.velocity.personalized_weight
+            + lr * gradients.personalized_weight;
 
         // 应用权重更新
-        self.weight_optimizer.current_weights.legacy_weight = 
-            (self.weight_optimizer.current_weights.legacy_weight + self.weight_optimizer.velocity.legacy_weight) * decay;
-        self.weight_optimizer.current_weights.enhanced_weight = 
-            (self.weight_optimizer.current_weights.enhanced_weight + self.weight_optimizer.velocity.enhanced_weight) * decay;
-        self.weight_optimizer.current_weights.vector_weight = 
-            (self.weight_optimizer.current_weights.vector_weight + self.weight_optimizer.velocity.vector_weight) * decay;
-        self.weight_optimizer.current_weights.multipath_weight = 
-            (self.weight_optimizer.current_weights.multipath_weight + self.weight_optimizer.velocity.multipath_weight) * decay;
-        self.weight_optimizer.current_weights.personalized_weight = 
-            (self.weight_optimizer.current_weights.personalized_weight + self.weight_optimizer.velocity.personalized_weight) * decay;
+        self.weight_optimizer.current_weights.legacy_weight =
+            (self.weight_optimizer.current_weights.legacy_weight
+                + self.weight_optimizer.velocity.legacy_weight)
+                * decay;
+        self.weight_optimizer.current_weights.enhanced_weight =
+            (self.weight_optimizer.current_weights.enhanced_weight
+                + self.weight_optimizer.velocity.enhanced_weight)
+                * decay;
+        self.weight_optimizer.current_weights.vector_weight =
+            (self.weight_optimizer.current_weights.vector_weight
+                + self.weight_optimizer.velocity.vector_weight)
+                * decay;
+        self.weight_optimizer.current_weights.multipath_weight =
+            (self.weight_optimizer.current_weights.multipath_weight
+                + self.weight_optimizer.velocity.multipath_weight)
+                * decay;
+        self.weight_optimizer.current_weights.personalized_weight =
+            (self.weight_optimizer.current_weights.personalized_weight
+                + self.weight_optimizer.velocity.personalized_weight)
+                * decay;
 
         // 确保权重为正值并进行归一化
         self.normalize_weights();
@@ -605,7 +661,7 @@ impl DynamicLearningManager {
     /// 归一化权重
     fn normalize_weights(&mut self) {
         let weights = &mut self.weight_optimizer.current_weights;
-        
+
         // 确保所有权重为正值
         weights.legacy_weight = weights.legacy_weight.max(0.01);
         weights.enhanced_weight = weights.enhanced_weight.max(0.01);
@@ -614,9 +670,12 @@ impl DynamicLearningManager {
         weights.personalized_weight = weights.personalized_weight.max(0.01);
 
         // 归一化主要权重（确保总和为1.0）
-        let total = weights.legacy_weight + weights.enhanced_weight + weights.vector_weight + 
-                   weights.multipath_weight + weights.personalized_weight;
-        
+        let total = weights.legacy_weight
+            + weights.enhanced_weight
+            + weights.vector_weight
+            + weights.multipath_weight
+            + weights.personalized_weight;
+
         if total > 0.0 {
             weights.legacy_weight /= total;
             weights.enhanced_weight /= total;
@@ -633,7 +692,7 @@ impl DynamicLearningManager {
     /// 检查收敛性
     fn check_convergence(&self, old_weights: &ComponentWeights) -> ConvergenceResult {
         let current_weights = &self.weight_optimizer.current_weights;
-        
+
         let weight_changes = [
             (current_weights.legacy_weight - old_weights.legacy_weight).abs(),
             (current_weights.enhanced_weight - old_weights.enhanced_weight).abs(),
@@ -678,7 +737,10 @@ impl DynamicLearningManager {
         }
 
         if self.feedback_processor.feedback_queue.len() < self.config.min_samples_for_update {
-            recommendations.push(format!("反馈样本不足，建议收集至少{}个反馈样本", self.config.min_samples_for_update));
+            recommendations.push(format!(
+                "反馈样本不足，建议收集至少{}个反馈样本",
+                self.config.min_samples_for_update
+            ));
         }
 
         if self.config.learning_rate < 0.005 {
@@ -720,8 +782,7 @@ impl DynamicLearningManager {
         if weights_file.exists() {
             let content = fs::read_to_string(&weights_file)
                 .map_err(|e| format!("读取权重文件失败: {}", e))?;
-            serde_json::from_str(&content)
-                .map_err(|e| format!("解析权重数据失败: {}", e))
+            serde_json::from_str(&content).map_err(|e| format!("解析权重数据失败: {}", e))
         } else {
             Err("权重文件不存在".to_string())
         }
@@ -729,15 +790,19 @@ impl DynamicLearningManager {
 
     /// 加载性能历史
     fn load_performance_history(&mut self) -> Result<(), String> {
-        let history_file = self.workspace_root.join("learning_data/performance_history.json");
+        let history_file = self
+            .workspace_root
+            .join("learning_data/performance_history.json");
         if history_file.exists() {
             let content = fs::read_to_string(&history_file)
                 .map_err(|e| format!("读取性能历史失败: {}", e))?;
-            let history: Vec<PerformanceRecord> = serde_json::from_str(&content)
-                .map_err(|e| format!("解析性能历史失败: {}", e))?;
-            
+            let history: Vec<PerformanceRecord> =
+                serde_json::from_str(&content).map_err(|e| format!("解析性能历史失败: {}", e))?;
+
             for record in history {
-                self.performance_tracker.performance_history.push_back(record);
+                self.performance_tracker
+                    .performance_history
+                    .push_back(record);
             }
         }
         Ok(())
@@ -746,17 +811,20 @@ impl DynamicLearningManager {
     /// 保存学习状态
     fn save_learning_state(&self) -> Result<(), String> {
         let learning_dir = self.workspace_root.join("learning_data");
-        
+
         // 保存权重
         let weights_file = learning_dir.join("weights.json");
         let weights_content = serde_json::to_string_pretty(&self.weight_optimizer.current_weights)
             .map_err(|e| format!("序列化权重失败: {}", e))?;
-        fs::write(&weights_file, weights_content)
-            .map_err(|e| format!("保存权重失败: {}", e))?;
+        fs::write(&weights_file, weights_content).map_err(|e| format!("保存权重失败: {}", e))?;
 
         // 保存性能历史
         let history_file = learning_dir.join("performance_history.json");
-        let history: Vec<_> = self.performance_tracker.performance_history.iter().collect();
+        let history: Vec<_> = self
+            .performance_tracker
+            .performance_history
+            .iter()
+            .collect();
         let history_content = serde_json::to_string_pretty(&history)
             .map_err(|e| format!("序列化性能历史失败: {}", e))?;
         fs::write(&history_file, history_content)
@@ -884,7 +952,7 @@ mod tests {
 
     fn create_test_hybrid_result() -> HybridAnalysisResult {
         use crate::{HybridAnalysisResult, TagVector};
-        
+
         let mut final_result = TagVector::new();
         final_result.set("creativity_level", 0.8);
         final_result.set("urgency", 0.6);
@@ -914,7 +982,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DynamicLearningConfig::default();
         let mut manager = DynamicLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         assert!(manager.initialize().is_ok());
     }
 
@@ -923,13 +991,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DynamicLearningConfig::default();
         let mut manager = DynamicLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         manager.initialize().unwrap();
-        
+
         let hybrid_result = create_test_hybrid_result();
         let mut expected_tags = TagVector::new();
         expected_tags.set("creativity_level", 0.9);
-        
+
         let result = manager.process_feedback_and_learn(
             "test input",
             &hybrid_result,
@@ -937,7 +1005,7 @@ mod tests {
             Some(0.8),
             FeedbackType::Explicit,
         );
-        
+
         assert!(result.is_ok());
         let learning_result = result.unwrap();
         assert!(learning_result.feedback_processed);
@@ -949,20 +1017,23 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DynamicLearningConfig::default();
         let mut manager = DynamicLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         // 设置不正常的权重
         manager.weight_optimizer.current_weights.legacy_weight = -0.1;
         manager.weight_optimizer.current_weights.enhanced_weight = 2.0;
-        
+
         manager.normalize_weights();
-        
+
         let weights = &manager.weight_optimizer.current_weights;
-        assert!(weights.legacy_weight >= 0.01);
+        assert!(weights.legacy_weight > 0.0);
         assert!(weights.enhanced_weight > 0.0);
-        
-        // 检查主要权重是否归一化
-        let total = weights.legacy_weight + weights.enhanced_weight + weights.vector_weight + 
-                   weights.multipath_weight + weights.personalized_weight;
+
+        // 归一化后和为 1；单项可小于 0.01
+        let total = weights.legacy_weight
+            + weights.enhanced_weight
+            + weights.vector_weight
+            + weights.multipath_weight
+            + weights.personalized_weight;
         assert!((total - 1.0).abs() < 0.001);
     }
 
@@ -972,18 +1043,19 @@ mod tests {
         let config = DynamicLearningConfig::default();
         let mut manager = DynamicLearningManager::new(temp_dir.path().to_path_buf(), config);
         manager.initialize().unwrap();
-        
+
         let mut predicted = TagVector::new();
         predicted.set("creativity_level", 0.8);
-        
+
         let mut expected = TagVector::new();
         expected.set("creativity_level", 0.9);
-        
+
         let accuracy = manager.calculate_accuracy(&predicted, &expected);
         assert!(accuracy > 0.8); // 应该有较高的准确度，因为差异不大
-        
+
         let error_vector = manager.calculate_error_vector(&predicted, &expected);
-        assert_eq!(error_vector.get("creativity_level"), -0.1);
+        let err = error_vector.get("creativity_level");
+        assert!((err - (-0.1)).abs() < 1e-5, "expected ~-0.1, got {}", err);
     }
 
     #[test]
@@ -991,7 +1063,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DynamicLearningConfig::default();
         let manager = DynamicLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         let stats = manager.get_learning_statistics();
         assert_eq!(stats.total_feedback_processed, 0);
         assert!(stats.learning_rate > 0.0);

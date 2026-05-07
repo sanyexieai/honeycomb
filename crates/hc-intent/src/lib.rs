@@ -106,7 +106,10 @@ impl IntentRouter {
             Some(top) if top.score >= self.merger.threshold => (
                 top.intent_id.clone(),
                 top.score,
-                format!("selected {} via detector {}", top.intent_id, top.detector_id),
+                format!(
+                    "selected {} via detector {}",
+                    top.intent_id, top.detector_id
+                ),
             ),
             Some(top) => (
                 self.merger.fallback_intent.clone(),
@@ -192,7 +195,9 @@ fn contains_ascii_digit(text: &str) -> bool {
 }
 
 fn contains_chinese_numeral_token(text: &str) -> bool {
-    const TOKENS: &[&str] = &["十", "百", "零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    const TOKENS: &[&str] = &[
+        "十", "百", "零", "一", "二", "三", "四", "五", "六", "七", "八", "九",
+    ];
     TOKENS.iter().any(|tok| text.contains(tok))
 }
 

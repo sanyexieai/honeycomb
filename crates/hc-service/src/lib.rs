@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod chat;
 pub mod conversation;
+pub mod human_inbox;
 pub mod index;
 pub mod scheduler;
 pub mod timed_turn;

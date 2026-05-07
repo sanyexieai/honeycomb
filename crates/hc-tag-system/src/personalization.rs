@@ -1,12 +1,12 @@
 //! 个性化模块 - 用户配置文件、偏好学习和自适应优化
 
-use std::collections::HashMap;
-use chrono::{DateTime, Utc, Duration};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 
-use crate::{TagVector, ContextAnalysisResult};
+use crate::{ContextAnalysisResult, TagVector};
 
 /// 个性化用户配置文件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,10 +74,10 @@ pub struct LearnedPattern {
 /// 模式类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PatternType {
-    InputPattern(String),      // 输入模式（常用短语）
-    DimensionCorrelation,      // 维度相关性
-    ContextualPreference,      // 上下文偏好
-    TemporalPattern,          // 时间模式
+    InputPattern(String), // 输入模式（常用短语）
+    DimensionCorrelation, // 维度相关性
+    ContextualPreference, // 上下文偏好
+    TemporalPattern,      // 时间模式
 }
 
 /// 错误分类记录
@@ -95,7 +95,7 @@ pub struct MisclassificationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserFeedback {
     pub feedback_type: FeedbackType,
-    pub rating: Option<f32>,           // 1-5分评级
+    pub rating: Option<f32>,               // 1-5分评级
     pub corrections: HashMap<String, f32>, // 维度修正
     pub comments: Option<String>,
 }
@@ -103,10 +103,10 @@ pub struct UserFeedback {
 /// 反馈类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FeedbackType {
-    Positive,      // 正面反馈
-    Negative,      // 负面反馈
-    Correction,    // 纠正反馈
-    Neutral,       // 中性反馈
+    Positive,   // 正面反馈
+    Negative,   // 负面反馈
+    Correction, // 纠正反馈
+    Neutral,    // 中性反馈
 }
 
 /// 使用统计信息
@@ -140,9 +140,9 @@ pub struct AdaptationEvent {
 /// 适应类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdaptationType {
-    WeightAdjustment,     // 权重调整
-    KeywordLearning,      // 关键词学习
-    PatternRecognition,   // 模式识别
+    WeightAdjustment,      // 权重调整
+    KeywordLearning,       // 关键词学习
+    PatternRecognition,    // 模式识别
     ThresholdOptimization, // 阈值优化
 }
 
@@ -205,7 +205,7 @@ impl PersonalizationManager {
         for entry in fs::read_dir(&profiles_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Some(user_id) = path.file_stem().and_then(|s| s.to_str()) {
                     match self.load_user_profile(user_id) {
@@ -225,7 +225,10 @@ impl PersonalizationManager {
 
     /// 加载用户配置文件
     fn load_user_profile(&self, user_id: &str) -> Result<UserProfile, Box<dyn std::error::Error>> {
-        let path = self.workspace_root.join("profiles").join(format!("{}.json", user_id));
+        let path = self
+            .workspace_root
+            .join("profiles")
+            .join(format!("{}.json", user_id));
         let content = fs::read_to_string(&path)?;
         let profile: UserProfile = serde_json::from_str(&content)?;
         Ok(profile)
@@ -235,7 +238,7 @@ impl PersonalizationManager {
     fn save_user_profile(&self, profile: &UserProfile) -> Result<(), Box<dyn std::error::Error>> {
         let profiles_dir = self.workspace_root.join("profiles");
         fs::create_dir_all(&profiles_dir)?;
-        
+
         let path = profiles_dir.join(format!("{}.json", profile.user_id));
         let content = serde_json::to_string_pretty(profile)?;
         fs::write(&path, content)?;
@@ -274,10 +277,10 @@ impl PersonalizationManager {
                 },
                 adaptation_history: Vec::new(),
             };
-            
+
             self.user_profiles.insert(user_id.to_string(), new_profile);
         }
-        
+
         self.user_profiles.get_mut(user_id).unwrap()
     }
 
@@ -286,7 +289,7 @@ impl PersonalizationManager {
         &mut self,
         user_id: &str,
         base_result: &TagVector,
-        context: Option<&ContextAnalysisResult>
+        context: Option<&ContextAnalysisResult>,
     ) -> PersonalizedResult {
         // 先获取需要的数据，避免借用冲突
         let (dimension_weights, learned_patterns, last_updated) = {
@@ -297,7 +300,7 @@ impl PersonalizationManager {
                 profile.last_updated,
             )
         };
-        
+
         // 应用个性化权重
         let mut personalized_result = base_result.clone();
         for (dimension, weight) in &dimension_weights {
@@ -307,12 +310,10 @@ impl PersonalizationManager {
         }
 
         // 应用学习到的模式
-        let pattern_adjustment = self.learning_engine.apply_learned_patterns(
-            &learned_patterns,
-            base_result,
-            context
-        );
-        
+        let pattern_adjustment =
+            self.learning_engine
+                .apply_learned_patterns(&learned_patterns, base_result, context);
+
         personalized_result = personalized_result.weighted_merge(&pattern_adjustment, 0.2);
 
         // 计算个性化置信度
@@ -320,7 +321,8 @@ impl PersonalizationManager {
             let profile = self.get_or_create_profile(user_id);
             let feedback_factor = (profile.learning_state.feedback_samples as f32 / 50.0).min(1.0);
             let success_factor = if profile.usage_statistics.total_analyses > 0 {
-                profile.usage_statistics.successful_analyses as f32 / profile.usage_statistics.total_analyses as f32
+                profile.usage_statistics.successful_analyses as f32
+                    / profile.usage_statistics.total_analyses as f32
             } else {
                 0.5
             };
@@ -331,7 +333,8 @@ impl PersonalizationManager {
         PersonalizedResult {
             personalized_vector: personalized_result,
             personalization_confidence,
-            applied_patterns: learned_patterns.iter()
+            applied_patterns: learned_patterns
+                .iter()
                 .filter(|p| p.last_used > Utc::now() - Duration::days(30))
                 .map(|p| p.pattern_id.clone())
                 .collect(),
@@ -345,7 +348,7 @@ impl PersonalizationManager {
         user_id: &str,
         input: &str,
         predicted_result: &TagVector,
-        feedback: UserFeedback
+        feedback: UserFeedback,
     ) -> FeedbackProcessResult {
         // 处理纠正反馈
         let corrected_result = if let FeedbackType::Correction = feedback.feedback_type {
@@ -361,25 +364,33 @@ impl PersonalizationManager {
         // 提取配置值避免借用冲突
         let learning_rate = self.config.learning_rate;
         let min_samples = self.config.min_samples_for_learning;
-        
+
         // 更新用户状态并进行学习
         let learning_result = {
             let profile = self.get_or_create_profile(user_id);
-            
+
             // 更新学习状态
             profile.learning_state.feedback_samples += 1;
             profile.last_updated = Utc::now();
 
             // 记录错误分类（如果是负面反馈）
-            if matches!(feedback.feedback_type, FeedbackType::Negative | FeedbackType::Correction) {
-                profile.learning_state.misclassification_history.push(MisclassificationRecord {
-                    timestamp: Utc::now(),
-                    input: input.to_string(),
-                    predicted_result: predicted_result.clone(),
-                    actual_result: corrected_result.clone().unwrap_or_else(|| predicted_result.clone()),
-                    user_feedback: feedback.clone(),
-                    correction_applied: false,
-                });
+            if matches!(
+                feedback.feedback_type,
+                FeedbackType::Negative | FeedbackType::Correction
+            ) {
+                profile
+                    .learning_state
+                    .misclassification_history
+                    .push(MisclassificationRecord {
+                        timestamp: Utc::now(),
+                        input: input.to_string(),
+                        predicted_result: predicted_result.clone(),
+                        actual_result: corrected_result
+                            .clone()
+                            .unwrap_or_else(|| predicted_result.clone()),
+                        user_feedback: feedback.clone(),
+                        correction_applied: false,
+                    });
             }
 
             // 简化版本的学习逻辑（避免借用检查问题）
@@ -390,17 +401,20 @@ impl PersonalizationManager {
             // 基于反馈类型调整学习进度
             match feedback.feedback_type {
                 FeedbackType::Positive => {
-                    profile.learning_state.learning_progress = (profile.learning_state.learning_progress + learning_rate * 0.5).min(1.0);
+                    profile.learning_state.learning_progress =
+                        (profile.learning_state.learning_progress + learning_rate * 0.5).min(1.0);
                     confidence_delta = 0.1;
                 }
                 FeedbackType::Negative | FeedbackType::Correction => {
-                    profile.learning_state.learning_progress = (profile.learning_state.learning_progress + learning_rate).min(1.0);
+                    profile.learning_state.learning_progress =
+                        (profile.learning_state.learning_progress + learning_rate).min(1.0);
                     confidence_delta = -0.05;
                     patterns_updated = true;
                     should_adapt = profile.learning_state.feedback_samples >= min_samples;
                 }
                 FeedbackType::Neutral => {
-                    profile.learning_state.learning_progress = (profile.learning_state.learning_progress + learning_rate * 0.2).min(1.0);
+                    profile.learning_state.learning_progress =
+                        (profile.learning_state.learning_progress + learning_rate * 0.2).min(1.0);
                 }
             }
 
@@ -414,20 +428,25 @@ impl PersonalizationManager {
         // 应用适应（分离操作）
         if learning_result.should_adapt {
             let profile = self.get_or_create_profile(user_id);
-            
+
             // 简化适应逻辑
             if learning_result.patterns_updated {
                 // 调整置信度阈值
                 if learning_result.confidence_delta < 0.0 {
-                    profile.preferences.confidence_threshold = (profile.preferences.confidence_threshold - 0.05).max(0.1);
+                    profile.preferences.confidence_threshold =
+                        (profile.preferences.confidence_threshold - 0.05).max(0.1);
                 } else {
-                    profile.preferences.confidence_threshold = (profile.preferences.confidence_threshold + 0.02).min(0.9);
+                    profile.preferences.confidence_threshold =
+                        (profile.preferences.confidence_threshold + 0.02).min(0.9);
                 }
 
                 profile.adaptation_history.push(AdaptationEvent {
                     timestamp: Utc::now(),
                     event_type: AdaptationType::ThresholdOptimization,
-                    description: format!("调整置信度阈值到 {:.2}", profile.preferences.confidence_threshold),
+                    description: format!(
+                        "调整置信度阈值到 {:.2}",
+                        profile.preferences.confidence_threshold
+                    ),
                     impact_score: learning_result.confidence_delta.abs(),
                 });
             }
@@ -452,7 +471,8 @@ impl PersonalizationManager {
     fn calculate_personalization_confidence(&self, profile: &UserProfile) -> f32 {
         let feedback_factor = (profile.learning_state.feedback_samples as f32 / 50.0).min(1.0);
         let success_factor = if profile.usage_statistics.total_analyses > 0 {
-            profile.usage_statistics.successful_analyses as f32 / profile.usage_statistics.total_analyses as f32
+            profile.usage_statistics.successful_analyses as f32
+                / profile.usage_statistics.total_analyses as f32
         } else {
             0.5
         };
@@ -463,11 +483,13 @@ impl PersonalizationManager {
 
     /// 获取用户统计信息
     pub fn get_user_statistics(&self, user_id: &str) -> Option<UserStatistics> {
-        self.user_profiles.get(user_id).map(|profile| {
-            UserStatistics {
+        self.user_profiles
+            .get(user_id)
+            .map(|profile| UserStatistics {
                 total_analyses: profile.usage_statistics.total_analyses,
                 success_rate: if profile.usage_statistics.total_analyses > 0 {
-                    profile.usage_statistics.successful_analyses as f32 / profile.usage_statistics.total_analyses as f32
+                    profile.usage_statistics.successful_analyses as f32
+                        / profile.usage_statistics.total_analyses as f32
                 } else {
                     0.0
                 },
@@ -475,8 +497,7 @@ impl PersonalizationManager {
                 personalization_level: profile.preferences.personalization_level.clone(),
                 adaptation_events: profile.adaptation_history.len() as u32,
                 learned_patterns: profile.learning_state.learned_patterns.len() as u32,
-            }
-        })
+            })
     }
 }
 
@@ -521,11 +542,11 @@ impl LearningEngine {
         &self,
         patterns: &[LearnedPattern],
         _base_result: &TagVector,
-        _context: Option<&ContextAnalysisResult>
+        _context: Option<&ContextAnalysisResult>,
     ) -> TagVector {
         // 简化实现：基于模式应用调整
         let mut adjustment = TagVector::new();
-        
+
         for pattern in patterns.iter().filter(|p| p.success_rate > 0.6) {
             match &pattern.pattern_type {
                 PatternType::DimensionCorrelation => {
@@ -537,7 +558,7 @@ impl LearningEngine {
                 }
             }
         }
-        
+
         adjustment
     }
 
@@ -556,17 +577,20 @@ impl LearningEngine {
         // 基于反馈类型调整学习进度
         match feedback.feedback_type {
             FeedbackType::Positive => {
-                learning_state.learning_progress = (learning_state.learning_progress + config.learning_rate * 0.5).min(1.0);
+                learning_state.learning_progress =
+                    (learning_state.learning_progress + config.learning_rate * 0.5).min(1.0);
                 confidence_delta = 0.1;
             }
             FeedbackType::Negative | FeedbackType::Correction => {
-                learning_state.learning_progress = (learning_state.learning_progress + config.learning_rate).min(1.0);
+                learning_state.learning_progress =
+                    (learning_state.learning_progress + config.learning_rate).min(1.0);
                 confidence_delta = -0.05;
                 patterns_updated = true;
                 should_adapt = learning_state.feedback_samples >= config.min_samples_for_learning;
             }
             FeedbackType::Neutral => {
-                learning_state.learning_progress = (learning_state.learning_progress + config.learning_rate * 0.2).min(1.0);
+                learning_state.learning_progress =
+                    (learning_state.learning_progress + config.learning_rate * 0.2).min(1.0);
             }
         }
 
@@ -603,9 +627,11 @@ impl AdaptationEngine {
         if learning_result.patterns_updated {
             // 调整置信度阈值
             if learning_result.confidence_delta < 0.0 {
-                preferences.confidence_threshold = (preferences.confidence_threshold - 0.05).max(0.1);
+                preferences.confidence_threshold =
+                    (preferences.confidence_threshold - 0.05).max(0.1);
             } else {
-                preferences.confidence_threshold = (preferences.confidence_threshold + 0.02).min(0.9);
+                preferences.confidence_threshold =
+                    (preferences.confidence_threshold + 0.02).min(0.9);
             }
 
             AdaptationResult {
@@ -639,7 +665,7 @@ mod tests {
     fn test_personalization_manager() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path().to_path_buf();
-        
+
         let mut manager = PersonalizationManager::with_defaults(workspace);
         assert!(manager.initialize().is_ok());
 
@@ -651,7 +677,7 @@ mod tests {
         // 测试个性化分析
         let mut base_result = TagVector::new();
         base_result.set("creativity_level", 0.5);
-        
+
         let personalized = manager.personalized_analysis("test_user", &base_result, None);
         assert!(personalized.personalization_confidence >= 0.0);
         assert!(personalized.personalization_confidence <= 1.0);
@@ -661,7 +687,7 @@ mod tests {
     fn test_feedback_processing() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path().to_path_buf();
-        
+
         let mut manager = PersonalizationManager::with_defaults(workspace);
         manager.initialize().unwrap();
 
@@ -683,7 +709,7 @@ mod tests {
             "test_user",
             "create innovative design",
             &predicted,
-            feedback
+            feedback,
         );
 
         assert!(result.corrected_result.is_some());
@@ -695,7 +721,7 @@ mod tests {
     fn test_user_statistics() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path().to_path_buf();
-        
+
         let mut manager = PersonalizationManager::with_defaults(workspace);
         manager.initialize().unwrap();
 

@@ -1240,7 +1240,8 @@ pub(crate) fn load_tool_routing_tags(
     config: &ServiceConfig,
     namespace: &ApiNamespace,
 ) -> Result<ToolRoutingTags> {
-    let mut tags: ToolRoutingTags = load_frontmatter(config, namespace, "routing/tool-routing-tags.md")?;
+    let mut tags: ToolRoutingTags =
+        load_frontmatter(config, namespace, "routing/tool-routing-tags.md")?;
     tags.ensure_builtin_timed_sequences();
     Ok(tags)
 }

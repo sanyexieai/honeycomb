@@ -1,12 +1,12 @@
 //! 强化学习模块 - 实现智能体持续优化决策
 
-use std::collections::{HashMap, VecDeque};
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::PathBuf;
 
-use crate::{HybridAnalysisResult, ComponentWeights};
+use crate::{ComponentWeights, HybridAnalysisResult};
 
 /// 强化学习管理器
 pub struct ReinforcementLearningManager {
@@ -71,10 +71,10 @@ impl Default for RLConfig {
 /// 强化学习算法类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RLAlgorithm {
-    QLearning,          // Q学习
-    PolicyGradient,     // 策略梯度
-    ActorCritic,        // Actor-Critic
-    DQN,                // 深度Q网络
+    QLearning,      // Q学习
+    PolicyGradient, // 策略梯度
+    ActorCritic,    // Actor-Critic
+    DQN,            // 深度Q网络
 }
 
 /// 强化学习策略后端。
@@ -130,9 +130,9 @@ pub struct RLAgent {
 /// 状态键（用于Q表索引）
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateKey {
-    pub input_complexity: u8,       // 输入复杂度等级 (0-9)
-    pub context_type: ContextType,  // 上下文类型
-    pub user_history: UserHistoryType, // 用户历史类型
+    pub input_complexity: u8,            // 输入复杂度等级 (0-9)
+    pub context_type: ContextType,       // 上下文类型
+    pub user_history: UserHistoryType,   // 用户历史类型
     pub dimension_focus: DimensionFocus, // 主要关注的维度
 }
 
@@ -149,10 +149,10 @@ pub enum ContextType {
 /// 用户历史类型
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UserHistoryType {
-    NewUser,       // 新用户
-    Experienced,   // 有经验的用户
-    FrequentUser,  // 频繁用户
-    PowerUser,     // 高级用户
+    NewUser,      // 新用户
+    Experienced,  // 有经验的用户
+    FrequentUser, // 频繁用户
+    PowerUser,    // 高级用户
 }
 
 /// 维度焦点
@@ -179,16 +179,16 @@ pub struct State {
 /// 强化学习动作
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Action {
-    UseDefaultWeights,           // 使用默认权重
-    EmphasizeLegacy,            // 强调传统方法
-    EmphasizeEnhanced,          // 强调增强方法
-    EmphasizeVector,            // 强调向量匹配
-    EmphasizeMultipath,         // 强调多路径
-    EmphasizePersonalized,      // 强调个性化
-    BalancedApproach,           // 平衡方法
-    AdaptiveWeighting,          // 自适应权重
-    ExploratoryAnalysis,        // 探索性分析
-    ConservativeAnalysis,       // 保守性分析
+    UseDefaultWeights,     // 使用默认权重
+    EmphasizeLegacy,       // 强调传统方法
+    EmphasizeEnhanced,     // 强调增强方法
+    EmphasizeVector,       // 强调向量匹配
+    EmphasizeMultipath,    // 强调多路径
+    EmphasizePersonalized, // 强调个性化
+    BalancedApproach,      // 平衡方法
+    AdaptiveWeighting,     // 自适应权重
+    ExploratoryAnalysis,   // 探索性分析
+    ConservativeAnalysis,  // 保守性分析
 }
 
 impl Action {
@@ -344,11 +344,15 @@ impl PolicyNetwork {
 
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         let mut layer_input = input.to_vec();
-        
+
         for (i, layer_weights) in self.weights.iter().enumerate() {
-            let layer_output_size = if i == 0 { self.hidden_size } else { self.output_size };
+            let layer_output_size = if i == 0 {
+                self.hidden_size
+            } else {
+                self.output_size
+            };
             let mut layer_output = vec![0.0; layer_output_size];
-            
+
             for j in 0..layer_output_size {
                 let mut sum = 0.0;
                 for k in 0..layer_input.len() {
@@ -357,7 +361,7 @@ impl PolicyNetwork {
                 sum += self.biases[if i == 0 { j } else { self.hidden_size + j }];
                 layer_output[j] = Self::relu(sum);
             }
-            
+
             layer_input = layer_output;
         }
 
@@ -468,7 +472,7 @@ impl ReinforcementLearningManager {
         if let Some(ref policy_network) = self.agent.policy_network {
             let state_features = self.extract_state_features(state);
             let action_probabilities = policy_network.forward(&state_features);
-            
+
             // 基于概率分布采样动作
             self.sample_action_from_probabilities(&action_probabilities)
         } else {
@@ -524,22 +528,22 @@ impl ReinforcementLearningManager {
     /// 提取状态特征向量
     fn extract_state_features(&self, state: &State) -> Vec<f32> {
         let mut features = Vec::new();
-        
+
         // 状态键特征
         features.push(state.key.input_complexity as f32 / 9.0);
         features.push(self.context_type_to_value(&state.key.context_type));
         features.push(self.user_history_type_to_value(&state.key.user_history));
         features.push(self.dimension_focus_to_value(&state.key.dimension_focus));
-        
+
         // 上下文特征
         features.extend_from_slice(&state.context_features);
-        
+
         // 用户档案特征
         features.extend_from_slice(&state.user_profile_features);
-        
+
         // 历史性能
         features.push(state.historical_performance);
-        
+
         features
     }
 
@@ -573,7 +577,12 @@ impl ReinforcementLearningManager {
     }
 
     /// 计算奖励
-    pub fn calculate_reward(&self, analysis_result: &HybridAnalysisResult, user_satisfaction: f32, response_time: std::time::Duration) -> f32 {
+    pub fn calculate_reward(
+        &self,
+        analysis_result: &HybridAnalysisResult,
+        user_satisfaction: f32,
+        response_time: std::time::Duration,
+    ) -> f32 {
         let shaping = &self.config.reward_shaping;
         let mut reward = 0.0;
 
@@ -612,18 +621,24 @@ impl ReinforcementLearningManager {
         let mut comparisons = 0;
 
         // 比较legacy和enhanced结果
-        total_similarity += analysis_result.legacy_result.cosine_similarity(&analysis_result.enhanced_result);
+        total_similarity += analysis_result
+            .legacy_result
+            .cosine_similarity(&analysis_result.enhanced_result);
         comparisons += 1;
 
         // 比较vector结果（如果存在）
         if let Some(ref vector_result) = analysis_result.vector_result {
-            total_similarity += analysis_result.final_result.cosine_similarity(&vector_result.tag_vector);
+            total_similarity += analysis_result
+                .final_result
+                .cosine_similarity(&vector_result.tag_vector);
             comparisons += 1;
         }
 
         // 比较multipath结果（如果存在）
         if let Some(ref multipath_result) = analysis_result.multipath_result {
-            total_similarity += analysis_result.final_result.cosine_similarity(&multipath_result.final_tag_vector);
+            total_similarity += analysis_result
+                .final_result
+                .cosine_similarity(&multipath_result.final_tag_vector);
             comparisons += 1;
         }
 
@@ -664,7 +679,9 @@ impl ReinforcementLearningManager {
         let reward = experience.reward;
 
         // 获取当前Q值
-        let current_q = self.agent.q_table
+        let current_q = self
+            .agent
+            .q_table
             .get(state_key)
             .and_then(|actions| actions.get(action))
             .copied()
@@ -672,7 +689,8 @@ impl ReinforcementLearningManager {
 
         // 计算下一状态的最大Q值
         let next_max_q = if let Some(ref next_state) = experience.next_state {
-            self.agent.q_table
+            self.agent
+                .q_table
                 .get(&next_state.key)
                 .map(|actions| actions.values().fold(0.0f32, |acc, &q| acc.max(q)))
                 .unwrap_or(0.0)
@@ -685,7 +703,8 @@ impl ReinforcementLearningManager {
         let new_q = current_q + self.config.learning_rate * (target_q - current_q);
 
         // 更新Q表
-        self.agent.q_table
+        self.agent
+            .q_table
             .entry(state_key.clone())
             .or_insert_with(HashMap::new)
             .insert(action.clone(), new_q);
@@ -728,25 +747,36 @@ impl ReinforcementLearningManager {
     }
 
     /// 结束episode并记录
-    pub fn end_episode(&mut self, episode_id: usize, experiences: Vec<Experience>, duration: std::time::Duration) -> Episode {
+    pub fn end_episode(
+        &mut self,
+        episode_id: usize,
+        experiences: Vec<Experience>,
+        duration: std::time::Duration,
+    ) -> Episode {
         let total_reward: f32 = experiences.iter().map(|e| e.reward).sum();
-        
+
         let average_accuracy = if !experiences.is_empty() {
-            experiences.iter()
-                .map(|e| if let Some(ref next_state) = e.next_state { 
-                    next_state.historical_performance 
-                } else { 
-                    0.5 
+            experiences
+                .iter()
+                .map(|e| {
+                    if let Some(ref next_state) = e.next_state {
+                        next_state.historical_performance
+                    } else {
+                        0.5
+                    }
                 })
-                .sum::<f32>() / experiences.len() as f32
+                .sum::<f32>()
+                / experiences.len() as f32
         } else {
             0.0
         };
 
         let average_satisfaction = if !experiences.is_empty() {
-            experiences.iter()
+            experiences
+                .iter()
                 .map(|e| (e.reward + 1.0) / 2.0) // 将奖励转换为满意度近似值
-                .sum::<f32>() / experiences.len() as f32
+                .sum::<f32>()
+                / experiences.len() as f32
         } else {
             0.0
         };
@@ -763,7 +793,9 @@ impl ReinforcementLearningManager {
         };
 
         // 更新性能跟踪
-        self.performance_tracker.episode_rewards.push_back(total_reward);
+        self.performance_tracker
+            .episode_rewards
+            .push_back(total_reward);
         if self.performance_tracker.episode_rewards.len() > 100 {
             self.performance_tracker.episode_rewards.pop_front();
         }
@@ -808,31 +840,74 @@ impl ReinforcementLearningManager {
 
     /// 估计输入复杂度
     fn estimate_input_complexity(&self, input: &str) -> u8 {
-        let word_count = input.split_whitespace().count();
-        let char_count = input.chars().count();
-        let unique_words = input.split_whitespace()
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return 0;
+        }
+
+        let word_count = trimmed.split_whitespace().count();
+        let char_count = trimmed.chars().count();
+        // 中日韩等无空格文本：用语义块估算“词数”，避免整句被当成单词导致复杂度为 0
+        let cjk_units = trimmed
+            .chars()
+            .filter(|c| {
+                matches!(c,
+                    '\u{4E00}'..='\u{9FFF}'
+                        | '\u{3400}'..='\u{4DBF}'
+                        | '\u{3040}'..='\u{309F}'
+                        | '\u{30A0}'..='\u{30FF}'
+                )
+            })
+            .count();
+        let inferred_words = if cjk_units > 0 {
+            word_count.max((cjk_units.saturating_add(1)) / 2)
+        } else {
+            word_count
+        }
+        .max(1);
+
+        let unique_words = trimmed
+            .split_whitespace()
             .map(|s| s.to_lowercase())
             .collect::<std::collections::HashSet<_>>()
-            .len();
+            .len()
+            .max(if cjk_units > 0 { 1 } else { 0 });
 
-        let complexity_score = (word_count as f32 * 0.3 + 
-                               char_count as f32 * 0.01 + 
-                               unique_words as f32 * 0.5) / 10.0;
+        let complexity_score = (inferred_words as f32 * 0.3
+            + char_count as f32 * 0.01
+            + unique_words as f32 * 0.5)
+            / 10.0;
 
-        complexity_score.clamp(0.0, 9.0) as u8
+        let mut score = complexity_score.clamp(0.0, 9.0) as u8;
+        if score == 0 {
+            score = 1;
+        }
+        score
     }
 
     /// 分类上下文类型
     fn classify_context_type(&self, input: &str) -> ContextType {
         let input_lower = input.to_lowercase();
-        
-        if input_lower.contains("创新") || input_lower.contains("设计") || input_lower.contains("创造") {
+
+        if input_lower.contains("创新")
+            || input_lower.contains("设计")
+            || input_lower.contains("创造")
+        {
             ContextType::Creative
-        } else if input_lower.contains("分析") || input_lower.contains("研究") || input_lower.contains("调研") {
+        } else if input_lower.contains("分析")
+            || input_lower.contains("研究")
+            || input_lower.contains("调研")
+        {
             ContextType::Analytical
-        } else if input_lower.contains("紧急") || input_lower.contains("urgent") || input_lower.contains("急") {
+        } else if input_lower.contains("紧急")
+            || input_lower.contains("urgent")
+            || input_lower.contains("急")
+        {
             ContextType::Urgent
-        } else if input_lower.contains("团队") || input_lower.contains("合作") || input_lower.contains("协作") {
+        } else if input_lower.contains("团队")
+            || input_lower.contains("合作")
+            || input_lower.contains("协作")
+        {
             ContextType::Collaborative
         } else {
             ContextType::Routine
@@ -854,7 +929,7 @@ impl ReinforcementLearningManager {
                 } else {
                     UserHistoryType::Experienced
                 }
-            },
+            }
             None => UserHistoryType::NewUser,
         }
     }
@@ -866,35 +941,62 @@ impl ReinforcementLearningManager {
 
         // 创造性关键词
         let creativity_keywords = ["创新", "创造", "设计", "原创", "想象"];
-        focus_scores.insert(DimensionFocus::Creativity, 
-            creativity_keywords.iter().map(|&k| if input_lower.contains(k) { 1 } else { 0 }).sum::<i32>());
+        focus_scores.insert(
+            DimensionFocus::Creativity,
+            creativity_keywords
+                .iter()
+                .map(|&k| if input_lower.contains(k) { 1 } else { 0 })
+                .sum::<i32>(),
+        );
 
         // 紧急性关键词
         let urgency_keywords = ["紧急", "urgent", "急", "立即", "马上"];
-        focus_scores.insert(DimensionFocus::Urgency,
-            urgency_keywords.iter().map(|&k| if input_lower.contains(k) { 1 } else { 0 }).sum::<i32>());
+        focus_scores.insert(
+            DimensionFocus::Urgency,
+            urgency_keywords
+                .iter()
+                .map(|&k| if input_lower.contains(k) { 1 } else { 0 })
+                .sum::<i32>(),
+        );
 
         // 复杂度关键词
         let complexity_keywords = ["复杂", "困难", "挑战", "技术", "深度"];
-        focus_scores.insert(DimensionFocus::Complexity,
-            complexity_keywords.iter().map(|&k| if input_lower.contains(k) { 1 } else { 0 }).sum::<i32>());
+        focus_scores.insert(
+            DimensionFocus::Complexity,
+            complexity_keywords
+                .iter()
+                .map(|&k| if input_lower.contains(k) { 1 } else { 0 })
+                .sum::<i32>(),
+        );
 
         // 协作关键词
         let collaboration_keywords = ["团队", "合作", "协作", "一起", "共同"];
-        focus_scores.insert(DimensionFocus::Collaboration,
-            collaboration_keywords.iter().map(|&k| if input_lower.contains(k) { 1 } else { 0 }).sum::<i32>());
+        focus_scores.insert(
+            DimensionFocus::Collaboration,
+            collaboration_keywords
+                .iter()
+                .map(|&k| if input_lower.contains(k) { 1 } else { 0 })
+                .sum::<i32>(),
+        );
 
         // 找到得分最高的维度
-        focus_scores.into_iter()
+        focus_scores
+            .into_iter()
             .max_by_key(|(_, score)| *score)
-            .map(|(focus, score)| if score > 0 { focus } else { DimensionFocus::Mixed })
+            .map(|(focus, score)| {
+                if score > 0 {
+                    focus
+                } else {
+                    DimensionFocus::Mixed
+                }
+            })
             .unwrap_or(DimensionFocus::Mixed)
     }
 
     /// 提取上下文特征
     fn extract_context_features(&self, input: &str) -> Vec<f32> {
         vec![
-            input.len() as f32 / 1000.0, // 长度特征
+            input.len() as f32 / 1000.0,                     // 长度特征
             input.split_whitespace().count() as f32 / 100.0, // 词数特征
             input.chars().filter(|c| c.is_uppercase()).count() as f32 / input.len() as f32, // 大写比例
             input.chars().filter(|c| c.is_ascii_punctuation()).count() as f32 / input.len() as f32, // 标点符号比例
@@ -912,7 +1014,10 @@ impl ReinforcementLearningManager {
         self.training_history
             .iter()
             .filter(|episode| {
-                episode.experiences.iter().any(|exp| exp.state.key == *state_key)
+                episode
+                    .experiences
+                    .iter()
+                    .any(|exp| exp.state.key == *state_key)
             })
             .map(|episode| episode.average_accuracy)
             .fold(0.0f32, |acc, perf| acc.max(perf))
@@ -922,14 +1027,16 @@ impl ReinforcementLearningManager {
     /// 获取强化学习统计信息
     pub fn get_rl_statistics(&self) -> RLStatistics {
         let average_episode_reward = if !self.performance_tracker.episode_rewards.is_empty() {
-            self.performance_tracker.episode_rewards.iter().sum::<f32>() / 
-            self.performance_tracker.episode_rewards.len() as f32
+            self.performance_tracker.episode_rewards.iter().sum::<f32>()
+                / self.performance_tracker.episode_rewards.len() as f32
         } else {
             0.0
         };
 
         let recent_performance = if self.training_history.len() >= 10 {
-            let recent: f32 = self.training_history.iter()
+            let recent: f32 = self
+                .training_history
+                .iter()
                 .rev()
                 .take(10)
                 .map(|e| e.total_reward)
@@ -955,11 +1062,15 @@ impl ReinforcementLearningManager {
     /// 计算收敛指标
     fn calculate_convergence_metrics(&self) -> ConvergenceMetrics {
         let reward_variance = if self.performance_tracker.episode_rewards.len() > 1 {
-            let mean = self.performance_tracker.episode_rewards.iter().sum::<f32>() / 
-                      self.performance_tracker.episode_rewards.len() as f32;
-            let variance = self.performance_tracker.episode_rewards.iter()
+            let mean = self.performance_tracker.episode_rewards.iter().sum::<f32>()
+                / self.performance_tracker.episode_rewards.len() as f32;
+            let variance = self
+                .performance_tracker
+                .episode_rewards
+                .iter()
                 .map(|&r| (r - mean).powi(2))
-                .sum::<f32>() / self.performance_tracker.episode_rewards.len() as f32;
+                .sum::<f32>()
+                / self.performance_tracker.episode_rewards.len() as f32;
             variance
         } else {
             1.0
@@ -989,13 +1100,17 @@ impl ReinforcementLearningManager {
             return 0.0;
         }
 
-        let recent_rewards: f32 = self.training_history.iter()
+        let recent_rewards: f32 = self
+            .training_history
+            .iter()
             .rev()
             .take(10)
             .map(|e| e.total_reward)
             .sum();
 
-        let early_rewards: f32 = self.training_history.iter()
+        let early_rewards: f32 = self
+            .training_history
+            .iter()
             .take(10)
             .map(|e| e.total_reward)
             .sum();
@@ -1020,7 +1135,7 @@ impl ReinforcementLearningManager {
     /// 保存智能体状态
     pub fn save_agent_state(&self) -> Result<(), String> {
         let rl_dir = self.workspace_root.join("rl_data");
-        
+
         // 保存Q表
         let q_table_content = serde_json::to_string_pretty(&self.agent.q_table)
             .map_err(|e| format!("序列化Q表失败: {}", e))?;
@@ -1039,14 +1154,14 @@ impl ReinforcementLearningManager {
     /// 加载智能体状态
     fn load_agent_state(&mut self) -> Result<(), String> {
         let rl_dir = self.workspace_root.join("rl_data");
-        
+
         // 加载Q表
         let q_table_file = rl_dir.join("q_table.json");
         if q_table_file.exists() {
-            let content = fs::read_to_string(&q_table_file)
-                .map_err(|e| format!("读取Q表失败: {}", e))?;
-            self.agent.q_table = serde_json::from_str(&content)
-                .map_err(|e| format!("解析Q表失败: {}", e))?;
+            let content =
+                fs::read_to_string(&q_table_file).map_err(|e| format!("读取Q表失败: {}", e))?;
+            self.agent.q_table =
+                serde_json::from_str(&content).map_err(|e| format!("解析Q表失败: {}", e))?;
         }
 
         // 加载训练历史
@@ -1054,8 +1169,8 @@ impl ReinforcementLearningManager {
         if history_file.exists() {
             let content = fs::read_to_string(&history_file)
                 .map_err(|e| format!("读取训练历史失败: {}", e))?;
-            self.training_history = serde_json::from_str(&content)
-                .map_err(|e| format!("解析训练历史失败: {}", e))?;
+            self.training_history =
+                serde_json::from_str(&content).map_err(|e| format!("解析训练历史失败: {}", e))?;
         }
 
         Ok(())
@@ -1067,12 +1182,14 @@ impl ReinforcementLearningManager {
         let mut action_values = Vec::new();
 
         for action in &actions {
-            let q_value = self.agent.q_table
+            let q_value = self
+                .agent
+                .q_table
                 .get(&state.key)
                 .and_then(|q_actions| q_actions.get(action))
                 .copied()
                 .unwrap_or(0.0);
-            
+
             action_values.push((action.clone(), q_value));
         }
 
@@ -1096,10 +1213,11 @@ impl ReinforcementLearningManager {
             let values: Vec<f32> = q_values.values().copied().collect();
             if values.len() > 1 {
                 let max_val = values.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let second_max = values.iter()
+                let second_max = values
+                    .iter()
                     .filter(|&&v| v < max_val)
                     .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                
+
                 if second_max != f32::NEG_INFINITY {
                     ((max_val - second_max).abs() / 2.0).clamp(0.0, 1.0)
                 } else {
@@ -1127,7 +1245,10 @@ impl ReinforcementLearningManager {
             Action::EmphasizeVector => "向量匹配在类似情况下表现最佳".to_string(),
             Action::EmphasizeEnhanced => "增强分析方法在此类任务中更有效".to_string(),
             Action::AdaptiveWeighting => "自适应权重能够动态调整以获得最佳效果".to_string(),
-            _ => format!("基于历史经验，{:?}方法的期望值为{:.3}", best_action, best_value),
+            _ => format!(
+                "基于历史经验，{:?}方法的期望值为{:.3}",
+                best_action, best_value
+            ),
         }
     }
 }
@@ -1137,7 +1258,7 @@ impl RLAgent {
         let policy_network = match config.algorithm {
             RLAlgorithm::PolicyGradient | RLAlgorithm::ActorCritic => {
                 Some(PolicyNetwork::new(10, 64, Action::all_actions().len()))
-            },
+            }
             _ => None,
         };
 
@@ -1212,7 +1333,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = RLConfig::default();
         let mut manager = ReinforcementLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         assert!(manager.initialize().is_ok());
         assert_eq!(manager.environment.current_episode, 0);
         assert_eq!(manager.agent.total_steps, 0);
@@ -1223,9 +1344,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = RLConfig::default();
         let manager = ReinforcementLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         let state = manager.build_state_from_input("创建一个创新的设计方案", Some("test_user"));
-        
+
         assert_eq!(state.key.context_type, ContextType::Creative);
         assert_eq!(state.key.dimension_focus, DimensionFocus::Creativity);
         assert!(state.key.input_complexity > 0);
@@ -1237,10 +1358,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = RLConfig::default();
         let mut manager = ReinforcementLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         let state = manager.build_state_from_input("分析数据", Some("user1"));
         let action = manager.select_action(&state);
-        
+
         // 应该返回某个有效的动作
         assert!(Action::all_actions().contains(&action));
     }
@@ -1253,10 +1374,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = RLConfig::default();
         let manager = ReinforcementLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         let mut final_result = TagVector::new();
         final_result.set("creativity_level", 0.8);
-        
+
         let analysis_result = HybridAnalysisResult {
             input: "test".to_string(),
             final_result,
@@ -1269,9 +1390,9 @@ mod tests {
             confidence_score: 0.8,
             analysis_duration: Duration::from_millis(100),
         };
-        
+
         let reward = manager.calculate_reward(&analysis_result, 0.9, Duration::from_millis(500));
-        
+
         assert!(reward >= -1.0 && reward <= 1.0);
         assert!(reward > 0.0); // 应该是正奖励
     }
@@ -1280,7 +1401,7 @@ mod tests {
     fn test_component_weights_conversion() {
         let action = Action::EmphasizeVector;
         let weights = action.to_component_weights();
-        
+
         assert_eq!(weights.vector_weight, 0.45);
         assert!(weights.legacy_weight < weights.vector_weight);
         assert!(weights.enhanced_weight < weights.vector_weight);
@@ -1291,13 +1412,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = RLConfig::default();
         let mut manager = ReinforcementLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         let episode_id = manager.start_episode();
         assert_eq!(episode_id, 1);
-        
+
         let experiences = vec![];
-        let episode = manager.end_episode(episode_id, experiences, std::time::Duration::from_secs(10));
-        
+        let episode =
+            manager.end_episode(episode_id, experiences, std::time::Duration::from_secs(10));
+
         assert_eq!(episode.episode_id, episode_id);
         assert_eq!(episode.total_reward, 0.0);
         assert_eq!(manager.training_history.len(), 1);
@@ -1309,10 +1431,10 @@ mod tests {
         let mut config = RLConfig::default();
         config.algorithm = RLAlgorithm::QLearning;
         let mut manager = ReinforcementLearningManager::new(temp_dir.path().to_path_buf(), config);
-        
+
         let state = manager.build_state_from_input("测试输入", None);
         let action = Action::UseDefaultWeights;
-        
+
         let experience = Experience {
             state: state.clone(),
             action: action.clone(),
@@ -1321,12 +1443,12 @@ mod tests {
             done: false,
             timestamp: Utc::now(),
         };
-        
+
         // Q表初始应该为空
         assert!(!manager.agent.q_table.contains_key(&state.key));
-        
+
         manager.update_agent(experience);
-        
+
         // 更新后应该有Q值
         assert!(manager.agent.q_table.contains_key(&state.key));
         assert!(manager.agent.q_table[&state.key].contains_key(&action));

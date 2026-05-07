@@ -1,15 +1,23 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use hc_context::runtime::{RuntimeIdentity, RuntimeVariables};
+use hc_conversation::{ConversationEvent, ConversationRepository};
 use hc_protocol::ApiNamespace;
 use hc_scheduler::{
     ScheduleRepository, ScheduleStatus, ScheduledRun, ScheduledRunStatus, ScheduledTargetKind,
     ScheduledTask, now_unix,
 };
 use hc_store::store::WorkspaceNamespace;
-use hc_toolchain::{McpServerRepository, call_mcp_tool};
+use hc_toolchain::{
+    CommandToolExecutor, McpServerRepository, ToolExecutor, ToolRepository,
+    build_default_tool_execution_plan, builtin_tool, call_mcp_tool,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::process::Command;
+use tracing::warn;
 
 use crate::ServiceConfig;
+use crate::conversation::process_conversation_inbox;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchedulerDispatchReport {
@@ -171,7 +179,8 @@ fn dispatch_queued_runs(
     Ok(receipts)
 }
 
-fn dispatch_scheduled_run(
+/// Dispatches a single scheduled run (typically one already in `queued` state).
+pub fn dispatch_scheduled_run(
     config: &ServiceConfig,
     namespace: &WorkspaceNamespace,
     repository: &ScheduleRepository,
@@ -184,10 +193,10 @@ fn dispatch_scheduled_run(
 
     let result = match run.target.kind {
         ScheduledTargetKind::Mcp => dispatch_scheduled_mcp_run(config, namespace, &run),
-        _ => Err(anyhow!(
-            "scheduled target kind {:?} is not dispatchable by hc-service yet",
-            run.target.kind
-        )),
+        ScheduledTargetKind::Command => dispatch_scheduled_command_run(config, &run),
+        ScheduledTargetKind::Tool => dispatch_scheduled_tool_run(config, namespace, &run),
+        ScheduledTargetKind::Agent => dispatch_scheduled_agent_run(config, namespace, &run),
+        ScheduledTargetKind::Event => dispatch_scheduled_event_run(config, namespace, &run),
     };
 
     let finished_at = now_unix();
@@ -198,6 +207,9 @@ fn dispatch_scheduled_run(
             run.result_ref = Some(result_ref.clone());
             run.error = None;
             repository.write_run(&run)?;
+            if run.target.kind == ScheduledTargetKind::Agent {
+                maybe_process_inbox_after_agent_schedule(config, namespace);
+            }
             Ok(receipt(&run, "succeeded", Some(result_ref), None))
         }
         Err(error) => {
@@ -248,6 +260,164 @@ fn dispatch_scheduled_mcp_run(
     Ok(format!("mcp:{}:{}", run.target.r#ref, tool_name))
 }
 
+fn dispatch_scheduled_command_run(config: &ServiceConfig, run: &ScheduledRun) -> Result<String> {
+    let program = run.target.r#ref.trim();
+    if program.is_empty() {
+        bail!("scheduled command target requires non-empty ref (executable name or path)");
+    }
+    let mut cmd = Command::new(program);
+    if let Some(action) = run
+        .target
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.arg(action);
+    }
+    if let Some(Value::Array(argv)) = run.target.args.get("argv") {
+        for item in argv {
+            if let Some(s) = item.as_str() {
+                cmd.arg(s);
+            } else if let Some(n) = item.as_i64() {
+                cmd.arg(n.to_string());
+            } else if let Some(n) = item.as_u64() {
+                cmd.arg(n.to_string());
+            } else if let Some(n) = item.as_f64() {
+                cmd.arg(n.to_string());
+            }
+        }
+    }
+    cmd.current_dir(&config.workspace_root);
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to spawn scheduled command: {program}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "scheduled command {program:?} exited with {:?}: {}",
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+    Ok(format!("command:{program}"))
+}
+
+fn dispatch_scheduled_tool_run(
+    config: &ServiceConfig,
+    namespace: &WorkspaceNamespace,
+    run: &ScheduledRun,
+) -> Result<String> {
+    let tool_id = run.target.r#ref.trim();
+    if tool_id.is_empty() {
+        bail!("scheduled tool target requires non-empty ref (tool id)");
+    }
+    let repo = ToolRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let catalog = repo.load_catalog()?;
+    let tool = if let Some(spec) = catalog.get(tool_id) {
+        spec.clone()
+    } else if let Some(spec) = builtin_tool(tool_id) {
+        spec
+    } else {
+        bail!("scheduled tool not found: {tool_id}");
+    };
+    let goal = run
+        .target
+        .action
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "scheduled tool run".to_owned());
+    let plan = build_default_tool_execution_plan(&tool, &goal)?;
+    let executor = CommandToolExecutor::default().with_working_dir(config.workspace_root.clone());
+    let outcome = executor.execute(&plan, &goal)?;
+    if !outcome.success {
+        let detail = outcome.observations.join("; ");
+        bail!(
+            "scheduled tool {} failed: {} ({})",
+            tool.id,
+            outcome.summary,
+            detail
+        );
+    }
+    Ok(format!("tool:{}", tool.id))
+}
+
+fn dispatch_scheduled_agent_run(
+    config: &ServiceConfig,
+    namespace: &WorkspaceNamespace,
+    run: &ScheduledRun,
+) -> Result<String> {
+    let agent_ref = run.target.r#ref.trim();
+    if agent_ref.is_empty() {
+        bail!("scheduled agent target requires non-empty ref (agent id)");
+    }
+    let repository =
+        ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let kind = run
+        .target
+        .action
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "scheduled.agent_dispatch".to_owned());
+    let mut event = ConversationEvent::new(&kind);
+    event.id = format!("scheduled-agent.{}", run.id.replace('/', "-"));
+    event.agent_id = Some(agent_ref.to_owned());
+    event.room_id = optional_arg_string(&run.target.args, "room_id")
+        .or_else(|| optional_arg_string(&run.target.args, "session_id"));
+    event
+        .payload
+        .insert("schedule_id".to_owned(), json!(&run.schedule_id));
+    event.payload.insert("run_id".to_owned(), json!(&run.id));
+    event
+        .payload
+        .insert("args".to_owned(), Value::Object(run.target.args.clone()));
+    event.tags.push("scheduled".to_owned());
+    repository.write_event(&event)?;
+    Ok(format!("agent-event:{agent_ref}:{}", event.id))
+}
+
+fn optional_arg_string(args: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    args.get(key).and_then(|value| match value {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_owned())
+            }
+        }
+        _ => None,
+    })
+}
+
+fn dispatch_scheduled_event_run(
+    config: &ServiceConfig,
+    namespace: &WorkspaceNamespace,
+    run: &ScheduledRun,
+) -> Result<String> {
+    let event_ref = run.target.r#ref.trim();
+    if event_ref.is_empty() {
+        bail!("scheduled event target requires non-empty ref");
+    }
+    let repository =
+        ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let kind = run
+        .target
+        .action
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "scheduled.event".to_owned());
+    let mut event = ConversationEvent::new(&kind);
+    event.id = format!("scheduled-event.{}", run.id.replace('/', "-"));
+    event.payload.insert("ref".to_owned(), json!(event_ref));
+    event
+        .payload
+        .insert("args".to_owned(), Value::Object(run.target.args.clone()));
+    event.tags.push("scheduled".to_owned());
+    repository.write_event(&event)?;
+    Ok(format!("event:{event_ref}"))
+}
+
 fn receipt(
     run: &ScheduledRun,
     status: &str,
@@ -267,6 +437,46 @@ fn receipt(
 
 fn workspace_namespace(namespace: ApiNamespace) -> WorkspaceNamespace {
     WorkspaceNamespace::new(namespace.tenant_id, namespace.user_id)
+}
+
+/// When `HC_SCHEDULE_AGENT_AUTO_PROCESS_INBOX` is `1` / `true` / `yes`, runs
+/// [`process_conversation_inbox`] so new scheduled agent events can become turn proposals
+/// (does not call LLM; drafting is separate).
+fn maybe_process_inbox_after_agent_schedule(
+    config: &ServiceConfig,
+    workspace_namespace: &WorkspaceNamespace,
+) {
+    if !schedule_agent_auto_process_inbox_enabled() {
+        return;
+    }
+    let api_namespace = ApiNamespace {
+        tenant_id: workspace_namespace.tenant_id.clone(),
+        user_id: workspace_namespace.user_id.clone(),
+    };
+    match process_conversation_inbox(config, api_namespace, None) {
+        Ok(report) => {
+            tracing::debug!(
+                processed = report.processed_events,
+                followups = report.fired_followups,
+                proposals = report.proposals.len(),
+                "schedule agent inbox auto-process"
+            );
+        }
+        Err(error) => warn!(
+            %error,
+            "HC_SCHEDULE_AGENT_AUTO_PROCESS_INBOX: process_conversation_inbox failed"
+        ),
+    }
+}
+
+fn schedule_agent_auto_process_inbox_enabled() -> bool {
+    matches!(
+        std::env::var("HC_SCHEDULE_AGENT_AUTO_PROCESS_INBOX").map(|raw| {
+            let v = raw.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        }),
+        Ok(true)
+    )
 }
 
 fn schedule_repository(config: &ServiceConfig, namespace: ApiNamespace) -> ScheduleRepository {
@@ -305,7 +515,10 @@ fn normalized_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hc_scheduler::{ScheduleKind, ScheduleSpec, ScheduledTarget, ScheduledTask};
+    use hc_scheduler::{
+        ScheduleKind, ScheduleSpec, ScheduledRunStatus, ScheduledTarget, ScheduledTargetKind,
+        ScheduledTask,
+    };
     use serde_json::Map;
     use std::path::PathBuf;
 
@@ -314,25 +527,25 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_target_is_recorded_as_failed_run() {
-        let root = temp_root("unsupported");
+    fn failing_command_target_is_recorded_as_failed_run() {
+        let root = temp_root("bad-command");
         let config = ServiceConfig::new(&root);
         let namespace = ApiNamespace::default();
         let workspace_namespace =
             WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
-        let repository = ScheduleRepository::with_namespace(&root, workspace_namespace);
+        let repository = ScheduleRepository::with_namespace(&root, workspace_namespace.clone());
         let task = ScheduledTask::new(
-            "schedule.service.unsupported",
-            "Unsupported Target",
+            "schedule.service.fail-cmd",
+            "Failing Command Target",
             ScheduleSpec {
                 kind: ScheduleKind::Once,
                 run_at_unix: Some(10),
                 interval_seconds: None,
             },
             ScheduledTarget {
-                kind: ScheduledTargetKind::Event,
-                r#ref: "event.demo".to_owned(),
-                action: Some("wake".to_owned()),
+                kind: ScheduledTargetKind::Command,
+                r#ref: "this-program-does-not-exist-honeycomb-test".to_owned(),
+                action: None,
                 args: Map::new(),
             },
         );
@@ -351,7 +564,47 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("not dispatchable")
+                .contains("failed to spawn")
+                || runs[0].error.as_deref().unwrap_or("").contains("exited")
         );
+    }
+
+    #[test]
+    fn event_target_dispatch_succeeds() {
+        let root = temp_root("event-ok");
+        let config = ServiceConfig::new(&root);
+        let namespace = ApiNamespace::default();
+        let workspace_namespace =
+            WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
+        let repository = ScheduleRepository::with_namespace(&root, workspace_namespace);
+        let task = ScheduledTask::new(
+            "schedule.service.event",
+            "Emit Event",
+            ScheduleSpec {
+                kind: ScheduleKind::Once,
+                run_at_unix: Some(10),
+                interval_seconds: None,
+            },
+            ScheduledTarget {
+                kind: ScheduledTargetKind::Event,
+                r#ref: "demo.signal".to_owned(),
+                action: Some("wake".to_owned()),
+                args: Map::new(),
+            },
+        );
+        repository.write_schedule(&task).unwrap();
+
+        let report = dispatch_due_scheduled_runs(&config, namespace, Some(10)).unwrap();
+
+        assert_eq!(report.queued_count, 1);
+        assert_eq!(report.receipts.len(), 1);
+        assert_eq!(report.receipts[0].status, "succeeded");
+        assert_eq!(
+            report.receipts[0].result_ref.as_deref(),
+            Some("event:demo.signal")
+        );
+        let runs = repository.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, ScheduledRunStatus::Succeeded);
     }
 }

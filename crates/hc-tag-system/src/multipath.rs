@@ -1,18 +1,18 @@
 //! 多路匹配器模块 - 整合规则、语义、统计等多种匹配方法
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::{TagVector, MatchResult, FuzzyMatcher, Dimension};
+use crate::{Dimension, FuzzyMatcher, MatchResult, TagVector};
 
 /// 匹配路径类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MatchPathType {
-    RuleBased,      // 规则匹配
-    Semantic,       // 语义匹配
-    Statistical,    // 统计匹配
-    Contextual,     // 上下文匹配
-    Hybrid,         // 混合匹配
+    RuleBased,   // 规则匹配
+    Semantic,    // 语义匹配
+    Statistical, // 统计匹配
+    Contextual,  // 上下文匹配
+    Hybrid,      // 混合匹配
 }
 
 /// 单个路径的匹配结果
@@ -40,10 +40,10 @@ pub struct MultiPathResult {
 /// 融合策略
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FusionStrategy {
-    WeightedAverage,    // 加权平均
-    MaxConfidence,      // 最高置信度
-    Voting,            // 投票机制
-    Adaptive,          // 自适应融合
+    WeightedAverage, // 加权平均
+    MaxConfidence,   // 最高置信度
+    Voting,          // 投票机制
+    Adaptive,        // 自适应融合
 }
 
 /// 多路匹配器配置
@@ -120,17 +120,11 @@ impl MultiPathMatcher {
         // 并行执行各个匹配路径
         for path_type in &self.config.enabled_paths {
             let path_start = std::time::Instant::now();
-            
+
             let result = match path_type {
-                MatchPathType::RuleBased => {
-                    self.rule_based_matcher.match_input(input)
-                }
-                MatchPathType::Semantic => {
-                    self.semantic_matcher.match_input(input)
-                }
-                MatchPathType::Statistical => {
-                    self.statistical_matcher.match_input(input)
-                }
+                MatchPathType::RuleBased => self.rule_based_matcher.match_input(input),
+                MatchPathType::Semantic => self.semantic_matcher.match_input(input),
+                MatchPathType::Statistical => self.statistical_matcher.match_input(input),
                 MatchPathType::Contextual => {
                     if let Some(contextual) = &self.contextual_matcher {
                         contextual.match_input(input, context)
@@ -145,7 +139,7 @@ impl MultiPathMatcher {
             };
 
             let processing_time = path_start.elapsed().as_millis() as u64;
-            
+
             let path_result = PathMatchResult {
                 path_type: path_type.clone(),
                 tag_vector: result.tag_vector,
@@ -179,18 +173,10 @@ impl MultiPathMatcher {
         }
 
         match self.config.fusion_strategy {
-            FusionStrategy::WeightedAverage => {
-                self.weighted_average_fusion(path_results)
-            }
-            FusionStrategy::MaxConfidence => {
-                self.max_confidence_fusion(path_results)
-            }
-            FusionStrategy::Voting => {
-                self.voting_fusion(path_results)
-            }
-            FusionStrategy::Adaptive => {
-                self.adaptive_fusion(path_results)
-            }
+            FusionStrategy::WeightedAverage => self.weighted_average_fusion(path_results),
+            FusionStrategy::MaxConfidence => self.max_confidence_fusion(path_results),
+            FusionStrategy::Voting => self.voting_fusion(path_results),
+            FusionStrategy::Adaptive => self.adaptive_fusion(path_results),
         }
     }
 
@@ -246,7 +232,9 @@ impl MultiPathMatcher {
     /// 最高置信度融合
     fn max_confidence_fusion(&self, path_results: &[PathMatchResult]) -> (TagVector, f32) {
         if let Some(best_result) = path_results.iter().max_by(|a, b| {
-            a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal)
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
         }) {
             (best_result.tag_vector.clone(), best_result.confidence)
         } else {
@@ -258,7 +246,7 @@ impl MultiPathMatcher {
     fn voting_fusion(&self, path_results: &[PathMatchResult]) -> (TagVector, f32) {
         // 简化版投票：对每个维度，选择多数路径认为的值
         let mut fused_vector = TagVector::new();
-        
+
         // 收集所有维度
         let mut all_dimensions = std::collections::HashSet::new();
         for result in path_results {
@@ -268,14 +256,15 @@ impl MultiPathMatcher {
         }
 
         for dimension in all_dimensions {
-            let values: Vec<f32> = path_results.iter()
+            let values: Vec<f32> = path_results
+                .iter()
                 .map(|r| r.tag_vector.get(&dimension))
                 .collect();
 
             // 简单投票：取中位数
             let mut sorted_values = values;
             sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            
+
             let median = if sorted_values.len() % 2 == 0 {
                 let mid = sorted_values.len() / 2;
                 (sorted_values[mid - 1] + sorted_values[mid]) / 2.0
@@ -311,7 +300,7 @@ impl MultiPathMatcher {
         let original_weights = self.config.weights.clone();
         let mut modified_config = self.config.clone();
         modified_config.weights = adjusted_weights;
-        
+
         // 临时创建一个新的匹配器来使用调整后的权重
         let temp_matcher = MultiPathMatcher {
             config: modified_config,
@@ -335,7 +324,9 @@ impl MultiPathMatcher {
 
         for i in 0..path_results.len() {
             for j in (i + 1)..path_results.len() {
-                let similarity = path_results[i].tag_vector.cosine_similarity(&path_results[j].tag_vector);
+                let similarity = path_results[i]
+                    .tag_vector
+                    .cosine_similarity(&path_results[j].tag_vector);
                 total_similarity += similarity;
                 comparisons += 1;
             }
@@ -349,9 +340,17 @@ impl MultiPathMatcher {
     }
 
     /// 获取最佳路径建议
-    pub fn get_best_path_recommendation(&self, results: &[PathMatchResult]) -> Option<MatchPathType> {
-        results.iter()
-            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
+    pub fn get_best_path_recommendation(
+        &self,
+        results: &[PathMatchResult],
+    ) -> Option<MatchPathType> {
+        results
+            .iter()
+            .max_by(|a, b| {
+                a.confidence
+                    .partial_cmp(&b.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|r| r.path_type.clone())
     }
 }
@@ -393,9 +392,15 @@ impl RuleBasedMatcher {
         let mut metadata = HashMap::new();
 
         for (dimension_id, dimension) in &self.dimensions {
-            let high_matches = self.fuzzy_matcher.fuzzy_match_keywords(input, &dimension.keywords.high);
-            let medium_matches = self.fuzzy_matcher.fuzzy_match_keywords(input, &dimension.keywords.medium);
-            let low_matches = self.fuzzy_matcher.fuzzy_match_keywords(input, &dimension.keywords.low);
+            let high_matches = self
+                .fuzzy_matcher
+                .fuzzy_match_keywords(input, &dimension.keywords.high);
+            let medium_matches = self
+                .fuzzy_matcher
+                .fuzzy_match_keywords(input, &dimension.keywords.medium);
+            let low_matches = self
+                .fuzzy_matcher
+                .fuzzy_match_keywords(input, &dimension.keywords.low);
 
             let mut score = dimension.default_value;
             let mut total_boost = 0.0f32;
@@ -450,10 +455,10 @@ impl SemanticMatcher {
         let mut metadata = HashMap::new();
 
         let input_words: Vec<&str> = input.split_whitespace().collect();
-        
+
         for (dimension_id, dimension) in &self.dimensions {
             let mut semantic_score = dimension.default_value;
-            
+
             // 简单的语义分析：检查词汇的语义场
             let creativity_indicators = ["new", "novel", "fresh", "unique", "breakthrough"];
             let complexity_indicators = ["complex", "intricate", "sophisticated", "advanced"];
@@ -461,19 +466,26 @@ impl SemanticMatcher {
 
             match dimension_id.as_str() {
                 "creativity_level" => {
-                    let creativity_words = input_words.iter()
-                        .filter(|&&word| creativity_indicators.contains(&word.to_lowercase().as_str()))
+                    let creativity_words = input_words
+                        .iter()
+                        .filter(|&&word| {
+                            creativity_indicators.contains(&word.to_lowercase().as_str())
+                        })
                         .count();
                     semantic_score += creativity_words as f32 * 0.2;
                 }
                 "technical_complexity" => {
-                    let complexity_words = input_words.iter()
-                        .filter(|&&word| complexity_indicators.contains(&word.to_lowercase().as_str()))
+                    let complexity_words = input_words
+                        .iter()
+                        .filter(|&&word| {
+                            complexity_indicators.contains(&word.to_lowercase().as_str())
+                        })
                         .count();
                     semantic_score += complexity_words as f32 * 0.2;
                 }
                 "urgency" => {
-                    let urgency_words = input_words.iter()
+                    let urgency_words = input_words
+                        .iter()
                         .filter(|&&word| urgency_indicators.contains(&word.to_lowercase().as_str()))
                         .count();
                     semantic_score += urgency_words as f32 * 0.2;
@@ -488,7 +500,10 @@ impl SemanticMatcher {
         }
 
         metadata.insert("matcher_type".to_string(), "semantic".to_string());
-        metadata.insert("analysis_method".to_string(), "word_cooccurrence".to_string());
+        metadata.insert(
+            "analysis_method".to_string(),
+            "word_cooccurrence".to_string(),
+        );
 
         GenericMatchResult {
             tag_vector,
@@ -540,7 +555,8 @@ impl StatisticalMatcher {
                 }
                 "creativity_level" => {
                     // 词汇多样性可能表示创造性
-                    let unique_words: std::collections::HashSet<&str> = input.split_whitespace().collect();
+                    let unique_words: std::collections::HashSet<&str> =
+                        input.split_whitespace().collect();
                     let diversity_ratio = unique_words.len() as f32 / word_count.max(1) as f32;
                     statistical_score += diversity_ratio * 0.3;
                 }
@@ -604,7 +620,10 @@ impl ContextualMatcher {
                 if !ctx.conversation_history.is_empty() {
                     // 简化：如果历史中有相似主题，增加相关维度的权重
                     let history_text = ctx.conversation_history.join(" ");
-                    if history_text.to_lowercase().contains(&input.to_lowercase()[..input.len().min(10)]) {
+                    if history_text
+                        .to_lowercase()
+                        .contains(&input.to_lowercase()[..input.len().min(10)])
+                    {
                         contextual_score += 0.1;
                     }
                 }
@@ -633,20 +652,27 @@ mod tests {
 
     fn create_test_dimensions() -> HashMap<String, Dimension> {
         let mut dimensions = HashMap::new();
-        
-        dimensions.insert("creativity_level".to_string(), Dimension {
-            id: "creativity_level".to_string(),
-            name: "Creativity Level".to_string(),
-            description: "Test dimension".to_string(),
-            scale_min: 0.0,
-            scale_max: 1.0,
-            default_value: 0.3,
-            keywords: DimensionKeywords {
-                low: vec!["copy".to_string(), "duplicate".to_string()],
-                medium: vec!["modify".to_string(), "improve".to_string()],
-                high: vec!["create".to_string(), "invent".to_string(), "design".to_string()],
+
+        dimensions.insert(
+            "creativity_level".to_string(),
+            Dimension {
+                id: "creativity_level".to_string(),
+                name: "Creativity Level".to_string(),
+                description: "Test dimension".to_string(),
+                scale_min: 0.0,
+                scale_max: 1.0,
+                default_value: 0.3,
+                keywords: DimensionKeywords {
+                    low: vec!["copy".to_string(), "duplicate".to_string()],
+                    medium: vec!["modify".to_string(), "improve".to_string()],
+                    high: vec![
+                        "create".to_string(),
+                        "invent".to_string(),
+                        "design".to_string(),
+                    ],
+                },
             },
-        });
+        );
 
         dimensions
     }
@@ -665,7 +691,9 @@ mod tests {
         assert!(result.consensus_score >= 0.0 && result.consensus_score <= 1.0);
 
         // 检查是否包含规则匹配结果
-        let has_rule_based = result.path_results.iter()
+        let has_rule_based = result
+            .path_results
+            .iter()
             .any(|r| r.path_type == MatchPathType::RuleBased);
         assert!(has_rule_based);
     }
@@ -673,15 +701,19 @@ mod tests {
     #[test]
     fn test_fusion_strategies() {
         let dimensions = create_test_dimensions();
-        
+
         // 测试不同的融合策略
-        for strategy in [FusionStrategy::WeightedAverage, FusionStrategy::MaxConfidence, FusionStrategy::Voting] {
+        for strategy in [
+            FusionStrategy::WeightedAverage,
+            FusionStrategy::MaxConfidence,
+            FusionStrategy::Voting,
+        ] {
             let mut config = MultiPathConfig::default();
             config.fusion_strategy = strategy;
-            
+
             let matcher = MultiPathMatcher::new(config, &dimensions);
             let result = matcher.match_input("create innovative design", None);
-            
+
             assert!(result.final_tag_vector.get("creativity_level") > 0.0);
         }
     }
@@ -691,20 +723,24 @@ mod tests {
         let dimensions = create_test_dimensions();
         let mut config = MultiPathConfig::default();
         config.enabled_paths.push(MatchPathType::Contextual);
-        
+
         let matcher = MultiPathMatcher::new(config, &dimensions);
-        
+
         let mut context = MatchContext {
             conversation_history: vec!["I love creative projects".to_string()],
             user_preferences: HashMap::new(),
             temporal_context: None,
         };
-        context.user_preferences.insert("creativity_level".to_string(), 0.8);
+        context
+            .user_preferences
+            .insert("creativity_level".to_string(), 0.8);
 
         let result = matcher.match_input("design something", Some(&context));
-        
+
         assert!(!result.path_results.is_empty());
-        let has_contextual = result.path_results.iter()
+        let has_contextual = result
+            .path_results
+            .iter()
             .any(|r| r.path_type == MatchPathType::Contextual);
         assert!(has_contextual);
     }

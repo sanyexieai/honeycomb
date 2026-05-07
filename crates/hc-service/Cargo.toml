@@ -14,9 +14,11 @@ hc-context = { path = "../hc-context" }
 hc-intent = { path = "../hc-intent" }
 hc-llm = { path = "../hc-llm" }
 hc-protocol = { path = "../hc-protocol" }
+hc-responder = { path = "../hc-responder" }
 hc-scheduler = { path = "../hc-scheduler" }
 hc-store = { path = "../hc-store" }
 hc-toolchain = { path = "../hc-toolchain" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+tracing = "0.1"

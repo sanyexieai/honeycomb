@@ -1,9 +1,9 @@
 //! 多模态输入处理模块
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::TagVector;
 
@@ -59,20 +59,34 @@ impl Default for MultimodalConfig {
             audio_segment_length: DEFAULT_AUDIO_SEGMENT_LENGTH_SECONDS,
             max_file_size_mb: DEFAULT_MAX_FILE_SIZE_MB,
             supported_image_formats: vec![
-                "png".to_string(), "jpg".to_string(), "jpeg".to_string(), 
-                "gif".to_string(), "bmp".to_string(), "webp".to_string()
+                "png".to_string(),
+                "jpg".to_string(),
+                "jpeg".to_string(),
+                "gif".to_string(),
+                "bmp".to_string(),
+                "webp".to_string(),
             ],
             supported_audio_formats: vec![
-                "mp3".to_string(), "wav".to_string(), "flac".to_string(),
-                "ogg".to_string(), "m4a".to_string()
+                "mp3".to_string(),
+                "wav".to_string(),
+                "flac".to_string(),
+                "ogg".to_string(),
+                "m4a".to_string(),
             ],
             supported_document_formats: vec![
-                "pdf".to_string(), "doc".to_string(), "docx".to_string(),
-                "txt".to_string(), "md".to_string(), "rtf".to_string()
+                "pdf".to_string(),
+                "doc".to_string(),
+                "docx".to_string(),
+                "txt".to_string(),
+                "md".to_string(),
+                "rtf".to_string(),
             ],
             supported_video_formats: vec![
-                "mp4".to_string(), "avi".to_string(), "mov".to_string(),
-                "mkv".to_string(), "webm".to_string()
+                "mp4".to_string(),
+                "avi".to_string(),
+                "mov".to_string(),
+                "mkv".to_string(),
+                "webm".to_string(),
             ],
         }
     }
@@ -284,7 +298,8 @@ impl ImageProcessor {
         let visual_features = self.analyze_visual_features(path)?;
 
         // 语义分析
-        let semantic_analysis = self.perform_image_semantic_analysis(&extracted_text, &visual_features);
+        let semantic_analysis =
+            self.perform_image_semantic_analysis(&extracted_text, &visual_features);
 
         // 计算置信度
         let confidence_scores = self.calculate_image_confidence(&visual_features, &extracted_text);
@@ -306,12 +321,14 @@ impl ImageProcessor {
             return Err(format!("文件不存在: {:?}", path));
         }
 
-        let metadata = fs::metadata(path)
-            .map_err(|e| format!("无法读取文件元数据: {}", e))?;
+        let metadata = fs::metadata(path).map_err(|e| format!("无法读取文件元数据: {}", e))?;
 
         let file_size_mb = metadata.len() / (1024 * 1024);
         if file_size_mb > self.config.max_file_size_mb as u64 {
-            return Err(format!("文件过大: {}MB > {}MB", file_size_mb, self.config.max_file_size_mb));
+            return Err(format!(
+                "文件过大: {}MB > {}MB",
+                file_size_mb, self.config.max_file_size_mb
+            ));
         }
 
         Ok(())
@@ -332,7 +349,8 @@ impl ImageProcessor {
             .map_err(|e| format!("无法获取文件大小: {}", e))?
             .len();
 
-        let format = path.extension()
+        let format = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("unknown")
             .to_lowercase();
@@ -364,29 +382,36 @@ impl ImageProcessor {
                     label: "person".to_string(),
                     confidence: 0.95,
                     bounding_box: BoundingBox {
-                        x: 100.0, y: 150.0, width: 200.0, height: 300.0,
+                        x: 100.0,
+                        y: 150.0,
+                        width: 200.0,
+                        height: 300.0,
                     },
                 },
                 DetectedObject {
                     label: "computer".to_string(),
                     confidence: 0.87,
                     bounding_box: BoundingBox {
-                        x: 350.0, y: 200.0, width: 150.0, height: 100.0,
+                        x: 350.0,
+                        y: 200.0,
+                        width: 150.0,
+                        height: 100.0,
                     },
                 },
             ],
             scene_type: "office".to_string(),
             emotional_tone: "professional".to_string(),
-            text_regions: vec![
-                TextRegion {
-                    text: "示例文本".to_string(),
-                    confidence: 0.92,
-                    bounding_box: BoundingBox {
-                        x: 50.0, y: 50.0, width: 100.0, height: 20.0,
-                    },
-                    language: Some("zh".to_string()),
+            text_regions: vec![TextRegion {
+                text: "示例文本".to_string(),
+                confidence: 0.92,
+                bounding_box: BoundingBox {
+                    x: 50.0,
+                    y: 50.0,
+                    width: 100.0,
+                    height: 20.0,
                 },
-            ],
+                language: Some("zh".to_string()),
+            }],
             color_analysis: ColorAnalysis {
                 dominant_colors: vec![
                     ColorInfo {
@@ -427,11 +452,11 @@ impl ImageProcessor {
             "office" => {
                 semantic_vector.set("technical_complexity", 0.6);
                 semantic_vector.set("creativity_level", 0.4);
-            },
+            }
             "creative_space" => {
                 semantic_vector.set("creativity_level", 0.9);
                 semantic_vector.set("technical_complexity", 0.3);
-            },
+            }
             _ => {
                 semantic_vector.set("creativity_level", 0.5);
             }
@@ -446,11 +471,15 @@ impl ImageProcessor {
         }
 
         // 基于颜色分析
-        let warm_colors = visual.color_analysis.dominant_colors
+        let warm_colors = visual
+            .color_analysis
+            .dominant_colors
             .iter()
-            .filter(|c| c.emotion_association == "energetic" || c.emotion_association == "passionate")
+            .filter(|c| {
+                c.emotion_association == "energetic" || c.emotion_association == "passionate"
+            })
             .count();
-        
+
         if warm_colors > 0 {
             semantic_vector.set("creativity_level", 0.6 + warm_colors as f32 * 0.1);
         }
@@ -458,7 +487,11 @@ impl ImageProcessor {
         semantic_vector
     }
 
-    fn calculate_image_confidence(&self, visual: &VisualFeatures, text: &str) -> HashMap<String, f32> {
+    fn calculate_image_confidence(
+        &self,
+        visual: &VisualFeatures,
+        text: &str,
+    ) -> HashMap<String, f32> {
         let mut confidence = HashMap::new();
 
         // OCR置信度
@@ -466,7 +499,8 @@ impl ImageProcessor {
         confidence.insert("ocr".to_string(), ocr_confidence);
 
         // 对象检测置信度
-        let object_confidence = visual.objects_detected
+        let object_confidence = visual
+            .objects_detected
             .iter()
             .map(|obj| obj.confidence)
             .fold(0.0f32, |acc, conf| acc.max(conf));
@@ -511,7 +545,8 @@ impl AudioProcessor {
         let audio_features = self.analyze_audio_features(path, &transcribed_text)?;
 
         // 语义分析
-        let semantic_analysis = self.perform_audio_semantic_analysis(&transcribed_text, &audio_features);
+        let semantic_analysis =
+            self.perform_audio_semantic_analysis(&transcribed_text, &audio_features);
 
         // 计算置信度
         let confidence_scores = self.calculate_audio_confidence(&audio_features);
@@ -533,7 +568,8 @@ impl AudioProcessor {
             return Err(format!("音频文件不存在: {:?}", path));
         }
 
-        let extension = path.extension()
+        let extension = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .ok_or("无法确定文件格式")?
             .to_lowercase();
@@ -559,7 +595,8 @@ impl AudioProcessor {
             .map_err(|e| format!("无法获取文件大小: {}", e))?
             .len();
 
-        let format = path.extension()
+        let format = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("unknown")
             .to_lowercase();
@@ -590,7 +627,7 @@ impl AudioProcessor {
             speaker_count: 1,
             emotion: "confident".to_string(),
             energy_level: 0.75,
-            speech_rate: 150.0, // words per minute
+            speech_rate: 150.0,                       // words per minute
             pause_patterns: vec![0.5, 1.2, 0.8, 2.0], // pause durations
             frequency_analysis: FrequencyAnalysis {
                 fundamental_frequency: 150.0,
@@ -619,14 +656,14 @@ impl AudioProcessor {
             "confident" => {
                 semantic_vector.set("technical_complexity", 0.7);
                 semantic_vector.set("creativity_level", 0.6);
-            },
+            }
             "excited" => {
                 semantic_vector.set("creativity_level", 0.9);
                 semantic_vector.set("urgency", 0.8);
-            },
+            }
             "calm" => {
                 semantic_vector.set("urgency", 0.2);
-            },
+            }
             _ => {}
         }
 
@@ -636,7 +673,10 @@ impl AudioProcessor {
         }
 
         if audio.energy_level > 0.8 {
-            semantic_vector.set("creativity_level", semantic_vector.get("creativity_level") + 0.1);
+            semantic_vector.set(
+                "creativity_level",
+                semantic_vector.get("creativity_level") + 0.1,
+            );
         }
 
         semantic_vector
@@ -646,7 +686,11 @@ impl AudioProcessor {
         let mut confidence = HashMap::new();
 
         // 语音识别置信度
-        let transcription_confidence = if audio.transcribed_text.is_empty() { 0.0 } else { 0.88 };
+        let transcription_confidence = if audio.transcribed_text.is_empty() {
+            0.0
+        } else {
+            0.88
+        };
         confidence.insert("transcription".to_string(), transcription_confidence);
 
         // 情感识别置信度
@@ -688,7 +732,8 @@ impl DocumentProcessor {
         let document_structure = self.analyze_document_structure(path)?;
 
         // 语义分析
-        let semantic_analysis = self.perform_document_semantic_analysis(&extracted_text, &document_structure);
+        let semantic_analysis =
+            self.perform_document_semantic_analysis(&extracted_text, &document_structure);
 
         // 计算置信度
         let confidence_scores = self.calculate_document_confidence(&extracted_text);
@@ -710,7 +755,8 @@ impl DocumentProcessor {
             return Err(format!("文档文件不存在: {:?}", path));
         }
 
-        let extension = path.extension()
+        let extension = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .ok_or("无法确定文件格式")?
             .to_lowercase();
@@ -749,7 +795,11 @@ impl DocumentProcessor {
         })
     }
 
-    fn perform_document_semantic_analysis(&self, text: &str, structure: &DocumentStructure) -> TagVector {
+    fn perform_document_semantic_analysis(
+        &self,
+        text: &str,
+        structure: &DocumentStructure,
+    ) -> TagVector {
         let mut semantic_vector = TagVector::new();
 
         // 基于内容的语义分析
@@ -764,11 +814,17 @@ impl DocumentProcessor {
 
         // 基于文档结构的分析
         if structure.page_count > 20 {
-            semantic_vector.set("technical_complexity", semantic_vector.get("technical_complexity") + 0.1);
+            semantic_vector.set(
+                "technical_complexity",
+                semantic_vector.get("technical_complexity") + 0.1,
+            );
         }
 
         if structure.has_images && structure.has_tables {
-            semantic_vector.set("creativity_level", semantic_vector.get("creativity_level") + 0.1);
+            semantic_vector.set(
+                "creativity_level",
+                semantic_vector.get("creativity_level") + 0.1,
+            );
         }
 
         semantic_vector
@@ -832,7 +888,7 @@ impl VideoProcessor {
         let fused_result = self.fuse_audio_visual_analysis(&audio_analysis, &visual_analysis);
 
         let confidence_scores = self.calculate_video_confidence(&visual_analysis, &audio_analysis);
-        
+
         Ok(MultimodalAnalysisResult {
             input_type: "Video".to_string(),
             extracted_text: audio_analysis.transcribed_text.clone(),
@@ -850,7 +906,8 @@ impl VideoProcessor {
             return Err(format!("视频文件不存在: {:?}", path));
         }
 
-        let extension = path.extension()
+        let extension = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .ok_or("无法确定文件格式")?
             .to_lowercase();
@@ -890,7 +947,8 @@ impl VideoProcessor {
     fn extract_and_analyze_audio(&self, _path: &Path) -> Result<AudioFeatures, String> {
         // 模拟视频音频分析
         Ok(AudioFeatures {
-            transcribed_text: "欢迎大家参加今天的创新技术分享会，我们将讨论人工智能的最新发展。".to_string(),
+            transcribed_text: "欢迎大家参加今天的创新技术分享会，我们将讨论人工智能的最新发展。"
+                .to_string(),
             speaker_count: 2,
             emotion: "enthusiastic".to_string(),
             energy_level: 0.8,
@@ -913,7 +971,12 @@ impl VideoProcessor {
                 all_objects.push(DetectedObject {
                     label: obj.clone(),
                     confidence: 0.85,
-                    bounding_box: BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+                    bounding_box: BoundingBox {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
                 });
             }
         }
@@ -924,14 +987,12 @@ impl VideoProcessor {
             emotional_tone: "educational".to_string(),
             text_regions: vec![],
             color_analysis: ColorAnalysis {
-                dominant_colors: vec![
-                    ColorInfo {
-                        hex: "#FFFFFF".to_string(),
-                        rgb: (255, 255, 255),
-                        percentage: 0.4,
-                        emotion_association: "clean".to_string(),
-                    },
-                ],
+                dominant_colors: vec![ColorInfo {
+                    hex: "#FFFFFF".to_string(),
+                    rgb: (255, 255, 255),
+                    percentage: 0.4,
+                    emotion_association: "clean".to_string(),
+                }],
                 overall_brightness: 0.8,
                 color_harmony: 0.7,
                 temperature: 0.0,
@@ -939,7 +1000,11 @@ impl VideoProcessor {
         })
     }
 
-    fn fuse_audio_visual_analysis(&self, audio: &AudioFeatures, visual: &VisualFeatures) -> TagVector {
+    fn fuse_audio_visual_analysis(
+        &self,
+        audio: &AudioFeatures,
+        visual: &VisualFeatures,
+    ) -> TagVector {
         let mut semantic_vector = TagVector::new();
 
         // 基于音频内容的分析
@@ -953,33 +1018,44 @@ impl VideoProcessor {
             "presentation" => {
                 semantic_vector.set("technical_complexity", 0.8);
                 semantic_vector.set("creativity_level", 0.6);
-            },
+            }
             "discussion" => {
                 semantic_vector.set("creativity_level", 0.7);
-            },
+            }
             _ => {}
         }
 
         // 基于情感分析的融合
         match audio.emotion.as_str() {
             "enthusiastic" => {
-                semantic_vector.set("creativity_level", semantic_vector.get("creativity_level") + 0.2);
+                semantic_vector.set(
+                    "creativity_level",
+                    semantic_vector.get("creativity_level") + 0.2,
+                );
                 semantic_vector.set("urgency", 0.6);
-            },
+            }
             _ => {}
         }
 
         semantic_vector
     }
 
-    fn calculate_video_confidence(&self, _visual: &VisualFeatures, audio: &AudioFeatures) -> HashMap<String, f32> {
+    fn calculate_video_confidence(
+        &self,
+        _visual: &VisualFeatures,
+        audio: &AudioFeatures,
+    ) -> HashMap<String, f32> {
         let mut confidence = HashMap::new();
 
         // 视频分析置信度
         confidence.insert("visual_analysis".to_string(), 0.82);
 
         // 音频分析置信度
-        let audio_confidence = if audio.transcribed_text.is_empty() { 0.0 } else { 0.85 };
+        let audio_confidence = if audio.transcribed_text.is_empty() {
+            0.0
+        } else {
+            0.85
+        };
         confidence.insert("audio_analysis".to_string(), audio_confidence);
 
         // 融合置信度
@@ -1016,50 +1092,49 @@ impl MultimodalAnalysisManager {
     /// 分析多模态输入
     pub fn analyze(&self, input: &MultimodalInput) -> Result<MultimodalAnalysisResult, String> {
         match input {
-            MultimodalInput::Text(text) => {
-                Ok(MultimodalAnalysisResult {
-                    input_type: "Text".to_string(),
-                    extracted_text: text.clone(),
-                    visual_features: None,
-                    audio_features: None,
-                    semantic_analysis: TagVector::new(),
-                    confidence_scores: [("overall".to_string(), 1.0)].iter().cloned().collect(),
-                    processing_time: std::time::Duration::from_millis(1),
-                    fusion_method: "Text Only".to_string(),
-                })
-            },
+            MultimodalInput::Text(text) => Ok(MultimodalAnalysisResult {
+                input_type: "Text".to_string(),
+                extracted_text: text.clone(),
+                visual_features: None,
+                audio_features: None,
+                semantic_analysis: TagVector::new(),
+                confidence_scores: [("overall".to_string(), 1.0)].iter().cloned().collect(),
+                processing_time: std::time::Duration::from_millis(1),
+                fusion_method: "Text Only".to_string(),
+            }),
             MultimodalInput::Image { path, .. } => {
                 if !self.config.enable_image_analysis {
                     return Err("图像分析功能未启用".to_string());
                 }
                 self.image_processor.analyze_image(path)
-            },
+            }
             MultimodalInput::Audio { path, .. } => {
                 if !self.config.enable_audio_analysis {
                     return Err("音频分析功能未启用".to_string());
                 }
                 self.audio_processor.analyze_audio(path)
-            },
+            }
             MultimodalInput::Document { path, .. } => {
                 if !self.config.enable_document_analysis {
                     return Err("文档分析功能未启用".to_string());
                 }
                 self.document_processor.analyze_document(path)
-            },
+            }
             MultimodalInput::Video { path, .. } => {
                 if !self.config.enable_video_analysis {
                     return Err("视频分析功能未启用".to_string());
                 }
                 self.video_processor.analyze_video(path)
-            },
-            MultimodalInput::Mixed(inputs) => {
-                self.analyze_mixed_inputs(inputs)
-            },
+            }
+            MultimodalInput::Mixed(inputs) => self.analyze_mixed_inputs(inputs),
         }
     }
 
     /// 分析混合输入
-    fn analyze_mixed_inputs(&self, inputs: &[MultimodalInput]) -> Result<MultimodalAnalysisResult, String> {
+    fn analyze_mixed_inputs(
+        &self,
+        inputs: &[MultimodalInput],
+    ) -> Result<MultimodalAnalysisResult, String> {
         let start_time = std::time::Instant::now();
         let mut results = Vec::new();
         let mut all_text = String::new();
@@ -1121,7 +1196,7 @@ impl MultimodalAnalysisManager {
             for (dimension, value) in &result.semantic_analysis.dimensions {
                 let current_weight = weights.get(dimension).unwrap_or(&0.0);
                 let current_value = fused.get(dimension);
-                
+
                 let new_weight = current_weight + weight;
                 let new_value = (current_value * current_weight + value * weight) / new_weight;
 
@@ -1134,13 +1209,18 @@ impl MultimodalAnalysisManager {
     }
 
     /// 计算混合置信度
-    fn calculate_mixed_confidence(&self, results: &[MultimodalAnalysisResult]) -> HashMap<String, f32> {
+    fn calculate_mixed_confidence(
+        &self,
+        results: &[MultimodalAnalysisResult],
+    ) -> HashMap<String, f32> {
         let mut mixed_confidence = HashMap::new();
 
         if !results.is_empty() {
-            let overall_confidence: f32 = results.iter()
+            let overall_confidence: f32 = results
+                .iter()
                 .filter_map(|r| r.confidence_scores.get("overall"))
-                .sum::<f32>() / results.len() as f32;
+                .sum::<f32>()
+                / results.len() as f32;
 
             mixed_confidence.insert("overall".to_string(), overall_confidence);
             mixed_confidence.insert("fusion_quality".to_string(), 0.85);
@@ -1153,10 +1233,22 @@ impl MultimodalAnalysisManager {
     /// 获取支持的文件格式
     pub fn get_supported_formats(&self) -> HashMap<String, Vec<String>> {
         let mut formats = HashMap::new();
-        formats.insert("image".to_string(), self.config.supported_image_formats.clone());
-        formats.insert("audio".to_string(), self.config.supported_audio_formats.clone());
-        formats.insert("document".to_string(), self.config.supported_document_formats.clone());
-        formats.insert("video".to_string(), self.config.supported_video_formats.clone());
+        formats.insert(
+            "image".to_string(),
+            self.config.supported_image_formats.clone(),
+        );
+        formats.insert(
+            "audio".to_string(),
+            self.config.supported_audio_formats.clone(),
+        );
+        formats.insert(
+            "document".to_string(),
+            self.config.supported_document_formats.clone(),
+        );
+        formats.insert(
+            "video".to_string(),
+            self.config.supported_video_formats.clone(),
+        );
         formats
     }
 }
@@ -1222,7 +1314,11 @@ mod tests {
         assert_eq!(config.max_file_size_mb, 100);
         assert!(config.supported_image_formats.contains(&"png".to_string()));
         assert!(config.supported_audio_formats.contains(&"mp3".to_string()));
-        assert!(config.supported_document_formats.contains(&"pdf".to_string()));
+        assert!(
+            config
+                .supported_document_formats
+                .contains(&"pdf".to_string())
+        );
         assert!(config.supported_video_formats.contains(&"mp4".to_string()));
     }
 }

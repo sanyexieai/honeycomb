@@ -8,9 +8,7 @@ use crate::{
     ServiceConfig,
     chat::{ChatStreamEvent, handle_chat_request, handle_chat_stream_request},
     timed_turn::{TimedDeliverMode, try_handle_timed_chat_turn, try_timed_stream_plan},
-    tool_turn::{
-        try_handle_configured_mcp_route_turn, try_handle_persisted_pending_confirmation,
-    },
+    tool_turn::{try_handle_configured_mcp_route_turn, try_handle_persisted_pending_confirmation},
 };
 
 fn intent_router() -> &'static IntentRouter {

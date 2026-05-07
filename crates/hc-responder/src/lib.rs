@@ -77,10 +77,7 @@ impl ResponderBinding {
             Self::Llm(config) => format!("{}/{}", config.provider, config.model),
             Self::Human(config) => format!(
                 "human:{}",
-                config
-                    .user_ref
-                    .clone()
-                    .unwrap_or_else(default_user_id)
+                config.user_ref.clone().unwrap_or_else(default_user_id)
             ),
             Self::Rule(config) => format!(
                 "rule:{}",

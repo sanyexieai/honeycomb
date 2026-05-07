@@ -652,7 +652,11 @@ impl ExecutionContext {
         self
     }
 
-    pub fn with_environment_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn with_environment_var(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
         self.environment.insert(key.into(), value.into());
         self
     }
@@ -679,7 +683,7 @@ pub struct MemoryRoom {
     pub relations: Vec<MemoryRelation>,
     pub source_docs: Vec<String>,
     pub derived_docs: Vec<String>,
-    
+
     // 新增：能力继承
     #[serde(default)]
     pub inherited_capabilities: Vec<CapabilityRef>,
@@ -689,7 +693,7 @@ pub struct MemoryRoom {
     pub inherited_skills: Vec<SkillRef>,
     #[serde(default)]
     pub inherited_schedules: Vec<ScheduleRef>,
-    
+
     // 新增：Room 特定配置
     #[serde(default)]
     pub room_config: RoomConfig,
@@ -813,7 +817,11 @@ impl MemoryRoom {
 
     /// 添加能力引用
     pub fn add_capability(&mut self, capability_ref: CapabilityRef) {
-        if !self.inherited_capabilities.iter().any(|c| c.id == capability_ref.id) {
+        if !self
+            .inherited_capabilities
+            .iter()
+            .any(|c| c.id == capability_ref.id)
+        {
             self.inherited_capabilities.push(capability_ref);
         }
     }
@@ -834,14 +842,19 @@ impl MemoryRoom {
 
     /// 添加调度引用
     pub fn add_schedule(&mut self, schedule_ref: ScheduleRef) {
-        if !self.inherited_schedules.iter().any(|s| s.id == schedule_ref.id) {
+        if !self
+            .inherited_schedules
+            .iter()
+            .any(|s| s.id == schedule_ref.id)
+        {
             self.inherited_schedules.push(schedule_ref);
         }
     }
 
     /// 移除能力引用
     pub fn remove_capability(&mut self, capability_id: &str) {
-        self.inherited_capabilities.retain(|c| c.id != capability_id);
+        self.inherited_capabilities
+            .retain(|c| c.id != capability_id);
     }
 
     /// 移除工具引用
@@ -861,7 +874,9 @@ impl MemoryRoom {
 
     /// 检查是否继承了指定的能力
     pub fn has_capability(&self, capability_id: &str) -> bool {
-        self.inherited_capabilities.iter().any(|c| c.id == capability_id)
+        self.inherited_capabilities
+            .iter()
+            .any(|c| c.id == capability_id)
     }
 
     /// 检查是否继承了指定的工具
@@ -1753,62 +1768,65 @@ impl MemoryRoomRepository {
         // 尝试在不同层级中查找房间
         let layers = [
             MemoryLayer::Chat,
-            MemoryLayer::Topic, 
+            MemoryLayer::Topic,
             MemoryLayer::Task,
             MemoryLayer::Project,
             MemoryLayer::Global,
         ];
-        
+
         for layer in layers {
             let room_path = PathBuf::from("memory")
                 .join("rooms")
                 .join(layer_dir_name(&layer))
                 .join(room_id)
                 .join("room.md");
-                
+
             if let Ok(room) = self.read_room(&room_path) {
                 if room.id == room_id {
                     return Ok(Some(room));
                 }
             }
         }
-        
+
         Ok(None)
     }
 
     pub fn list_rooms(&self) -> Result<Vec<MemoryRoom>> {
         let mut rooms = Vec::new();
-        
+
         // 遍历所有层级
         let layers = [
             MemoryLayer::Chat,
-            MemoryLayer::Topic, 
+            MemoryLayer::Topic,
             MemoryLayer::Task,
             MemoryLayer::Project,
             MemoryLayer::Global,
         ];
-        
+
         for layer in layers {
             let layer_path = PathBuf::from("memory")
                 .join("rooms")
                 .join(layer_dir_name(&layer));
-                
-            let full_layer_path = self.store.resolve_in_namespace(&self.namespace, &layer_path);
-            
+
+            let full_layer_path = self
+                .store
+                .resolve_in_namespace(&self.namespace, &layer_path);
+
             // 检查层级目录是否存在
             if !full_layer_path.exists() {
                 continue;
             }
-            
+
             // 遍历层级目录中的所有房间
             if let Ok(entries) = std::fs::read_dir(&full_layer_path) {
                 for entry in entries.flatten() {
                     if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                         let room_dir = entry.path();
                         let room_file = room_dir.join("room.md");
-                        
+
                         if room_file.exists() {
-                            let relative_room_path = layer_path.join(entry.file_name()).join("room.md");
+                            let relative_room_path =
+                                layer_path.join(entry.file_name()).join("room.md");
                             if let Ok(room) = self.read_room(&relative_room_path) {
                                 rooms.push(room);
                             }
@@ -1817,36 +1835,36 @@ impl MemoryRoomRepository {
                 }
             }
         }
-        
+
         // 按层级和ID排序
-        rooms.sort_by(|a, b| {
-            a.layer.cmp(&b.layer).then(a.id.cmp(&b.id))
-        });
-        
+        rooms.sort_by(|a, b| a.layer.cmp(&b.layer).then(a.id.cmp(&b.id)));
+
         Ok(rooms)
     }
 
     pub fn list_rooms_by_layer(&self, layer: MemoryLayer) -> Result<Vec<MemoryRoom>> {
         let mut rooms = Vec::new();
-        
+
         let layer_path = PathBuf::from("memory")
             .join("rooms")
             .join(layer_dir_name(&layer));
-            
-        let full_layer_path = self.store.resolve_in_namespace(&self.namespace, &layer_path);
-        
+
+        let full_layer_path = self
+            .store
+            .resolve_in_namespace(&self.namespace, &layer_path);
+
         // 检查层级目录是否存在
         if !full_layer_path.exists() {
             return Ok(rooms);
         }
-        
+
         // 遍历层级目录中的所有房间
         if let Ok(entries) = std::fs::read_dir(&full_layer_path) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                     let room_dir = entry.path();
                     let room_file = room_dir.join("room.md");
-                    
+
                     if room_file.exists() {
                         let relative_room_path = layer_path.join(entry.file_name()).join("room.md");
                         if let Ok(room) = self.read_room(&relative_room_path) {
@@ -1856,10 +1874,10 @@ impl MemoryRoomRepository {
                 }
             }
         }
-        
+
         // 按ID排序
         rooms.sort_by(|a, b| a.id.cmp(&b.id));
-        
+
         Ok(rooms)
     }
 
@@ -2499,7 +2517,10 @@ impl ResolvedRoomCapabilities {
 
     /// 获取所有能力 ID
     pub fn capability_ids(&self) -> Vec<String> {
-        self.capabilities.iter().map(|c| c.capability_ref.id.clone()).collect()
+        self.capabilities
+            .iter()
+            .map(|c| c.capability_ref.id.clone())
+            .collect()
     }
 
     /// 获取所有启用的调度 ID
@@ -2559,10 +2580,7 @@ impl ResolvedTool {
     }
 
     pub fn auto_discovered(tool_id: impl Into<String>) -> Self {
-        Self::new(
-            ToolRef::new(tool_id)
-                .with_inheritance_type(InheritanceType::AutoDiscovered),
-        )
+        Self::new(ToolRef::new(tool_id).with_inheritance_type(InheritanceType::AutoDiscovered))
     }
 }
 
@@ -2586,10 +2604,7 @@ impl ResolvedSkill {
     }
 
     pub fn auto_discovered(skill_id: impl Into<String>) -> Self {
-        Self::new(
-            SkillRef::new(skill_id)
-                .with_inheritance_type(InheritanceType::AutoDiscovered),
-        )
+        Self::new(SkillRef::new(skill_id).with_inheritance_type(InheritanceType::AutoDiscovered))
     }
 }
 
@@ -2614,8 +2629,7 @@ impl ResolvedSchedule {
 
     pub fn auto_discovered(schedule_id: impl Into<String>) -> Self {
         Self::new(
-            ScheduleRef::new(schedule_id)
-                .with_inheritance_type(InheritanceType::AutoDiscovered),
+            ScheduleRef::new(schedule_id).with_inheritance_type(InheritanceType::AutoDiscovered),
         )
     }
 }
@@ -2649,7 +2663,9 @@ impl RoomCapabilityResolver {
 
         // 1. 解析直接继承的能力
         for cap_ref in &room.inherited_capabilities {
-            resolved.capabilities.push(ResolvedCapability::new(cap_ref.clone()));
+            resolved
+                .capabilities
+                .push(ResolvedCapability::new(cap_ref.clone()));
         }
 
         // 2. 解析继承的工具
@@ -2665,7 +2681,9 @@ impl RoomCapabilityResolver {
         // 4. 解析继承的定时任务
         for schedule_ref in &room.inherited_schedules {
             if schedule_ref.enabled_in_room {
-                resolved.schedules.push(ResolvedSchedule::new(schedule_ref.clone()));
+                resolved
+                    .schedules
+                    .push(ResolvedSchedule::new(schedule_ref.clone()));
             }
         }
 
@@ -2725,7 +2743,7 @@ impl RoomCapabilityResolver {
         if project_id.contains("honeycomb") {
             self.add_auto_discovered_tools(resolved, HONEYCOMB_PROJECT_TOOLS);
         }
-        
+
         Ok(())
     }
 
@@ -2738,7 +2756,7 @@ impl RoomCapabilityResolver {
         if task_id.contains("refactor") {
             self.add_auto_discovered_tools(resolved, REFACTOR_TASK_TOOLS);
         }
-        
+
         Ok(())
     }
 
@@ -2751,7 +2769,7 @@ impl RoomCapabilityResolver {
         if crate_id.contains("memory") {
             self.add_auto_discovered_tools(resolved, MEMORY_CRATE_TOOLS);
         }
-        
+
         Ok(())
     }
 
@@ -2761,7 +2779,11 @@ impl RoomCapabilityResolver {
         tool_ids: &[&str],
     ) {
         for tool_id in tool_ids {
-            if !resolved.tools.iter().any(|tool| tool.tool_ref.id == *tool_id) {
+            if !resolved
+                .tools
+                .iter()
+                .any(|tool| tool.tool_ref.id == *tool_id)
+            {
                 resolved.tools.push(ResolvedTool::auto_discovered(*tool_id));
             }
         }

@@ -11,6 +11,7 @@ axum = { workspace = true, features = ["ws"] }
 futures-util = "0.3"
 hc-bootstrap = { path = "../../crates/hc-bootstrap" }
 hc-protocol = { path = "../../crates/hc-protocol" }
+hc-responder = { path = "../../crates/hc-responder" }
 hc-service = { path = "../../crates/hc-service" }
 hc-conversation = { path = "../../crates/hc-conversation" }
 hc-scheduler = { path = "../../crates/hc-scheduler" }
@@ -22,3 +23,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-stream = "0.1"
 tracing = "0.1.44"
+
+[dev-dependencies]
+hc-service = { path = "../../crates/hc-service" }
+tower = { version = "0.5", features = ["util"] }

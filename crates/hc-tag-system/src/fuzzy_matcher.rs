@@ -1,9 +1,9 @@
 //! 模糊匹配模块 - 支持同义词、拼写纠错和语义相似度匹配
 
-use std::collections::{HashMap, HashSet};
-use strsim::{levenshtein, jaro_winkler};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use strsim::{jaro_winkler, levenshtein};
 
 /// 匹配结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,11 +17,11 @@ pub struct MatchResult {
 /// 匹配类型
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MatchType {
-    Exact,           // 精确匹配
-    Fuzzy,          // 模糊匹配
-    Synonym,        // 同义词匹配
-    Stemmed,        // 词干匹配
-    Phonetic,       // 语音相似
+    Exact,    // 精确匹配
+    Fuzzy,    // 模糊匹配
+    Synonym,  // 同义词匹配
+    Stemmed,  // 词干匹配
+    Phonetic, // 语音相似
 }
 
 /// 模糊匹配器配置
@@ -83,18 +83,19 @@ impl FuzzyMatcher {
     pub fn fuzzy_match_keywords(&self, input: &str, keywords: &[String]) -> Vec<MatchResult> {
         let normalized_input = self.normalize_text(input);
         let input_words: Vec<&str> = normalized_input.split_whitespace().collect();
-        
+
         let mut results = Vec::new();
-        
+
         for keyword in keywords {
             let normalized_keyword = self.normalize_text(keyword);
-            
+
             // 1. 精确匹配（包括子串匹配）
-            if let Some(result) = self.exact_match(&normalized_input, &normalized_keyword, keyword) {
+            if let Some(result) = self.exact_match(&normalized_input, &normalized_keyword, keyword)
+            {
                 results.push(result);
                 continue;
             }
-            
+
             // 2. 词级别匹配
             for word in &input_words {
                 if let Some(result) = self.match_single_word(word, &normalized_keyword, keyword) {
@@ -102,13 +103,18 @@ impl FuzzyMatcher {
                 }
             }
         }
-        
+
         // 去重并按分数排序
         self.deduplicate_and_sort(results)
     }
 
     /// 单词级别匹配
-    fn match_single_word(&self, word: &str, normalized_keyword: &str, original_keyword: &str) -> Option<MatchResult> {
+    fn match_single_word(
+        &self,
+        word: &str,
+        normalized_keyword: &str,
+        original_keyword: &str,
+    ) -> Option<MatchResult> {
         // 1. 精确匹配
         if word == normalized_keyword {
             return Some(MatchResult {
@@ -146,31 +152,8 @@ impl FuzzyMatcher {
             }
         }
 
-        // 4. Jaro-Winkler 相似度匹配
-        let jw_score = jaro_winkler(word, normalized_keyword) as f32;
-        if jw_score >= self.config.jaro_winkler_threshold {
-            return Some(MatchResult {
-                keyword: original_keyword.to_string(),
-                score: jw_score,
-                match_type: MatchType::Fuzzy,
-                original_input: word.to_string(),
-            });
-        }
-
-        // 5. 同义词匹配
-        if self.config.enable_synonym_matching {
-            if self.synonym_dict.are_synonyms(word, normalized_keyword) {
-                return Some(MatchResult {
-                    keyword: original_keyword.to_string(),
-                    score: 0.8,
-                    match_type: MatchType::Synonym,
-                    original_input: word.to_string(),
-                });
-            }
-        }
-
-        // 6. 词干匹配
-        if self.config.enable_stemming && word.len() >= 4 {
+        // 4. 词干匹配（先于 Jaro-Winkler，避免本可判定为词干的配对被标成模糊匹配）
+        if self.config.enable_stemming && word.len() >= 3 {
             let stem_word = self.stemmer_en.stem(word);
             let stem_keyword = self.stemmer_en.stem(normalized_keyword);
             if stem_word == stem_keyword {
@@ -183,11 +166,39 @@ impl FuzzyMatcher {
             }
         }
 
+        // 5. Jaro-Winkler 相似度匹配
+        let jw_score = jaro_winkler(word, normalized_keyword) as f32;
+        if jw_score >= self.config.jaro_winkler_threshold {
+            return Some(MatchResult {
+                keyword: original_keyword.to_string(),
+                score: jw_score,
+                match_type: MatchType::Fuzzy,
+                original_input: word.to_string(),
+            });
+        }
+
+        // 6. 同义词匹配
+        if self.config.enable_synonym_matching {
+            if self.synonym_dict.are_synonyms(word, normalized_keyword) {
+                return Some(MatchResult {
+                    keyword: original_keyword.to_string(),
+                    score: 0.8,
+                    match_type: MatchType::Synonym,
+                    original_input: word.to_string(),
+                });
+            }
+        }
+
         None
     }
 
     /// 精确匹配（包括子串）
-    fn exact_match(&self, input: &str, keyword: &str, original_keyword: &str) -> Option<MatchResult> {
+    fn exact_match(
+        &self,
+        input: &str,
+        keyword: &str,
+        original_keyword: &str,
+    ) -> Option<MatchResult> {
         if input.contains(keyword) || keyword.contains(input) {
             let score = if input == keyword { 1.0 } else { 0.95 };
             Some(MatchResult {
@@ -220,7 +231,7 @@ impl FuzzyMatcher {
         // 按关键词去重，保留分数最高的
         let mut seen: HashMap<String, usize> = HashMap::new();
         let mut filtered: Vec<MatchResult> = Vec::new();
-        
+
         for result in results {
             match seen.get(&result.keyword) {
                 Some(&index) => {
@@ -234,32 +245,34 @@ impl FuzzyMatcher {
                 }
             }
         }
-        
+
         // 按分数降序排序
         filtered.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
-        
+
         filtered
     }
 
     /// 构建常见拼写错误字典
     fn build_common_typos() -> HashMap<String, String> {
         let mut typos = HashMap::new();
-        
+
         // 英文常见拼写错误
         typos.insert("teh".to_string(), "the".to_string());
         typos.insert("recieve".to_string(), "receive".to_string());
         typos.insert("seperate".to_string(), "separate".to_string());
         typos.insert("definately".to_string(), "definitely".to_string());
         typos.insert("occured".to_string(), "occurred".to_string());
-        
+
         // 技术术语常见拼写错误
         typos.insert("algortihm".to_string(), "algorithm".to_string());
         typos.insert("databse".to_string(), "database".to_string());
         typos.insert("funtcion".to_string(), "function".to_string());
         typos.insert("varialbe".to_string(), "variable".to_string());
-        
+
         typos
     }
 }
@@ -293,11 +306,9 @@ impl SynonymDictionary {
     /// 添加同义词组
     pub fn add_synonym_group(&mut self, words: Vec<String>) {
         for word in &words {
-            let synonym_set: HashSet<String> = words.iter()
-                .filter(|&w| w != word)
-                .cloned()
-                .collect();
-            
+            let synonym_set: HashSet<String> =
+                words.iter().filter(|&w| w != word).cloned().collect();
+
             if let Some(existing) = self.synonyms.get_mut(word) {
                 existing.extend(synonym_set);
             } else {
@@ -310,41 +321,60 @@ impl SynonymDictionary {
     fn build_default_synonyms(&mut self) {
         // 创造性相关同义词
         self.add_synonym_group(vec![
-            "create".to_string(), "make".to_string(), "build".to_string(), "generate".to_string()
+            "create".to_string(),
+            "make".to_string(),
+            "build".to_string(),
+            "generate".to_string(),
         ]);
         self.add_synonym_group(vec![
-            "innovative".to_string(), "creative".to_string(), "original".to_string(), "novel".to_string()
+            "innovative".to_string(),
+            "creative".to_string(),
+            "original".to_string(),
+            "novel".to_string(),
         ]);
         self.add_synonym_group(vec![
-            "design".to_string(), "architect".to_string(), "plan".to_string(), "blueprint".to_string()
+            "design".to_string(),
+            "architect".to_string(),
+            "plan".to_string(),
+            "blueprint".to_string(),
         ]);
-        
+
         // 技术复杂度相关同义词
         self.add_synonym_group(vec![
-            "complex".to_string(), "complicated".to_string(), "intricate".to_string(), "sophisticated".to_string()
+            "complex".to_string(),
+            "complicated".to_string(),
+            "intricate".to_string(),
+            "sophisticated".to_string(),
         ]);
         self.add_synonym_group(vec![
-            "simple".to_string(), "easy".to_string(), "basic".to_string(), "straightforward".to_string()
+            "simple".to_string(),
+            "easy".to_string(),
+            "basic".to_string(),
+            "straightforward".to_string(),
         ]);
-        
+
         // 紧急程度相关同义词
         self.add_synonym_group(vec![
-            "urgent".to_string(), "critical".to_string(), "important".to_string(), "priority".to_string()
+            "urgent".to_string(),
+            "critical".to_string(),
+            "important".to_string(),
+            "priority".to_string(),
         ]);
         self.add_synonym_group(vec![
-            "routine".to_string(), "normal".to_string(), "standard".to_string(), "regular".to_string()
+            "routine".to_string(),
+            "normal".to_string(),
+            "standard".to_string(),
+            "regular".to_string(),
         ]);
-        
+
         // 中英文对应
         self.add_synonym_group(vec![
-            "create".to_string(), "创建".to_string(), "创造".to_string()
+            "create".to_string(),
+            "创建".to_string(),
+            "创造".to_string(),
         ]);
-        self.add_synonym_group(vec![
-            "complex".to_string(), "复杂".to_string()
-        ]);
-        self.add_synonym_group(vec![
-            "urgent".to_string(), "紧急".to_string()
-        ]);
+        self.add_synonym_group(vec!["complex".to_string(), "复杂".to_string()]);
+        self.add_synonym_group(vec!["urgent".to_string(), "紧急".to_string()]);
     }
 }
 
@@ -357,7 +387,7 @@ mod tests {
         let matcher = FuzzyMatcher::with_defaults();
         let keywords = vec!["create".to_string(), "design".to_string()];
         let results = matcher.fuzzy_match_keywords("I want to create something", &keywords);
-        
+
         assert!(!results.is_empty());
         assert_eq!(results[0].keyword, "create");
         assert_eq!(results[0].match_type, MatchType::Exact);
@@ -369,7 +399,7 @@ mod tests {
         let matcher = FuzzyMatcher::with_defaults();
         let keywords = vec!["algorithm".to_string()];
         let results = matcher.fuzzy_match_keywords("algortihm implementation", &keywords);
-        
+
         assert!(!results.is_empty());
         assert_eq!(results[0].keyword, "algorithm");
         assert_eq!(results[0].match_type, MatchType::Fuzzy);
@@ -381,7 +411,7 @@ mod tests {
         let matcher = FuzzyMatcher::with_defaults();
         let keywords = vec!["create".to_string()];
         let results = matcher.fuzzy_match_keywords("I need to make something", &keywords);
-        
+
         assert!(!results.is_empty());
         assert_eq!(results[0].keyword, "create");
         assert_eq!(results[0].match_type, MatchType::Synonym);
@@ -393,7 +423,7 @@ mod tests {
         let matcher = FuzzyMatcher::with_defaults();
         let keywords = vec!["running".to_string()];
         let results = matcher.fuzzy_match_keywords("I run every day", &keywords);
-        
+
         // 应该通过词干匹配找到相似性
         if !results.is_empty() {
             assert_eq!(results[0].match_type, MatchType::Stemmed);

@@ -1,12 +1,38 @@
 use hc_memory::{
-    ArtifactConsumer, ArtifactDraft, ArtifactEvolutionAction, ArtifactEvolutionEvent,
-    MaterializationKind, MemoryAssetForm, MemoryAssetStage, MemoryCatalog, MemoryEntityKind,
-    MemoryEntityRef, MemoryKind, MemoryLayer, MemoryNamespace, MemoryOwnerRef, MemoryQuery,
-    MemoryRecord, MemoryRelation, MemoryRelationKind, MemoryRepository, MemoryRoom,
-    MemoryRoomAsset, MemoryRoomAssetKind, MemoryRoomRepository, MemoryScope, MemoryVisibility,
+    ArtifactConsumer,
+    ArtifactDraft,
+    ArtifactEvolutionAction,
+    ArtifactEvolutionEvent,
     // 新增：能力继承相关
-    CapabilityRef, ToolRef, SkillRef, ScheduleRef, InheritanceType, RoomConfig, ExecutionContext,
+    CapabilityRef,
+    ExecutionContext,
+    InheritanceType,
+    MaterializationKind,
+    MemoryAssetForm,
+    MemoryAssetStage,
+    MemoryCatalog,
+    MemoryEntityKind,
+    MemoryEntityRef,
+    MemoryKind,
+    MemoryLayer,
+    MemoryNamespace,
+    MemoryOwnerRef,
+    MemoryQuery,
+    MemoryRecord,
+    MemoryRelation,
+    MemoryRelationKind,
+    MemoryRepository,
+    MemoryRoom,
+    MemoryRoomAsset,
+    MemoryRoomAssetKind,
+    MemoryRoomRepository,
+    MemoryScope,
+    MemoryVisibility,
     RoomCapabilityResolver,
+    RoomConfig,
+    ScheduleRef,
+    SkillRef,
+    ToolRef,
 };
 use hc_store::store::WorkspaceNamespace;
 use std::fs;
@@ -803,7 +829,7 @@ fn room_capability_inheritance_roundtrips_through_storage() {
         &root,
         WorkspaceNamespace::new("tenant-demo", "user-demo"),
     );
-    
+
     // 创建带有能力继承的 Room
     let room = MemoryRoom::new(
         "room.project.honeycomb.capability-test",
@@ -816,22 +842,28 @@ fn room_capability_inheritance_roundtrips_through_storage() {
     .with_tag("project")
     .with_inherited_capability(
         CapabilityRef::new("capability.rust.development")
-            .with_inheritance_type(InheritanceType::Manual)
+            .with_inheritance_type(InheritanceType::Manual),
     )
     .with_inherited_tool(
         ToolRef::new("tool.cargo-test")
             .with_inheritance_type(InheritanceType::AutoDiscovered)
-            .with_command_override(vec!["cargo".to_string(), "test".to_string(), "--all".to_string()])
+            .with_command_override(vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "--all".to_string(),
+            ]),
     )
     .with_inherited_skill(
         SkillRef::new("skill.rust.review")
             .with_inheritance_type(InheritanceType::FromParent)
-            .with_instructions_override("Focus on memory safety and performance in Rust code reviews.")
+            .with_instructions_override(
+                "Focus on memory safety and performance in Rust code reviews.",
+            ),
     )
     .with_inherited_schedule(
         ScheduleRef::new("schedule.daily-build")
             .with_inheritance_type(InheritanceType::FromSibling)
-            .enabled()
+            .enabled(),
     )
     .with_room_config(
         RoomConfig::new()
@@ -841,8 +873,8 @@ fn room_capability_inheritance_roundtrips_through_storage() {
                 ExecutionContext::new()
                     .with_default_namespace("honeycomb")
                     .with_environment_var("RUST_LOG", "debug")
-                    .with_working_directory("/workspace/honeycomb")
-            )
+                    .with_working_directory("/workspace/honeycomb"),
+            ),
     );
 
     // 写入房间
@@ -863,40 +895,71 @@ fn room_capability_inheritance_roundtrips_through_storage() {
 
     // 验证能力继承
     assert_eq!(loaded_room.inherited_capabilities.len(), 1);
-    assert_eq!(loaded_room.inherited_capabilities[0].id, "capability.rust.development");
-    assert_eq!(loaded_room.inherited_capabilities[0].inheritance_type, InheritanceType::Manual);
+    assert_eq!(
+        loaded_room.inherited_capabilities[0].id,
+        "capability.rust.development"
+    );
+    assert_eq!(
+        loaded_room.inherited_capabilities[0].inheritance_type,
+        InheritanceType::Manual
+    );
 
     assert_eq!(loaded_room.inherited_tools.len(), 1);
     assert_eq!(loaded_room.inherited_tools[0].id, "tool.cargo-test");
-    assert_eq!(loaded_room.inherited_tools[0].inheritance_type, InheritanceType::AutoDiscovered);
+    assert_eq!(
+        loaded_room.inherited_tools[0].inheritance_type,
+        InheritanceType::AutoDiscovered
+    );
     assert_eq!(
         loaded_room.inherited_tools[0].command_override,
-        Some(vec!["cargo".to_string(), "test".to_string(), "--all".to_string()])
+        Some(vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--all".to_string()
+        ])
     );
 
     assert_eq!(loaded_room.inherited_skills.len(), 1);
     assert_eq!(loaded_room.inherited_skills[0].id, "skill.rust.review");
-    assert_eq!(loaded_room.inherited_skills[0].inheritance_type, InheritanceType::FromParent);
+    assert_eq!(
+        loaded_room.inherited_skills[0].inheritance_type,
+        InheritanceType::FromParent
+    );
     assert_eq!(
         loaded_room.inherited_skills[0].instructions_override,
         Some("Focus on memory safety and performance in Rust code reviews.".to_string())
     );
 
     assert_eq!(loaded_room.inherited_schedules.len(), 1);
-    assert_eq!(loaded_room.inherited_schedules[0].id, "schedule.daily-build");
-    assert_eq!(loaded_room.inherited_schedules[0].inheritance_type, InheritanceType::FromSibling);
+    assert_eq!(
+        loaded_room.inherited_schedules[0].id,
+        "schedule.daily-build"
+    );
+    assert_eq!(
+        loaded_room.inherited_schedules[0].inheritance_type,
+        InheritanceType::FromSibling
+    );
     assert!(loaded_room.inherited_schedules[0].enabled_in_room);
 
     // 验证房间配置
     assert!(loaded_room.room_config.auto_inherit_parent);
     assert!(!loaded_room.room_config.auto_inherit_siblings);
-    assert!(loaded_room.room_config.tool_filter_tags.contains(&"rust".to_string()));
+    assert!(
+        loaded_room
+            .room_config
+            .tool_filter_tags
+            .contains(&"rust".to_string())
+    );
     assert_eq!(
         loaded_room.room_config.execution_context.default_namespace,
         Some("honeycomb".to_string())
     );
     assert_eq!(
-        loaded_room.room_config.execution_context.environment.get("RUST_LOG"),
+        loaded_room
+            .room_config
+            .execution_context
+            .environment
+            .get("RUST_LOG"),
         Some(&"debug".to_string())
     );
 
@@ -907,7 +970,7 @@ fn room_capability_inheritance_roundtrips_through_storage() {
 fn room_capability_resolver_resolves_inherited_capabilities() {
     let namespace = MemoryNamespace::new("tenant-demo", "user-demo");
     let resolver = RoomCapabilityResolver::new(namespace);
-    
+
     // 创建带有各种继承能力的房间
     let room = MemoryRoom::new(
         "room.task.rust-refactor",
@@ -919,20 +982,19 @@ fn room_capability_resolver_resolves_inherited_capabilities() {
     .with_tag("refactor")
     .with_related_entity(MemoryEntityRef::new(
         MemoryEntityKind::Project,
-        "project.honeycomb"
+        "project.honeycomb",
     ))
     .with_related_entity(MemoryEntityRef::new(
         MemoryEntityKind::Crate,
-        "crate.hc-memory"
+        "crate.hc-memory",
     ))
     .with_inherited_tool(
-        ToolRef::new("tool.manual-added")
-            .with_inheritance_type(InheritanceType::Manual)
+        ToolRef::new("tool.manual-added").with_inheritance_type(InheritanceType::Manual),
     )
     .with_room_config(
         RoomConfig::new()
             .with_auto_inherit_parent()
-            .with_auto_inherit_siblings()
+            .with_auto_inherit_siblings(),
     );
 
     // 解析能力
@@ -944,16 +1006,36 @@ fn room_capability_resolver_resolves_inherited_capabilities() {
     assert_eq!(resolved.room_id, "room.task.rust-refactor");
 
     // 验证手动添加的工具存在
-    assert!(resolved.tools.iter().any(|t| t.tool_ref.id == "tool.manual-added"));
+    assert!(
+        resolved
+            .tools
+            .iter()
+            .any(|t| t.tool_ref.id == "tool.manual-added")
+    );
 
     // 验证自动发现的能力
     // 基于 "rust" 标签应该发现 Rust 工具
-    assert!(resolved.tools.iter().any(|t| t.tool_ref.id == "tool.cargo-check"));
-    assert!(resolved.tools.iter().any(|t| t.tool_ref.id == "tool.cargo-test"));
+    assert!(
+        resolved
+            .tools
+            .iter()
+            .any(|t| t.tool_ref.id == "tool.cargo-check")
+    );
+    assert!(
+        resolved
+            .tools
+            .iter()
+            .any(|t| t.tool_ref.id == "tool.cargo-test")
+    );
 
     // 基于项目实体应该发现 Honeycomb 工具
     assert!(resolved.tools.iter().any(|t| t.tool_ref.id == "tool.rg"));
-    assert!(resolved.tools.iter().any(|t| t.tool_ref.id == "tool.local-file.read"));
+    assert!(
+        resolved
+            .tools
+            .iter()
+            .any(|t| t.tool_ref.id == "tool.local-file.read")
+    );
 
     // 基于 "refactor" 标签应该发现重构工具
     // (由于我们在 inherit_task_capabilities 中处理包含 "refactor" 的任务)
@@ -1014,7 +1096,10 @@ fn capability_ref_builder_methods_work() {
         .with_override_config(serde_json::json!({"key": "value"}));
 
     assert_eq!(capability_ref.id, "capability.test");
-    assert_eq!(capability_ref.source_room_id, Some("room.source".to_string()));
+    assert_eq!(
+        capability_ref.source_room_id,
+        Some("room.source".to_string())
+    );
     assert_eq!(capability_ref.inheritance_type, InheritanceType::FromParent);
     assert!(capability_ref.override_config.is_some());
 
@@ -1030,8 +1115,7 @@ fn capability_ref_builder_methods_work() {
         Some(vec!["custom".to_string(), "command".to_string()])
     );
 
-    let skill_ref = SkillRef::new("skill.test")
-        .with_instructions_override("Custom instructions");
+    let skill_ref = SkillRef::new("skill.test").with_instructions_override("Custom instructions");
 
     assert_eq!(skill_ref.id, "skill.test");
     assert_eq!(

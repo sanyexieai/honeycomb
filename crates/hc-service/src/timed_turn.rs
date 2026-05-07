@@ -8,21 +8,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 use hc_agent::phrase_match_score;
-use hc_context::runtime::{default_session_id, DEFAULT_TENANT_ID, DEFAULT_USER_ID};
+use hc_context::runtime::{DEFAULT_TENANT_ID, DEFAULT_USER_ID, default_session_id};
 use hc_conversation::{ConversationRepository, FollowUpStatus, PendingFollowUp};
 use hc_intent::{IntentResolution, ids as intent_ids};
-use hc_protocol::{
-    ApiChatMessage, ApiMessageRole, ApiNamespace, ChatRequest, ChatResponse,
-};
+use hc_protocol::{ApiChatMessage, ApiMessageRole, ApiNamespace, ChatRequest, ChatResponse};
 use hc_scheduler::now_unix;
 use hc_store::store::WorkspaceNamespace;
 use serde::Deserialize;
 
 use crate::{
     ServiceConfig,
-    tool_turn::{
-        load_tool_routing_tags, request_input, request_namespace, ToolRoutingTags,
-    },
+    tool_turn::{ToolRoutingTags, load_tool_routing_tags, request_input, request_namespace},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -141,11 +137,12 @@ pub fn try_timed_stream_plan(
 ) -> Result<Option<TimedStreamPlan>> {
     let input = request_input(request)?;
     let namespace = request_namespace(request);
-    let mut routing = load_tool_routing_tags(config, &namespace)
-        .unwrap_or_else(|_| ToolRoutingTags::default());
+    let mut routing =
+        load_tool_routing_tags(config, &namespace).unwrap_or_else(|_| ToolRoutingTags::default());
     routing.ensure_builtin_timed_sequences();
 
-    if let Some(text) = handle_reminder_turn(config, request, &routing, TimedDeliverMode::Headless)? {
+    if let Some(text) = handle_reminder_turn(config, request, &routing, TimedDeliverMode::Headless)?
+    {
         let final_response = chat_response_simple(request, &namespace, text.clone());
         return Ok(Some(TimedStreamPlan {
             chunks: vec![text],
@@ -197,8 +194,8 @@ pub fn try_handle_timed_chat_turn(
 ) -> Result<Option<ChatResponse>> {
     let input = request_input(request)?;
     let namespace = request_namespace(request);
-    let mut routing = load_tool_routing_tags(config, &namespace)
-        .unwrap_or_else(|_| ToolRoutingTags::default());
+    let mut routing =
+        load_tool_routing_tags(config, &namespace).unwrap_or_else(|_| ToolRoutingTags::default());
     routing.ensure_builtin_timed_sequences();
 
     if let Some(text) = handle_reminder_turn(config, request, &routing, deliver)? {
@@ -214,7 +211,11 @@ pub fn try_handle_timed_chat_turn(
     Ok(None)
 }
 
-fn chat_response_simple(request: &ChatRequest, namespace: &ApiNamespace, content: String) -> ChatResponse {
+fn chat_response_simple(
+    request: &ChatRequest,
+    namespace: &ApiNamespace,
+    content: String,
+) -> ChatResponse {
     ChatResponse {
         message: ApiChatMessage {
             role: ApiMessageRole::Assistant,
@@ -260,7 +261,8 @@ fn handle_reminder_turn(
         namespace_api.tenant_id.clone(),
         namespace_api.user_id.clone(),
     );
-    let repository = ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let repository =
+        ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
     let now = now_unix();
     let reminder_prefix = if rule.id.trim().is_empty() {
         "reminder"
@@ -287,15 +289,19 @@ fn handle_reminder_turn(
         "draft_message".to_owned(),
         serde_json::Value::String(due_reply),
     );
-    followup.payload.insert(
-        "source_turn".to_owned(),
-        serde_json::Value::String(input),
-    );
+    followup
+        .payload
+        .insert("source_turn".to_owned(), serde_json::Value::String(input));
     followup.notes = format!("Reminder due in {delay_seconds} seconds.");
     repository.write_followup(&followup)?;
 
     if matches!(deliver, TimedDeliverMode::Interactive) {
-        spawn_reminder_worker(config.workspace_root.clone(), namespace, reminder_id, delay_seconds);
+        spawn_reminder_worker(
+            config.workspace_root.clone(),
+            namespace,
+            reminder_id,
+            delay_seconds,
+        );
     }
 
     Ok(Some(
@@ -353,15 +359,9 @@ pub fn reminder_delay_seconds(text: &str, default_delay_seconds: u64) -> Option<
         .map(|value| value as u64);
     let unit_seconds = if contains_any(text, &["毫秒", "ms"]) {
         0
-    } else if contains_any(
-        text,
-        &["小时", "钟头", "hour", "hours", "h"],
-    ) {
+    } else if contains_any(text, &["小时", "钟头", "hour", "hours", "h"]) {
         60 * 60
-    } else if contains_any(
-        text,
-        &["分钟", "分", "minute", "minutes", "min"],
-    ) {
+    } else if contains_any(text, &["分钟", "分", "minute", "minutes", "min"]) {
         60
     } else if contains_any(text, &["秒", "second", "seconds", "sec", "s"]) {
         1
@@ -568,7 +568,8 @@ pub fn timed_sequence_end(
 }
 
 fn is_count_quantity_turn(text: &str) -> bool {
-    (text.contains("个数") || text.contains("个数字") || text.contains("个")) && !text.contains("到")
+    (text.contains("个数") || text.contains("个数字") || text.contains("个"))
+        && !text.contains("到")
 }
 
 fn build_timed_sequence_values(start: i64, end: i64, rule: &TimedSequenceRule) -> Option<Vec<i64>> {

@@ -1,13 +1,13 @@
 //! 性能优化模块 - 缓存、预计算和增量更新
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 use lru::LruCache;
-use std::num::NonZeroUsize;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 
-use crate::{TagVector, TagAnalysisResult, MatchResult, MatchType};
+use crate::{MatchResult, MatchType, TagAnalysisResult, TagVector};
 
 /// 输入内容的哈希键
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -19,9 +19,9 @@ pub struct InputHashKey {
 /// 分析类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnalysisType {
-    Legacy,      // 传统分析
-    Enhanced,    // 增强分析
-    Detailed,    // 详细分析
+    Legacy,   // 传统分析
+    Enhanced, // 增强分析
+    Detailed, // 详细分析
 }
 
 /// 缓存条目
@@ -82,7 +82,7 @@ impl PerformanceOptimizer {
     pub fn new(config: CacheConfig) -> Self {
         let cache_size = NonZeroUsize::new(config.max_cache_size)
             .unwrap_or_else(|| NonZeroUsize::new(FALLBACK_CACHE_SIZE).unwrap());
-        
+
         Self {
             result_cache: LruCache::new(cache_size),
             precomputed_matches: HashMap::new(),
@@ -104,7 +104,11 @@ impl PerformanceOptimizer {
     }
 
     /// 从缓存获取结果，如果不存在则返回 None
-    pub fn get_cached_result(&mut self, input: &str, analysis_type: AnalysisType) -> Option<TagVector> {
+    pub fn get_cached_result(
+        &mut self,
+        input: &str,
+        analysis_type: AnalysisType,
+    ) -> Option<TagVector> {
         let key = InputHashKey {
             content_hash: self.compute_input_hash(input),
             analysis_type,
@@ -114,7 +118,7 @@ impl PerformanceOptimizer {
             // 检查是否过期
             let now = chrono::Utc::now();
             let age = now.timestamp() - entry.timestamp.timestamp();
-            
+
             if age < self.cache_config.cache_ttl_seconds {
                 entry.hit_count += 1;
                 if self.cache_config.enable_statistics {
@@ -156,10 +160,29 @@ impl PerformanceOptimizer {
         }
 
         let common_words = vec![
-            "create", "make", "build", "design", "develop", "implement",
-            "simple", "easy", "basic", "complex", "difficult", "advanced",
-            "urgent", "important", "critical", "routine", "normal", "standard",
-            "innovative", "creative", "original", "traditional", "conventional",
+            "create",
+            "make",
+            "build",
+            "design",
+            "develop",
+            "implement",
+            "simple",
+            "easy",
+            "basic",
+            "complex",
+            "difficult",
+            "advanced",
+            "urgent",
+            "important",
+            "critical",
+            "routine",
+            "normal",
+            "standard",
+            "innovative",
+            "creative",
+            "original",
+            "traditional",
+            "conventional",
         ];
 
         for word in common_words {
@@ -188,7 +211,8 @@ impl PerformanceOptimizer {
             }
 
             if precomputed.total_score_boost > 0.0 {
-                self.precomputed_matches.insert(word.to_string(), precomputed);
+                self.precomputed_matches
+                    .insert(word.to_string(), precomputed);
             }
         }
     }
@@ -196,10 +220,7 @@ impl PerformanceOptimizer {
     /// 获取预计算的匹配结果
     pub fn get_precomputed_matches(&self, input: &str) -> Option<&PrecomputedMatches> {
         // 简化版：只查找输入中的第一个单词
-        let first_word = input
-            .split_whitespace()
-            .next()
-            .map(|w| w.to_lowercase());
+        let first_word = input.split_whitespace().next().map(|w| w.to_lowercase());
 
         if let Some(word) = first_word {
             self.precomputed_matches.get(&word)
@@ -235,17 +256,14 @@ impl PerformanceOptimizer {
     pub fn cleanup_expired(&mut self) {
         let now = chrono::Utc::now();
         let ttl = self.cache_config.cache_ttl_seconds;
-        
+
         // 收集过期的键
-        let expired_keys: Vec<InputHashKey> = self.result_cache
+        let expired_keys: Vec<InputHashKey> = self
+            .result_cache
             .iter()
             .filter_map(|(key, entry)| {
                 let age = now.timestamp() - entry.timestamp.timestamp();
-                if age >= ttl {
-                    Some(key.clone())
-                } else {
-                    None
-                }
+                if age >= ttl { Some(key.clone()) } else { None }
             })
             .collect();
 
@@ -290,18 +308,14 @@ impl IncrementalUpdater {
     }
 
     /// 增量更新结果
-    pub fn incremental_update(
-        &mut self, 
-        input: &str, 
-        new_result: TagVector
-    ) -> Option<TagVector> {
+    pub fn incremental_update(&mut self, input: &str, new_result: TagVector) -> Option<TagVector> {
         if let Some(previous) = self.previous_results.get(input) {
-            // 计算变化程度
             let similarity = previous.cosine_similarity(&new_result);
-            
-            if similarity < (1.0 - self.change_threshold) {
+            let max_abs_diff = dimension_max_abs_difference(previous, &new_result);
+            if similarity < (1.0 - self.change_threshold) || max_abs_diff > self.change_threshold {
                 // 变化较大，更新并返回新结果
-                self.previous_results.insert(input.to_string(), new_result.clone());
+                self.previous_results
+                    .insert(input.to_string(), new_result.clone());
                 Some(new_result)
             } else {
                 // 变化不大，返回之前的结果
@@ -309,10 +323,22 @@ impl IncrementalUpdater {
             }
         } else {
             // 首次分析，存储并返回
-            self.previous_results.insert(input.to_string(), new_result.clone());
+            self.previous_results
+                .insert(input.to_string(), new_result.clone());
             Some(new_result)
         }
     }
+}
+
+fn dimension_max_abs_difference(a: &TagVector, b: &TagVector) -> f32 {
+    let mut max_d = 0.0f32;
+    for key in a.dimensions.keys().chain(b.dimensions.keys()) {
+        let d = (a.get(key) - b.get(key)).abs();
+        if d > max_d {
+            max_d = d;
+        }
+    }
+    max_d
 }
 
 #[cfg(test)]
@@ -323,20 +349,24 @@ mod tests {
     #[test]
     fn test_cache_operations() {
         let mut optimizer = PerformanceOptimizer::with_defaults();
-        
+
         // 测试缓存未命中
-        assert!(optimizer.get_cached_result("test input", AnalysisType::Enhanced).is_none());
-        
+        assert!(
+            optimizer
+                .get_cached_result("test input", AnalysisType::Enhanced)
+                .is_none()
+        );
+
         // 缓存结果
         let mut tag_vector = TagVector::new();
         tag_vector.set("test_dim", 0.8);
         optimizer.cache_result("test input", AnalysisType::Enhanced, tag_vector.clone());
-        
+
         // 测试缓存命中
         let cached = optimizer.get_cached_result("test input", AnalysisType::Enhanced);
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().get("test_dim"), 0.8);
-        
+
         // 测试统计信息
         let stats = optimizer.get_cache_stats();
         assert_eq!(stats.cache_hits, 1);
@@ -347,24 +377,24 @@ mod tests {
     #[test]
     fn test_incremental_updater() {
         let mut updater = IncrementalUpdater::new(0.1);
-        
+
         let mut vec1 = TagVector::new();
         vec1.set("test", 0.5);
-        
+
         let mut vec2 = TagVector::new();
         vec2.set("test", 0.55); // 小变化
-        
+
         let mut vec3 = TagVector::new();
         vec3.set("test", 0.8); // 大变化
-        
+
         // 首次更新
         let result1 = updater.incremental_update("input1", vec1.clone());
         assert!(result1.is_some());
-        
+
         // 小变化，应该返回之前的结果
         let result2 = updater.incremental_update("input1", vec2);
         assert_eq!(result2.unwrap().get("test"), 0.5); // 返回原值
-        
+
         // 大变化，应该返回新结果
         let result3 = updater.incremental_update("input1", vec3);
         assert_eq!(result3.unwrap().get("test"), 0.8); // 返回新值
