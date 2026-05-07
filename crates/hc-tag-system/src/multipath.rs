@@ -297,7 +297,6 @@ impl MultiPathMatcher {
         }
 
         // 使用调整后的权重进行加权平均
-        let original_weights = self.config.weights.clone();
         let mut modified_config = self.config.clone();
         modified_config.weights = adjusted_weights;
 

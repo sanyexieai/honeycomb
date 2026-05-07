@@ -46,6 +46,7 @@ impl Default for DynamicLearningConfig {
 }
 
 /// 权重优化器
+#[allow(dead_code)]
 pub struct WeightOptimizer {
     current_weights: ComponentWeights,
     weight_history: VecDeque<WeightSnapshot>,
@@ -98,6 +99,7 @@ pub struct WeightSnapshot {
 }
 
 /// 反馈处理器
+#[allow(dead_code)]
 pub struct FeedbackProcessor {
     feedback_queue: VecDeque<ProcessedFeedback>,
     aggregated_feedback: HashMap<String, FeedbackStats>,
@@ -911,6 +913,7 @@ pub struct LearningResult {
 
 /// 性能更新结果
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PerformanceUpdate {
     pub improvement: f32,
     pub current_accuracy: f32,
@@ -919,6 +922,7 @@ struct PerformanceUpdate {
 
 /// 权重更新结果
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct WeightUpdateResult {
     pub weights_changed: bool,
     pub convergence_achieved: bool,

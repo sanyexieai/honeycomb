@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    env,
     io::{BufRead, BufReader, Read},
     process::{Command, Stdio},
     rc::Rc,
@@ -1550,8 +1549,8 @@ fn send_window_message(
             .iter()
             .find(|agent| agent.binding.instance_id == to_id)
         {
-            match agent.binding.responder.as_ref() {
-                Some(responder) if responder.is_human() => {
+            if let Some(responder) = agent.binding.responder.as_ref() {
+                if responder.is_human() {
                     let request = orchestrator.build_direct_reply_request(
                         &registry_ref.runtime,
                         &agents,
@@ -1562,8 +1561,7 @@ fn send_window_message(
                     registry_ref.windows[from_index]
                         .transcript_lines
                         .push(format!("[pending] {} will reply manually", to_name));
-                }
-                Some(responder) if !responder.is_human() => {
+                } else {
                     let reply_backend = default_reply_backend();
                     match orchestrator.generate_and_post_direct_reply(
                         &reply_backend,
@@ -1587,17 +1585,17 @@ fn send_window_message(
                                 ));
                         }
                         Err(error) => {
-                            registry_ref.windows[from_index]
-                                .transcript_lines
-                                .push(format!("[llm error] {} could not reply: {error}", to_name));
+                            registry_ref.windows[from_index].transcript_lines.push(format!(
+                                "[llm error] {} could not reply: {error}",
+                                to_name
+                            ));
                         }
                     }
                 }
-                None => {
-                    registry_ref.windows[from_index]
-                        .transcript_lines
-                        .push(format!("[responder] {} has no responder bound", to_name));
-                }
+            } else {
+                registry_ref.windows[from_index]
+                    .transcript_lines
+                    .push(format!("[responder] {} has no responder bound", to_name));
             }
         }
     }
@@ -1671,8 +1669,10 @@ fn broadcast_window_message(
             let winning_agent = agents
                 .iter()
                 .find(|agent| agent.binding.instance_id == grant.instance_id);
-            match winning_agent.and_then(|agent| agent.binding.responder.as_ref()) {
-                Some(responder) if responder.is_human() => {
+            if let Some(responder) =
+                winning_agent.and_then(|agent| agent.binding.responder.as_ref())
+            {
+                if responder.is_human() {
                     let request = orchestrator.build_reply_request_for_grant(
                         &registry_ref.runtime,
                         &agents,
@@ -1684,8 +1684,7 @@ fn broadcast_window_message(
                             .transcript_lines
                             .push(format!("[pending] {} will reply manually", speaker_name));
                     }
-                }
-                Some(responder) if !responder.is_human() => {
+                } else {
                     let reply_backend = default_reply_backend();
                     match orchestrator.generate_and_post_reply(
                         &reply_backend,
@@ -1735,7 +1734,6 @@ fn broadcast_window_message(
                         }
                     }
                 }
-                None => {}
             }
         }
     }
@@ -1952,8 +1950,10 @@ fn send_channel_message(
             let winning_agent = agents
                 .iter()
                 .find(|agent| agent.binding.instance_id == grant.instance_id);
-            match winning_agent.and_then(|agent| agent.binding.responder.as_ref()) {
-                Some(responder) if responder.is_human() => {
+            if let Some(responder) =
+                winning_agent.and_then(|agent| agent.binding.responder.as_ref())
+            {
+                if responder.is_human() {
                     let request = orchestrator.build_reply_request_for_grant(
                         &registry_ref.runtime,
                         &agents,
@@ -1965,8 +1965,7 @@ fn send_channel_message(
                             .transcript_lines
                             .push(format!("[pending] {} will reply manually", speaker_name));
                     }
-                }
-                Some(responder) if !responder.is_human() => {
+                } else {
                     let reply_backend = default_reply_backend();
                     match orchestrator.generate_and_post_reply(
                         &reply_backend,
@@ -2010,7 +2009,6 @@ fn send_channel_message(
                         }
                     }
                 }
-                None => {}
             }
         }
     }
@@ -2945,15 +2943,13 @@ fn preferred_default_responder(agent_name: &str, role_name: &str) -> ResponderBi
         ResponderBinding::Llm(LlmResponderConfig {
             provider: default_provider_from_env(),
             model: default_model_from_env(),
-            system_prompt: Some(
-                render_agent_responder_system_prompt(
-                    &runtime_namespace(),
-                    agent_name,
-                    role_name,
-                    "Stay concise and collaborative.",
-                )
-                .ok(),
-            ),
+            system_prompt: render_agent_responder_system_prompt(
+                &runtime_namespace(),
+                agent_name,
+                role_name,
+                "Stay concise and collaborative.",
+            )
+            .ok(),
         })
     } else {
         ResponderBinding::Human(HumanResponderConfig::new(Some(user_id_from_env()), None))
@@ -3690,8 +3686,8 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
 
     let orchestrator = registry_ref.orchestrator.clone();
     let agents = registry_ref.agents.clone();
-    match assigned_agent.binding.responder.as_ref() {
-        Some(responder) if responder.is_human() => {
+    if let Some(responder) = assigned_agent.binding.responder.as_ref() {
+        if responder.is_human() {
             let request = orchestrator.build_direct_reply_request(
                 &registry_ref.runtime,
                 &agents,
@@ -3702,8 +3698,7 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
             registry_ref.windows[source_index]
                 .transcript_lines
                 .push(format!("[pending] {target_name} will execute manually"));
-        }
-        Some(responder) if !responder.is_human() => {
+        } else {
             let reply_backend = default_reply_backend();
             match orchestrator.generate_and_post_direct_reply(
                 &reply_backend,
@@ -3723,30 +3718,23 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
                             reply.id, source_name, reply.body
                         ));
                     }
-                    registry_ref.windows[source_index]
-                        .transcript_lines
-                        .push(format!(
-                            "[recv {}] {} -> you: {}",
-                            reply.id, target_name, reply.body
-                        ));
+                    registry_ref.windows[source_index].transcript_lines.push(format!(
+                        "[recv {}] {} -> you: {}",
+                        reply.id, target_name, reply.body
+                    ));
                 }
                 Err(error) => {
-                    registry_ref.windows[source_index]
-                        .transcript_lines
-                        .push(format!(
-                            "[llm error] {target_name} could not execute: {error}"
-                        ));
+                    registry_ref.windows[source_index].transcript_lines.push(format!(
+                        "[llm error] {target_name} could not execute: {error}"
+                    ));
                 }
             }
         }
-        None => {
-            registry_ref.windows[source_index]
-                .transcript_lines
-                .push(format!(
-                    "[responder] {} has no responder bound",
-                    target_name
-                ));
-        }
+    } else {
+        registry_ref.windows[source_index].transcript_lines.push(format!(
+            "[responder] {} has no responder bound",
+            target_name
+        ));
     }
 
     refresh_persisted_task_artifacts(registry_ref)?;
@@ -3916,8 +3904,8 @@ fn execute_work_item(
 
         let orchestrator = registry_ref.orchestrator.clone();
         let agents = registry_ref.agents.clone();
-        match assigned_agent.binding.responder.as_ref() {
-            Some(responder) if responder.is_human() => {
+        if let Some(responder) = assigned_agent.binding.responder.as_ref() {
+            if responder.is_human() {
                 let request = orchestrator.build_direct_reply_request(
                     &registry_ref.runtime,
                     &agents,
@@ -3928,8 +3916,7 @@ fn execute_work_item(
                 registry_ref.windows[source_index]
                     .transcript_lines
                     .push(format!("[pending] {target_name} will execute manually"));
-            }
-            Some(responder) if !responder.is_human() => {
+            } else {
                 let reply_backend = default_reply_backend();
                 match orchestrator.generate_and_post_direct_reply(
                     &reply_backend,
@@ -3949,30 +3936,23 @@ fn execute_work_item(
                                 reply.id, source_name, reply.body
                             ));
                         }
-                        registry_ref.windows[source_index]
-                            .transcript_lines
-                            .push(format!(
-                                "[recv {}] {} -> you: {}",
-                                reply.id, target_name, reply.body
-                            ));
+                        registry_ref.windows[source_index].transcript_lines.push(format!(
+                            "[recv {}] {} -> you: {}",
+                            reply.id, target_name, reply.body
+                        ));
                     }
                     Err(error) => {
-                        registry_ref.windows[source_index]
-                            .transcript_lines
-                            .push(format!(
-                                "[llm error] {target_name} could not execute: {error}"
-                            ));
+                        registry_ref.windows[source_index].transcript_lines.push(format!(
+                            "[llm error] {target_name} could not execute: {error}"
+                        ));
                     }
                 }
             }
-            None => {
-                registry_ref.windows[source_index]
-                    .transcript_lines
-                    .push(format!(
-                        "[responder] {} has no responder bound",
-                        target_name
-                    ));
-            }
+        } else {
+            registry_ref.windows[source_index].transcript_lines.push(format!(
+                "[responder] {} has no responder bound",
+                target_name
+            ));
         }
 
         refresh_persisted_task_artifacts(&mut registry_ref)?;

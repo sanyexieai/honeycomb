@@ -147,6 +147,7 @@ pub enum AdaptationType {
 }
 
 /// 个性化管理器
+#[allow(dead_code)]
 pub struct PersonalizationManager {
     workspace_root: PathBuf,
     user_profiles: HashMap<String, UserProfile>,
@@ -468,6 +469,7 @@ impl PersonalizationManager {
     }
 
     /// 计算个性化置信度
+    #[allow(dead_code)]
     fn calculate_personalization_confidence(&self, profile: &UserProfile) -> f32 {
         let feedback_factor = (profile.learning_state.feedback_samples as f32 / 50.0).min(1.0);
         let success_factor = if profile.usage_statistics.total_analyses > 0 {
@@ -562,6 +564,7 @@ impl LearningEngine {
         adjustment
     }
 
+    #[allow(dead_code)]
     fn learn_from_feedback(
         &self,
         learning_state: &mut LearningState,
@@ -617,6 +620,7 @@ impl AdaptationEngine {
         Self
     }
 
+    #[allow(dead_code)]
     fn adapt_preferences(
         &self,
         preferences: &mut UserPreferences,
@@ -650,6 +654,7 @@ impl AdaptationEngine {
 }
 
 /// 适应结果
+#[allow(dead_code)]
 struct AdaptationResult {
     adaptation_type: AdaptationType,
     description: String,

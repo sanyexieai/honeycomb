@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::{DimensionAnalysisResult, MatchResult, MatchType, TagVector};
+use crate::{DimensionAnalysisResult, MatchType};
 
 /// 分类解释结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,7 +431,7 @@ mod tests {
     fn test_explanation_generation() {
         let mut dimension_details = BTreeMap::new();
 
-        let mut creativity_result = DimensionAnalysisResult {
+        let creativity_result = DimensionAnalysisResult {
             dimension_id: "creativity_level".to_string(),
             final_score: 0.8,
             high_matches: vec![MatchResult {

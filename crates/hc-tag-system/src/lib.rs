@@ -1857,7 +1857,7 @@ impl TagSystemManager {
     pub fn analyze_input_tags_hybrid(
         &mut self,
         input: &str,
-        user_id: Option<&str>,
+        _user_id: Option<&str>,
     ) -> HybridAnalysisResult {
         let start_time = std::time::Instant::now();
 
@@ -2385,7 +2385,7 @@ impl TagSystemManager {
     fn analyze_with_custom_weights(
         &mut self,
         input: &str,
-        user_id: Option<&str>,
+        _user_id: Option<&str>,
         weights: &ComponentWeights,
     ) -> HybridAnalysisResult {
         let start_time = std::time::Instant::now();
@@ -3142,7 +3142,7 @@ impl TagSystemManager {
             }
             "Video" => {
                 // 视频结合了音频和视觉，给予更高的置信度
-                for (dimension, value) in fused.dimensions.iter_mut() {
+                for (_dimension, value) in fused.dimensions.iter_mut() {
                     *value = (*value * 1.1).min(1.0);
                 }
             }
@@ -3577,7 +3577,7 @@ impl TagSystemManager {
                         self.analyze_input_tags_hybrid(input, None).final_result
                     }
                     AlgorithmVariant::Multimodal => {
-                        if let Some(ref multimodal_manager) = self.multimodal_manager {
+                        if self.multimodal_manager.is_some() {
                             let multimodal_input =
                                 crate::multimodal::MultimodalInput::Text(input.clone());
                             match self.analyze_multimodal_input(&multimodal_input) {
@@ -4468,7 +4468,6 @@ keywords_high: ["create", "invent", "design", "innovate"]
 
     #[test]
     fn test_personalization() {
-        use chrono::Utc;
         use std::fs;
         use tempfile::TempDir;
 
@@ -5291,7 +5290,6 @@ keywords_high: ["create", "invent", "design", "innovate"]
         assert_eq!(result.analysis_result.input, input);
         assert!(result.reward >= -1.0 && result.reward <= 1.0);
         assert!(!result.action_recommendation.reasoning.is_empty());
-        assert!(result.rl_statistics.total_steps >= 0);
 
         println!("强化学习分析结果:");
         println!("  输入: {}", result.analysis_result.input);

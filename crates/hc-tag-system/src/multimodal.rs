@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::TagVector;
 
 /// 多模态分析管理器
+#[allow(dead_code)]
 pub struct MultimodalAnalysisManager {
     workspace_root: PathBuf,
     config: MultimodalConfig,
@@ -848,6 +849,7 @@ impl DocumentProcessor {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DocumentStructure {
     page_count: usize,
     section_count: usize,
@@ -1070,6 +1072,7 @@ impl VideoProcessor {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct KeyFrame {
     timestamp: f32,
     scene_description: String,

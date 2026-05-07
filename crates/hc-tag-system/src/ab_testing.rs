@@ -4,9 +4,9 @@ use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use crate::{AnalysisType, HybridAnalysisResult, MultimodalTagAnalysisResult, TagVector};
+use crate::TagVector;
 
 /// A/B测试管理器
 pub struct ABTestingManager {
@@ -280,7 +280,7 @@ impl SignificanceTest for TTest {
         let se = (pooled_var * (1.0 / n1 + 1.0 / n2)).sqrt();
 
         let t_stat = (mean_treatment - mean_control) / se;
-        let df = n1 + n2 - 2.0;
+        let _df = n1 + n2 - 2.0;
 
         // 简化的p值计算（实际应该使用t分布）
         let p_value = 2.0 * (1.0 - Self::normal_cdf(t_stat.abs()));
@@ -718,7 +718,7 @@ impl ABTestingManager {
                     .find(|m| m.is_primary)
                     .map(|m| &m.name);
 
-                if let Some(metric_name) = primary_metric {
+                if primary_metric.is_some() {
                     let mut best_variant = 0;
                     let mut best_value = f64::NEG_INFINITY;
 
@@ -747,14 +747,13 @@ impl ABTestingManager {
         let variant_count = experiment.variants.len();
 
         // 为每个变体生成beta分布的采样值
-        let mut rng = rand::thread_rng();
         let mut best_variant = 0;
         let mut best_sample = 0.0;
 
         for i in 0..variant_count {
-            // 简化：使用固定的alpha和beta参数
-            let alpha = 1.0;
-            let beta = 1.0;
+            // 简化：使用固定的 alpha/beta（本应驱动 Beta 采样；此处用均匀随机近似）
+            let _alpha = 1.0;
+            let _beta = 1.0;
             let sample: f64 = rand::random::<f64>(); // 简化的beta采样
 
             if sample > best_sample {
@@ -919,7 +918,7 @@ impl ABTestingManager {
         &self,
         experiment: &Experiment,
         variant_data: &HashMap<String, Vec<f64>>,
-        statistical_tests: &[StatisticalTestResult],
+        _statistical_tests: &[StatisticalTestResult],
     ) -> ResultsSummary {
         let mut variant_performance = HashMap::new();
         let mut total_samples = 0;
@@ -1128,7 +1127,7 @@ mod tests {
         assert_eq!(variant1, variant2);
 
         // 测试不同用户可能有不同分配
-        let variant3 = manager
+        let _variant3 = manager
             .assign_variant(&experiment_id, Some("user2"))
             .unwrap();
         // variant3 可能等于或不等于 variant1，取决于哈希

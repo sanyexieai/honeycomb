@@ -1,4 +1,4 @@
-use hc_tag_system::{TagSystemManager, TagVector};
+use hc_tag_system::TagSystemManager;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

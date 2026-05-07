@@ -269,6 +269,16 @@ trait ToolSelector {
     fn select(&self, input: &str, catalog: &ToolCatalog) -> Result<ToolSelection>;
 }
 
+fn select_cli_tools(input: &str, catalog: &ToolCatalog) -> Result<ToolSelection> {
+    if let Some(tag_manager) = get_tag_system_manager() {
+        TagAwareToolSelector::new(5)
+            .with_tag_manager(tag_manager)
+            .select(input, catalog)
+    } else {
+        KeywordToolSelector::default().select(input, catalog)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KeywordToolSelector {
     limit: usize,
@@ -281,15 +291,15 @@ impl Default for KeywordToolSelector {
 }
 
 /// 标签感知工具选择器 - 结合关键词匹配和标签相似度
-struct TagAwareToolSelector {
+struct TagAwareToolSelector<'a> {
     limit: usize,
-    tag_manager: Option<TagSystemManager>,
+    tag_manager: Option<&'a TagSystemManager>,
     keyword_weight: f32,
     tag_weight: f32,
 }
 
-impl TagAwareToolSelector {
-    pub fn new(limit: usize) -> Self {
+impl<'a> TagAwareToolSelector<'a> {
+    fn new(limit: usize) -> Self {
         Self {
             limit,
             tag_manager: None,
@@ -298,24 +308,18 @@ impl TagAwareToolSelector {
         }
     }
 
-    pub fn with_tag_manager(mut self, tag_manager: TagSystemManager) -> Self {
+    fn with_tag_manager(mut self, tag_manager: &'a TagSystemManager) -> Self {
         self.tag_manager = Some(tag_manager);
-        self
-    }
-
-    pub fn with_weights(mut self, keyword_weight: f32, tag_weight: f32) -> Self {
-        self.keyword_weight = keyword_weight;
-        self.tag_weight = tag_weight;
         self
     }
 }
 
-impl ToolSelector for TagAwareToolSelector {
+impl ToolSelector for TagAwareToolSelector<'_> {
     fn select(&self, input: &str, catalog: &ToolCatalog) -> Result<ToolSelection> {
         let mut candidates: Vec<ToolSelectionCandidate> = Vec::new();
 
         // 分析输入生成标签向量
-        let query_tags = if let Some(ref tag_manager) = self.tag_manager {
+        let query_tags = if let Some(tag_manager) = self.tag_manager {
             tag_manager.analyze_input_tags(input)
         } else {
             TagVector::new()
@@ -326,7 +330,7 @@ impl ToolSelector for TagAwareToolSelector {
             let keyword_score = score_tool_for_goal(tool, input) as f32;
 
             // 标签相似度评分
-            let tag_score = if let Some(ref tag_manager) = self.tag_manager {
+            let tag_score = if let Some(tag_manager) = self.tag_manager {
                 let similarity =
                     tag_manager.calculate_entity_similarity(&query_tags, &tool.id, "tools");
                 similarity * 100.0 // 转换为与keyword_score相同的量级
@@ -731,8 +735,6 @@ fn handle_chat(args: &[String]) -> Result<()> {
             &memory_options.namespace,
             capture_options.room_id.as_deref(),
         )?;
-        // 暂时使用传统关键词选择器，后续可以扩展为标签感知选择器
-        let selector = KeywordToolSelector::default();
         let selection_input = selection_input_from_history(&history, trimmed);
         let recalled_memories = if memory_options.enabled {
             let query = memory_options.build_query(trimmed);
@@ -749,13 +751,14 @@ fn handle_chat(args: &[String]) -> Result<()> {
             .count()
             + 1;
         let intent_resolution = cli_intent_router().resolve(&IntentInput { user_text: trimmed });
+        let tool_selection = select_cli_tools(&selection_input, &catalog)?;
         let mut frame = TurnFrame::new(
             trimmed.to_owned(),
             memory_options.namespace.clone(),
             capture_options.room_id.clone(),
             turn_index,
             selection_input.clone(),
-            selector.select(&selection_input, &catalog)?,
+            tool_selection,
             recalled_memories,
             intent_resolution,
         );

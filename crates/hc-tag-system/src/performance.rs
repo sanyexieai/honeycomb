@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 
-use crate::{MatchResult, MatchType, TagAnalysisResult, TagVector};
+use crate::{MatchResult, MatchType, TagVector};
 
 /// 输入内容的哈希键
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -194,7 +194,7 @@ impl PerformanceOptimizer {
             };
 
             // 为每个维度计算匹配结果
-            for (dimension, keyword_lists) in keywords {
+            for (_dimension, keyword_lists) in keywords {
                 // 这里简化处理，实际应该用 FuzzyMatcher
                 if keyword_lists.contains(&word.to_string()) {
                     let match_result = MatchResult {

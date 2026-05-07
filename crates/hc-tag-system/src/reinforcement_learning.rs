@@ -382,6 +382,7 @@ impl PolicyNetwork {
 }
 
 /// 分析环境
+#[allow(dead_code)]
 pub struct AnalysisEnvironment {
     current_episode: usize,
     episode_rewards: Vec<f32>,
@@ -402,6 +403,7 @@ pub struct Episode {
 }
 
 /// 强化学习性能跟踪器
+#[allow(dead_code)]
 pub struct RLPerformanceTracker {
     cumulative_reward: f32,
     episode_rewards: VecDeque<f32>,
