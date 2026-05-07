@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use hc_bootstrap::wall_clock_ms;
 use hc_capability::CapabilityRepository;
 use hc_context::{RoomMemoryWriteRequest, persist_room_memory};
 use hc_memory::{MemoryNamespace, MemoryRepository, MemoryVisibility};
@@ -171,7 +171,7 @@ pub fn persist_task_artifacts(
         task.namespace.user_id.clone(),
     );
     let store = WorkspaceStore::new(workspace_root.as_ref().to_path_buf());
-    let timestamp = current_timestamp_label();
+    let timestamp = wall_clock_ms().to_string();
     let task_slug = slugify(&task.id);
     let room_id = task_room_id(task);
 
@@ -514,14 +514,6 @@ fn task_plan_status_label(status: &TaskPlanStatus) -> &'static str {
         TaskPlanStatus::Drafted => "drafted",
         TaskPlanStatus::Approved => "approved",
     }
-}
-
-fn current_timestamp_label() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_millis()
-        .to_string()
 }
 
 fn slugify(value: &str) -> String {

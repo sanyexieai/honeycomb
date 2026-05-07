@@ -24,4 +24,9 @@ impl ServiceConfig {
             workspace_root: workspace_root.into(),
         }
     }
+
+    /// 使用 [`hc_bootstrap::workspace_root`]（`HC_WORKSPACE_ROOT` 与默认目录）构造配置。
+    pub fn from_env() -> Self {
+        Self::new(hc_bootstrap::workspace_root())
+    }
 }

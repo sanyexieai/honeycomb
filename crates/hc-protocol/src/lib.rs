@@ -48,6 +48,15 @@ impl Default for ApiNamespace {
     }
 }
 
+impl ApiNamespace {
+    pub fn from_tenant_user(tenant_id: impl Into<String>, user_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            user_id: user_id.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ApiMemoryQuery {
     #[serde(default)]

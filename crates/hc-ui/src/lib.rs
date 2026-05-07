@@ -7,7 +7,6 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -1385,7 +1384,7 @@ fn queue_human_reply(registry_ref: &mut UiRegistry, request: ReplyRequest) -> Re
         .clone()
         .unwrap_or_else(|| "default".to_owned());
     let repository = HumanInboxRepository::with_namespace(
-        workspace_root(),
+        hc_bootstrap::workspace_root(),
         hc_store::store::WorkspaceNamespace::new(
             registry_ref.namespace.tenant_id.clone(),
             responder_user_ref.clone(),
@@ -1450,7 +1449,7 @@ fn post_human_reply(
         let request = registry_ref.windows[source_index].pending_replies.remove(0);
         let source_name = registry_ref.windows[source_index].instance_name.clone();
         let repository = HumanInboxRepository::with_namespace(
-            workspace_root(),
+            hc_bootstrap::workspace_root(),
             hc_store::store::WorkspaceNamespace::new(
                 registry_ref.namespace.tenant_id.clone(),
                 registry_ref.namespace.user_id.clone(),
@@ -2271,7 +2270,7 @@ fn sync_external_human_replies(registry: &Rc<RefCell<UiRegistry>>) -> Result<boo
     let answered_items = {
         let registry_ref = registry.borrow();
         let repository = HumanInboxRepository::with_namespace(
-            workspace_root(),
+            hc_bootstrap::workspace_root(),
             hc_store::store::WorkspaceNamespace::new(
                 registry_ref.namespace.tenant_id.clone(),
                 registry_ref.namespace.user_id.clone(),
@@ -2288,7 +2287,7 @@ fn sync_external_human_replies(registry: &Rc<RefCell<UiRegistry>>) -> Result<boo
     let repository = {
         let registry_ref = registry.borrow();
         HumanInboxRepository::with_namespace(
-            workspace_root(),
+            hc_bootstrap::workspace_root(),
             hc_store::store::WorkspaceNamespace::new(
                 registry_ref.namespace.tenant_id.clone(),
                 registry_ref.namespace.user_id.clone(),
@@ -2525,9 +2524,9 @@ fn refresh_persisted_task_artifacts(registry: &mut UiRegistry) -> Result<()> {
         registry.namespace.tenant_id.clone(),
         registry.namespace.user_id.clone(),
     );
-    persist_task_artifacts(workspace_root(), &task, &registry.task_plan)?;
+    persist_task_artifacts(hc_bootstrap::workspace_root(), &task, &registry.task_plan)?;
     registry.task_artifacts = query_task_artifacts(
-        workspace_root(),
+        hc_bootstrap::workspace_root(),
         &namespace,
         &hc_agent::TaskArtifactQuery::default().for_task(registry.task_id.clone()),
     )?;
@@ -4236,14 +4235,7 @@ fn summarize_task_title(task_goal: &str) -> String {
 }
 
 fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn workspace_root() -> std::path::PathBuf {
-    std::path::PathBuf::from("workspace")
+    hc_bootstrap::wall_clock_ms()
 }
 
 fn default_llm_registry() -> ProviderRegistry {

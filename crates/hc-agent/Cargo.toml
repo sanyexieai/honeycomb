@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+hc-bootstrap = { path = "../hc-bootstrap" }
 serde.workspace = true
 hc-core = { path = "../hc-core" }
 hc-capability = { path = "../hc-capability" }

@@ -1868,6 +1868,7 @@ name = "hc-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-bootstrap",
  "hc-capability",
  "hc-claim",
  "hc-context",
@@ -1924,6 +1925,7 @@ name = "hc-bootstrap"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-protocol",
  "tracing-subscriber",
 ]
 
@@ -1984,6 +1986,7 @@ dependencies = [
  "hc-llm",
  "hc-memory",
  "hc-persona",
+ "hc-protocol",
  "hc-store",
  "hc-toolchain",
  "hc-trace",
@@ -1996,6 +1999,7 @@ name = "hc-conversation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-bootstrap",
  "hc-store",
  "serde",
  "serde_json",
@@ -2047,6 +2051,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hc-persona",
+ "hc-protocol",
  "hc-store",
  "hc-trace",
  "serde",
@@ -2087,6 +2092,7 @@ name = "hc-scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-bootstrap",
  "hc-core",
  "hc-store",
  "serde",
@@ -2099,6 +2105,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hc-agent",
+ "hc-bootstrap",
  "hc-capability",
  "hc-context",
  "hc-conversation",
@@ -2131,6 +2138,7 @@ name = "hc-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-bootstrap",
  "hc-protocol",
  "rusqlite",
  "serde",
@@ -2167,6 +2175,7 @@ name = "hc-toolchain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hc-bootstrap",
  "hc-capability",
  "hc-store",
  "reqwest 0.12.28",
@@ -2178,6 +2187,7 @@ dependencies = [
 name = "hc-trace"
 version = "0.1.0"
 dependencies = [
+ "hc-bootstrap",
  "hc-responder",
  "hc-store",
  "serde",

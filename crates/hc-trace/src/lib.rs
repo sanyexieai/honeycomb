@@ -8,7 +8,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityItemView {
@@ -140,7 +139,7 @@ impl TraceEvent {
     ) -> Self {
         Self {
             id: new_trace_id("evt"),
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: hc_bootstrap::wall_clock_ms() as u128,
             level,
             component: component.into(),
             stage: stage.into(),
@@ -374,14 +373,7 @@ fn merge_trace_context(mut event: TraceEvent) -> TraceEvent {
 
 pub fn new_trace_id(prefix: &str) -> String {
     let sequence = TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}.{}.{}", current_timestamp_ms(), sequence)
-}
-
-fn current_timestamp_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    format!("{prefix}.{}.{}", hc_bootstrap::wall_clock_ms() as u128, sequence)
 }
 
 pub fn agent_code_from(role: &str, instance_id: &str) -> String {

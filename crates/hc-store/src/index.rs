@@ -135,7 +135,7 @@ impl RebuildableIndex for LocalJsonVectorIndex {
             })?;
         }
         let payload = LocalVectorIndexPayload {
-            generated_at_ms: current_timestamp_ms(),
+            generated_at_ms: hc_bootstrap::wall_clock_ms(),
             namespace: namespace.clone(),
             documents: source.clone(),
         };
@@ -315,13 +315,6 @@ fn normalize_vector(vector: &mut [f32]) {
     for value in vector {
         *value /= norm;
     }
-}
-
-fn current_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[allow(dead_code)]

@@ -3,7 +3,7 @@
 pub mod runtime;
 
 use anyhow::Result;
-use hc_bootstrap::{tenant_id_from_env, user_id_from_env};
+use hc_bootstrap::{tenant_id_from_env, user_id_from_env, wall_clock_ms};
 use hc_capability::CapabilityProfile;
 use hc_llm::{
     ChatMessage, GenerateRequest, GenerateResponse, LlmError, MessageRole, ProviderRegistry,
@@ -2901,11 +2901,7 @@ pub fn workspace_namespace_from_memory_namespace(
 pub fn default_workspace_root() -> &'static Path {
     static WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
     WORKSPACE_ROOT
-        .get_or_init(|| {
-            env::var("HC_WORKSPACE_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("workspace"))
-        })
+        .get_or_init(hc_bootstrap::workspace_root)
         .as_path()
 }
 
@@ -4964,10 +4960,7 @@ fn asset_confidence(asset: &AssetView) -> u16 {
 }
 
 fn current_unix_timestamp_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
+    wall_clock_ms() as u128
 }
 
 fn compiled_tool_asset_form(asset: &AssetView) -> MemoryAssetForm {
@@ -5261,10 +5254,7 @@ fn memory_layer_from_label(label: &str) -> Option<MemoryLayer> {
 }
 
 fn default_room_asset_file_name(request: &RoomMemoryWriteRequest) -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_millis();
+    let millis = current_unix_timestamp_ms();
     format!(
         "min.{}.{}.md",
         millis,
@@ -5273,10 +5263,7 @@ fn default_room_asset_file_name(request: &RoomMemoryWriteRequest) -> String {
 }
 
 fn default_room_asset_id(request: &RoomMemoryWriteRequest) -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_millis();
+    let millis = current_unix_timestamp_ms();
     format!(
         "asset.{}.{}.{}",
         request.room_id,
@@ -5600,10 +5587,7 @@ fn archive_managed_prompt_revision(
     kind: ManagedPromptKind,
     previous: &MemoryRoomAsset,
 ) -> Result<MemoryRoomAsset> {
-    let revision_stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_millis();
+    let revision_stamp = current_unix_timestamp_ms();
     let managed_path = managed_prompt_relative_path(kind);
     let base_name = managed_path
         .file_stem()

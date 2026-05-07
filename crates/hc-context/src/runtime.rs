@@ -8,8 +8,7 @@ use hc_store::store::WorkspaceNamespace;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const DEFAULT_TENANT_ID: &str = "local";
-pub const DEFAULT_USER_ID: &str = "default";
+pub use hc_protocol::{DEFAULT_TENANT_ID, DEFAULT_USER_ID};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]

@@ -11,7 +11,6 @@ pub mod store {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct WorkspaceNamespace {
@@ -28,7 +27,7 @@ pub mod store {
         }
 
         pub fn local_default() -> Self {
-            Self::new("local", "default")
+            Self::new(hc_protocol::DEFAULT_TENANT_ID, hc_protocol::DEFAULT_USER_ID)
         }
 
         pub fn scoped_prefix(&self) -> PathBuf {
@@ -378,7 +377,7 @@ pub mod store {
             }
 
             let index = MarkdownIndex {
-                generated_at_ms: current_timestamp_ms(),
+                generated_at_ms: hc_bootstrap::wall_clock_ms(),
                 namespace: namespace.clone(),
                 documents,
             };
@@ -1127,10 +1126,25 @@ pub mod store {
         path.as_ref().to_string_lossy().replace('\\', "/")
     }
 
-    fn current_timestamp_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_millis() as u64
+}
+
+use crate::store::WorkspaceNamespace;
+use hc_protocol::ApiNamespace;
+
+impl From<&WorkspaceNamespace> for ApiNamespace {
+    fn from(ns: &WorkspaceNamespace) -> Self {
+        Self {
+            tenant_id: ns.tenant_id.clone(),
+            user_id: ns.user_id.clone(),
+        }
+    }
+}
+
+impl From<WorkspaceNamespace> for ApiNamespace {
+    fn from(ns: WorkspaceNamespace) -> Self {
+        Self {
+            tenant_id: ns.tenant_id,
+            user_id: ns.user_id,
+        }
     }
 }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -596,10 +596,7 @@ fn render_mcp_tool_cache_body(cache: &McpToolCache) -> String {
 }
 
 fn current_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+    hc_bootstrap::unix_timestamp_secs()
 }
 
 pub fn seed_tool_rg() -> ToolSpec {

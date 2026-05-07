@@ -11,6 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 hc-bootstrap = { path = "../hc-bootstrap" }
 hc-llm = { path = "../hc-llm" }
+hc-protocol = { path = "../hc-protocol" }
 hc-capability = { path = "../hc-capability" }
 hc-memory = { path = "../hc-memory" }
 hc-persona = { path = "../hc-persona" }

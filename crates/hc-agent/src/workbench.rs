@@ -1,10 +1,10 @@
 use anyhow::Result;
+use hc_bootstrap::wall_clock_ms;
 use hc_core::{
     ChannelRecord, MessageRecord, MessageRoute, NominationStatus, RuntimeNamespace,
     RuntimeSupervisor, SessionRecord,
 };
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     AgentPlan, ChannelConversation, ConversationParticipant, MaterializedAgent, TaskPlan,
@@ -50,7 +50,7 @@ impl AgentWorkbench {
         title: impl Into<String>,
     ) -> String {
         let id = format!("conversation.{:04}", self.channel_conversations.len() + 1);
-        let now = current_timestamp_ms();
+        let now = wall_clock_ms();
         let mut conversation =
             ChannelConversation::new(id.clone(), self.session.id.clone(), channel_id, title, now);
         conversation.activate(now);
@@ -150,8 +150,8 @@ impl AgentWorkbench {
         let message_id = conversation
             .last_message_id
             .clone()
-            .unwrap_or_else(|| format!("turn.{}", current_timestamp_ms()));
-        conversation.open_turn(message_id, current_timestamp_ms());
+            .unwrap_or_else(|| format!("turn.{}", wall_clock_ms()));
+        conversation.open_turn(message_id, wall_clock_ms());
         Ok(())
     }
 
@@ -161,7 +161,7 @@ impl AgentWorkbench {
             .iter_mut()
             .find(|conversation| conversation.id == conversation_id)
             .ok_or_else(|| anyhow::anyhow!("conversation not found: {conversation_id}"))?;
-        conversation.resolve_turn(current_timestamp_ms());
+        conversation.resolve_turn(wall_clock_ms());
         Ok(())
     }
 
@@ -188,7 +188,7 @@ impl AgentWorkbench {
             .find(|conversation| conversation.id == conversation_id)
             .ok_or_else(|| anyhow::anyhow!("conversation not found: {conversation_id}"))?;
 
-        conversation.open_turn(message.id.clone(), current_timestamp_ms());
+        conversation.open_turn(message.id.clone(), wall_clock_ms());
 
         if let Ok(nomination) = runtime.nomination_for_message(&message.id) {
             match nomination.status {
@@ -196,7 +196,7 @@ impl AgentWorkbench {
                     conversation.turn_state = crate::ConversationTurnState::Open;
                 }
                 NominationStatus::Granted | NominationStatus::Exhausted => {
-                    conversation.resolve_turn(current_timestamp_ms());
+                    conversation.resolve_turn(wall_clock_ms());
                 }
             }
         }
@@ -236,10 +236,3 @@ pub fn bootstrap_task_workbench(
 #[cfg(test)]
 #[path = "../tests/unit/workbench.rs"]
 mod tests;
-
-fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}

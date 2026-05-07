@@ -2,12 +2,13 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 
-pub const DEFAULT_TENANT_ID: &str = "local";
-pub const DEFAULT_USER_ID: &str = "default";
+pub use hc_protocol::{DEFAULT_TENANT_ID, DEFAULT_USER_ID};
+
 pub const DEFAULT_WORKSPACE_ROOT: &str = "workspace";
 
 pub fn default_tenant_id() -> String {
@@ -30,6 +31,22 @@ pub fn workspace_root() -> PathBuf {
     env::var("HC_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_WORKSPACE_ROOT))
+}
+
+/// Unix 纪元以来的整秒数（墙钟；异常时返回 0）。
+pub fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// 当前系统时间的 Unix 毫秒时间戳（单调性不保证，仅用于墙钟记录）。
+pub fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn env_file_path() -> Result<PathBuf> {

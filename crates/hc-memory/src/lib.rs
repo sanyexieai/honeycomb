@@ -2821,3 +2821,21 @@ impl RoomCapabilityResolver {
         Ok(())
     }
 }
+
+impl From<&MemoryNamespace> for hc_protocol::ApiNamespace {
+    fn from(ns: &MemoryNamespace) -> Self {
+        Self {
+            tenant_id: ns.tenant_id.clone(),
+            user_id: ns.user_id.clone(),
+        }
+    }
+}
+
+impl From<MemoryNamespace> for hc_protocol::ApiNamespace {
+    fn from(ns: MemoryNamespace) -> Self {
+        Self {
+            tenant_id: ns.tenant_id,
+            user_id: ns.user_id,
+        }
+    }
+}

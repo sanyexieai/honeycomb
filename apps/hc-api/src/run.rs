@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     env,
     net::SocketAddr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -27,7 +27,7 @@ use hc_behavior::{
 };
 use hc_bootstrap::{
     default_tenant_id, default_user_id, init_console_tracing, load_local_env_file,
-    tenant_id_from_env, user_id_from_env, workspace_root,
+    tenant_id_from_env, user_id_from_env, wall_clock_ms, workspace_root,
 };
 use hc_conversation::{ConversationRepository, now_unix};
 use hc_memory::{
@@ -391,7 +391,7 @@ pub async fn serve() -> Result<()> {
     init_console_tracing();
     let runtime_config = ApiRuntimeConfig::from_env()?;
     let state = AppState {
-        service: ServiceConfig::new(workspace_root()),
+        service: ServiceConfig::from_env(),
     };
     start_scheduler_loop_if_enabled(state.service.clone(), runtime_config.scheduler_tick_seconds);
     let bind_addr = runtime_config.bind_addr;
@@ -565,13 +565,6 @@ async fn human_inbox_complete(
     .map_err(|error| ApiError(anyhow!("human inbox complete worker failed: {error}")))?
     .map_err(ApiError::from)?;
     Ok(Json(json!({ "path": path })))
-}
-
-fn wall_clock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 async fn conversation_proposal_draft(

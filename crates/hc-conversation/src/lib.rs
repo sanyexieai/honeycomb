@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use hc_store::store::{StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
@@ -608,10 +607,7 @@ impl AgentTurnProposalFrontmatter {
 }
 
 pub fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+    hc_bootstrap::unix_timestamp_secs()
 }
 
 fn validate_event(event: &ConversationEvent) -> Result<()> {
