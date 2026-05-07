@@ -6,18 +6,30 @@ use std::{
 
 use anyhow::{Context, Result};
 
+pub const DEFAULT_TENANT_ID: &str = "local";
+pub const DEFAULT_USER_ID: &str = "default";
+pub const DEFAULT_WORKSPACE_ROOT: &str = "workspace";
+
 pub fn default_tenant_id() -> String {
-    "local".to_owned()
+    DEFAULT_TENANT_ID.to_owned()
 }
 
 pub fn default_user_id() -> String {
-    "default".to_owned()
+    DEFAULT_USER_ID.to_owned()
+}
+
+pub fn tenant_id_from_env() -> String {
+    env::var("HC_TENANT_ID").unwrap_or_else(|_| default_tenant_id())
+}
+
+pub fn user_id_from_env() -> String {
+    env::var("HC_USER_ID").unwrap_or_else(|_| default_user_id())
 }
 
 pub fn workspace_root() -> PathBuf {
     env::var("HC_WORKSPACE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("workspace"))
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_WORKSPACE_ROOT))
 }
 
 pub fn env_file_path() -> Result<PathBuf> {

@@ -3,6 +3,7 @@
 pub mod runtime;
 
 use anyhow::Result;
+use hc_bootstrap::{tenant_id_from_env, user_id_from_env};
 use hc_capability::CapabilityProfile;
 use hc_llm::{
     ChatMessage, GenerateRequest, GenerateResponse, LlmError, MessageRole, ProviderRegistry,
@@ -564,9 +565,7 @@ impl ChatMemoryOptions {
 }
 
 pub fn runtime_memory_namespace_from_env() -> MemoryNamespace {
-    let tenant_id = env::var("HC_TENANT_ID").unwrap_or_else(|_| "local".to_owned());
-    let user_id = env::var("HC_USER_ID").unwrap_or_else(|_| "default".to_owned());
-    MemoryNamespace::new(tenant_id, user_id)
+    MemoryNamespace::new(tenant_id_from_env(), user_id_from_env())
 }
 
 pub fn default_chat_memory_enabled_from_env() -> bool {

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State,
+        Extension, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -19,11 +19,14 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt;
-use hc_bootstrap::{default_tenant_id, default_user_id, load_local_env_file, workspace_root};
+use hc_bootstrap::{
+    default_tenant_id, default_user_id, load_local_env_file, tenant_id_from_env, user_id_from_env,
+    workspace_root,
+};
 use hc_conversation::{ConversationRepository, now_unix};
 use hc_memory::{
-    MemoryNamespace, MemoryRoom, MemoryRoomRepository, RoomCapabilityResolver, 
-    ResolvedRoomCapabilities, CapabilityRef, ToolRef, SkillRef, ScheduleRef,
+    MemoryLayer, MemoryNamespace, MemoryRoom, MemoryRoomRepository, RoomCapabilityResolver,
+    ResolvedRoomCapabilities, CapabilityRef, ToolRef, SkillRef, ScheduleRef, RoomConfig,
 };
 use hc_behavior::{
     BehaviorPattern, BehaviorConfig, BehaviorContext, BehaviorEngine,
@@ -60,10 +63,40 @@ use tokio_stream::{
     Stream,
     wrappers::{IntervalStream, ReceiverStream},
 };
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 struct AppState {
     service: ServiceConfig,
+}
+
+const DEFAULT_API_BIND: &str = "127.0.0.1:8787";
+const DEFAULT_SCHEDULER_TICK_SECONDS: u64 = 30;
+const DEFAULT_SWAGGER_UI_DIST_BASE_URL: &str = "https://unpkg.com/swagger-ui-dist@5";
+
+#[derive(Debug, Clone)]
+struct ApiRuntimeConfig {
+    bind_addr: SocketAddr,
+    scheduler_tick_seconds: u64,
+    swagger_ui_dist_base_url: String,
+}
+
+impl ApiRuntimeConfig {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            bind_addr: env::var("HC_API_BIND")
+                .unwrap_or_else(|_| DEFAULT_API_BIND.to_owned())
+                .parse()
+                .context("invalid HC_API_BIND")?,
+            scheduler_tick_seconds: env::var("HC_SCHEDULER_TICK_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_SCHEDULER_TICK_SECONDS),
+            swagger_ui_dist_base_url: env::var("HC_SWAGGER_UI_DIST_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_SWAGGER_UI_DIST_BASE_URL.to_owned()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,11 +301,12 @@ async fn chat_ws_session(mut socket: WebSocket, state: AppState) {
 #[tokio::main]
 async fn main() -> Result<()> {
     load_local_env_file()?;
+    let runtime_config = ApiRuntimeConfig::from_env()?;
     let state = AppState {
         service: ServiceConfig::new(workspace_root()),
     };
-    start_scheduler_loop_if_enabled(state.service.clone());
-    let bind_addr = bind_addr()?;
+    start_scheduler_loop_if_enabled(state.service.clone(), runtime_config.scheduler_tick_seconds);
+    let bind_addr = runtime_config.bind_addr;
     let app = Router::new()
         .route("/health", get(health))
         .route("/openapi.json", get(openapi))
@@ -325,9 +359,10 @@ async fn main() -> Result<()> {
         .route("/v1/behavior/patterns", get(behavior_patterns))
         .route("/v1/behavior/patterns/:pattern", get(behavior_pattern_get))
         .route("/v1/behavior/patterns/:pattern/test", post(behavior_pattern_test))
+        .layer(Extension(runtime_config.swagger_ui_dist_base_url))
         .with_state(state);
 
-    println!("hc-api listening on http://{bind_addr}");
+    info!(%bind_addr, "hc-api listening");
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
@@ -506,22 +541,19 @@ async fn conversation_proposal_dismiss(
     Ok(Json(response))
 }
 
-fn start_scheduler_loop_if_enabled(service: ServiceConfig) {
+fn start_scheduler_loop_if_enabled(service: ServiceConfig, tick_seconds: u64) {
     if !env_flag("HC_SCHEDULER_ENABLED") {
         return;
     }
-    let tick_seconds = env::var("HC_SCHEDULER_TICK_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(30);
     let namespace = ApiNamespace {
-        tenant_id: env::var("HC_TENANT_ID").unwrap_or_else(|_| default_tenant_id()),
-        user_id: env::var("HC_USER_ID").unwrap_or_else(|_| default_user_id()),
+        tenant_id: tenant_id_from_env(),
+        user_id: user_id_from_env(),
     };
-    println!(
-        "hc-api scheduler enabled namespace={}/{} tick_seconds={}",
-        namespace.tenant_id, namespace.user_id, tick_seconds
+    info!(
+        tenant_id = %namespace.tenant_id,
+        user_id = %namespace.user_id,
+        tick_seconds,
+        "hc-api scheduler enabled"
     );
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(tick_seconds));
@@ -536,15 +568,15 @@ fn start_scheduler_loop_if_enabled(service: ServiceConfig) {
             match result {
                 Ok(Ok(report)) => {
                     if !report.receipts.is_empty() {
-                        println!(
-                            "scheduler> dispatched={} queued={}",
-                            report.receipts.len(),
-                            report.queued_count
+                        info!(
+                            dispatched = report.receipts.len(),
+                            queued = report.queued_count,
+                            "scheduler dispatched due runs"
                         );
                     }
                 }
-                Ok(Err(error)) => eprintln!("warning> scheduler tick failed: {error}"),
-                Err(error) => eprintln!("warning> scheduler worker failed: {error}"),
+                Ok(Err(error)) => warn!(%error, "scheduler tick failed"),
+                Err(error) => warn!(%error, "scheduler worker failed"),
             }
         }
     });
@@ -689,8 +721,8 @@ async fn openapi() -> Json<Value> {
     Json(openapi_document())
 }
 
-async fn swagger_ui() -> Html<String> {
-    Html(swagger_ui_html())
+async fn swagger_ui(Extension(swagger_ui_dist_base_url): Extension<String>) -> Html<String> {
+    Html(swagger_ui_html(&swagger_ui_dist_base_url))
 }
 
 async fn chat(
@@ -2079,17 +2111,12 @@ fn openapi_document() -> Value {
     })
 }
 
-fn swagger_ui_html() -> String {
+fn swagger_ui_html(swagger_ui_dist_base_url: &str) -> String {
     let spec = openapi_document();
     let spec_json = serde_json::to_string(&spec).expect("openapi document should serialize");
-    SWAGGER_UI_HTML.replace("__HONEYCOMB_OPENAPI_SPEC__", &spec_json)
-}
-
-fn bind_addr() -> Result<SocketAddr> {
-    env::var("HC_API_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
-        .parse()
-        .context("invalid HC_API_BIND")
+    SWAGGER_UI_HTML
+        .replace("__HONEYCOMB_OPENAPI_SPEC__", &spec_json)
+        .replace("__SWAGGER_UI_DIST_BASE_URL__", swagger_ui_dist_base_url.trim_end_matches('/'))
 }
 
 const SWAGGER_UI_HTML: &str = r##"<!doctype html>
@@ -2098,7 +2125,7 @@ const SWAGGER_UI_HTML: &str = r##"<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Honeycomb API Swagger</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+    <link rel="stylesheet" href="__SWAGGER_UI_DIST_BASE_URL__/swagger-ui.css" />
     <style>
       body {
         margin: 0;
@@ -2111,7 +2138,7 @@ const SWAGGER_UI_HTML: &str = r##"<!doctype html>
   </head>
   <body>
     <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script src="__SWAGGER_UI_DIST_BASE_URL__/swagger-ui-bundle.js"></script>
     <script>
       window.onload = () => {
         const spec = __HONEYCOMB_OPENAPI_SPEC__;
@@ -2174,6 +2201,17 @@ struct MemoryNamespaceResponse {
     user_id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct MemoryRoomWriteRequest {
+    id: Option<String>,
+    layer: Option<String>,
+    title: Option<String>,
+    summary: Option<String>,
+    status: Option<String>,
+    tags: Option<Vec<String>>,
+    room_config: Option<RoomConfig>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RoomCapabilitiesResponse {
     room_id: String,
@@ -2229,7 +2267,7 @@ struct InheritScheduleRequest {
 
 // Memory Room API 处理函数
 async fn memory_rooms(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<MemoryRoomListResponse>, ApiError> {
     let namespace = normalized_request_namespace(
@@ -2238,7 +2276,6 @@ async fn memory_rooms(
         Some(query.user_id),
     );
     
-    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
     let repository = MemoryRoomRepository::with_namespace(
         workspace_root(),
         hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
@@ -2264,7 +2301,7 @@ async fn memory_rooms(
 }
 
 async fn memory_room_get(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<MemoryRoomResponse>, ApiError> {
@@ -2305,27 +2342,143 @@ async fn memory_room_get(
     }
 }
 
+fn memory_room_detail(room: MemoryRoom) -> Result<MemoryRoomDetail, ApiError> {
+    Ok(MemoryRoomDetail {
+        id: room.id,
+        namespace: MemoryNamespaceResponse {
+            tenant_id: room.namespace.tenant_id,
+            user_id: room.namespace.user_id,
+        },
+        layer: format!("{:?}", room.layer).to_lowercase(),
+        title: room.title,
+        summary: room.summary,
+        status: room.status,
+        tags: room.tags,
+        inherited_capabilities: room.inherited_capabilities,
+        inherited_tools: room.inherited_tools,
+        inherited_skills: room.inherited_skills,
+        inherited_schedules: room.inherited_schedules,
+        room_config: serde_json::to_value(&room.room_config)
+            .map_err(|e| ApiError(anyhow!("Failed to serialize room config: {}", e)))?,
+    })
+}
+
+fn parse_memory_layer(value: Option<&str>) -> Result<MemoryLayer, ApiError> {
+    match value.unwrap_or("chat").trim().to_ascii_lowercase().as_str() {
+        "chat" => Ok(MemoryLayer::Chat),
+        "topic" => Ok(MemoryLayer::Topic),
+        "task" => Ok(MemoryLayer::Task),
+        "project" => Ok(MemoryLayer::Project),
+        "global" => Ok(MemoryLayer::Global),
+        layer => Err(ApiError(anyhow!(
+            "Invalid room layer: {} (must be chat, topic, task, project, or global)",
+            layer
+        ))),
+    }
+}
+
 async fn memory_room_create(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Query(query): Query<NamespaceQuery>,
-    Json(request): Json<serde_json::Value>,
+    Json(request): Json<MemoryRoomWriteRequest>,
 ) -> Result<Json<MemoryRoomResponse>, ApiError> {
-    // TODO: 实现房间创建
-    Err(ApiError(anyhow!("Room creation not yet implemented")))
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
+    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
+    );
+
+    let id = request
+        .id
+        .filter(|value| !value.trim().is_empty())
+        .context("missing room id")
+        .map_err(ApiError)?;
+    if repository.get_room_by_id(&id)?.is_some() {
+        return Err(ApiError(anyhow!("Room already exists: {}", id)));
+    }
+
+    let title = request
+        .title
+        .filter(|value| !value.trim().is_empty())
+        .context("missing room title")
+        .map_err(ApiError)?;
+    let summary = request.summary.unwrap_or_default();
+    let layer = parse_memory_layer(request.layer.as_deref())?;
+
+    let mut room = MemoryRoom::new(id, layer, title, summary).with_namespace(memory_namespace);
+    if let Some(status) = request.status {
+        room.status = status;
+    }
+    if let Some(tags) = request.tags {
+        room.tags = tags;
+    }
+    if let Some(room_config) = request.room_config {
+        room.room_config = room_config;
+    }
+
+    repository.write_room(&room)?;
+    Ok(Json(MemoryRoomResponse {
+        room: memory_room_detail(room)?,
+    }))
 }
 
 async fn memory_room_update(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
-    Json(request): Json<serde_json::Value>,
+    Json(request): Json<MemoryRoomWriteRequest>,
 ) -> Result<Json<MemoryRoomResponse>, ApiError> {
-    // TODO: 实现房间更新
-    Err(ApiError(anyhow!("Room update not yet implemented")))
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
+    );
+
+    let mut room = repository
+        .get_room_by_id(&room_id)?
+        .ok_or_else(|| ApiError(anyhow!("Room not found: {}", room_id)))?;
+
+    if let Some(layer) = request.layer {
+        let requested_layer = parse_memory_layer(Some(&layer))?;
+        if requested_layer != room.layer {
+            return Err(ApiError(anyhow!(
+                "Changing room layer is not supported by this endpoint"
+            )));
+        }
+    }
+    if let Some(title) = request.title {
+        room.title = title;
+    }
+    if let Some(summary) = request.summary {
+        room.summary = summary;
+    }
+    if let Some(status) = request.status {
+        room.status = status;
+    }
+    if let Some(tags) = request.tags {
+        room.tags = tags;
+    }
+    if let Some(room_config) = request.room_config {
+        room.room_config = room_config;
+    }
+
+    repository.write_room(&room)?;
+    Ok(Json(MemoryRoomResponse {
+        room: memory_room_detail(room)?,
+    }))
 }
 
 async fn memory_room_capabilities(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<RoomCapabilitiesResponse>, ApiError> {
@@ -2375,7 +2528,7 @@ async fn memory_room_capabilities(
 }
 
 async fn memory_room_inherit_capability(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
     Json(request): Json<InheritCapabilityRequest>,
@@ -2385,13 +2538,24 @@ async fn memory_room_inherit_capability(
         Some(query.tenant_id),
         Some(query.user_id),
     );
-    
-    // TODO: 实现为房间添加能力继承
+    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
+    );
+    let resolver = RoomCapabilityResolver::new(memory_namespace);
+
+    let mut room = repository
+        .get_room_by_id(&room_id)?
+        .ok_or_else(|| ApiError(anyhow!("Room not found: {}", room_id)))?;
+    resolver.add_capability_to_room(&mut room, request.capability_ref)?;
+    repository.write_room(&room)?;
+
     Ok(Json(serde_json::json!({"success": true, "message": "Capability inheritance added"})))
 }
 
 async fn memory_room_inherit_tool(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
     Json(request): Json<InheritToolRequest>,
@@ -2401,13 +2565,24 @@ async fn memory_room_inherit_tool(
         Some(query.tenant_id),
         Some(query.user_id),
     );
-    
-    // TODO: 实现为房间添加工具继承
+    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
+    );
+    let resolver = RoomCapabilityResolver::new(memory_namespace);
+
+    let mut room = repository
+        .get_room_by_id(&room_id)?
+        .ok_or_else(|| ApiError(anyhow!("Room not found: {}", room_id)))?;
+    resolver.add_tool_to_room(&mut room, request.tool_ref)?;
+    repository.write_room(&room)?;
+
     Ok(Json(serde_json::json!({"success": true, "message": "Tool inheritance added"})))
 }
 
 async fn memory_room_inherit_skill(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
     Json(request): Json<InheritSkillRequest>,
@@ -2417,13 +2592,24 @@ async fn memory_room_inherit_skill(
         Some(query.tenant_id),
         Some(query.user_id),
     );
-    
-    // TODO: 实现为房间添加技能继承
+    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
+    );
+    let resolver = RoomCapabilityResolver::new(memory_namespace);
+
+    let mut room = repository
+        .get_room_by_id(&room_id)?
+        .ok_or_else(|| ApiError(anyhow!("Room not found: {}", room_id)))?;
+    resolver.add_skill_to_room(&mut room, request.skill_ref)?;
+    repository.write_room(&room)?;
+
     Ok(Json(serde_json::json!({"success": true, "message": "Skill inheritance added"})))
 }
 
 async fn memory_room_inherit_schedule(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(room_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
     Json(request): Json<InheritScheduleRequest>,
@@ -2433,8 +2619,19 @@ async fn memory_room_inherit_schedule(
         Some(query.tenant_id),
         Some(query.user_id),
     );
-    
-    // TODO: 实现为房间添加调度继承
+    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id),
+    );
+    let resolver = RoomCapabilityResolver::new(memory_namespace);
+
+    let mut room = repository
+        .get_room_by_id(&room_id)?
+        .ok_or_else(|| ApiError(anyhow!("Room not found: {}", room_id)))?;
+    resolver.add_schedule_to_room(&mut room, request.schedule_ref)?;
+    repository.write_room(&room)?;
+
     Ok(Json(serde_json::json!({"success": true, "message": "Schedule inheritance added"})))
 }
 
@@ -2494,10 +2691,9 @@ async fn enhance_chat_request_with_room_capabilities(
     };
 
     // 构建命名空间
-    let namespace = hc_store::store::WorkspaceNamespace::new(
-        request.tenant_id.as_deref().unwrap_or("local"),
-        request.user_id.as_deref().unwrap_or("default"),
-    );
+    let tenant_id = request.tenant_id.clone().unwrap_or_else(default_tenant_id);
+    let user_id = request.user_id.clone().unwrap_or_else(default_user_id);
+    let namespace = hc_store::store::WorkspaceNamespace::new(&tenant_id, &user_id);
     
     // 获取房间
     let repository = MemoryRoomRepository::with_namespace(workspace_root(), namespace.clone());
@@ -2510,24 +2706,20 @@ async fn enhance_chat_request_with_room_capabilities(
             return Ok((enhanced_request, None));
         }
         Err(err) => {
-            // 读取错误，记录日志并返回原请求
-            eprintln!("Failed to load room {}: {}", room_id, err);
+            error!(%room_id, error = %err, "failed to load room");
             return Ok((enhanced_request, None));
         }
     };
     
     // 构建内存命名空间
-    let memory_namespace = MemoryNamespace::new(
-        request.tenant_id.as_deref().unwrap_or("local"),
-        request.user_id.as_deref().unwrap_or("default"),
-    );
+    let memory_namespace = MemoryNamespace::new(&tenant_id, &user_id);
     
     // 解析房间能力
     let resolver = RoomCapabilityResolver::new(memory_namespace);
     let capabilities = match resolver.resolve_room_capabilities(&room) {
         Ok(caps) => caps,
         Err(err) => {
-            eprintln!("Failed to resolve capabilities for room {}: {}", room_id, err);
+            error!(%room_id, error = %err, "failed to resolve room capabilities");
             return Ok((enhanced_request, None));
         }
     };

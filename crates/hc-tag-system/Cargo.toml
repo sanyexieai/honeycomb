@@ -16,3 +16,21 @@ hc-bootstrap = { path = "../hc-bootstrap" }
 hc-protocol = { path = "../hc-protocol" }
 notify = "6.1"
 tokio = { workspace = true, features = ["fs", "sync"] }
+# 模糊匹配依赖
+strsim = "0.11"  # 字符串相似度计算
+rust-stemmers = "1.2"  # 词干提取
+# 性能优化依赖
+lru = "0.12"  # LRU 缓存
+# 向量化匹配依赖
+ndarray = "0.15"  # 数值计算
+reqwest = { version = "0.11", features = ["json"], optional = true }  # HTTP客户端
+# 强化学习依赖
+rand = "0.8"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.0"  # 测试用临时文件
+
+[features]
+default = []
+embedding = ["reqwest"]  # 嵌入向量功能

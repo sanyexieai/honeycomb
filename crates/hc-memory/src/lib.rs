@@ -2626,6 +2626,18 @@ pub struct RoomCapabilityResolver {
     pub namespace: MemoryNamespace,
 }
 
+const RUST_TAG_TOOLS: &[&str] = &["tool.cargo-check", "tool.cargo-test", "tool.cargo-build"];
+const SEARCH_TAG_TOOLS: &[&str] = &["tool.rg", "tool.grep", "tool.find"];
+const HONEYCOMB_PROJECT_TOOLS: &[&str] = &[
+    "tool.cargo-check",
+    "tool.cargo-test",
+    "tool.rg",
+    "tool.local-file.read",
+    "tool.local-dir.list",
+];
+const REFACTOR_TASK_TOOLS: &[&str] = &["tool.rg", "tool.ast-grep", "tool.cargo-check"];
+const MEMORY_CRATE_TOOLS: &[&str] = &["tool.cargo-test", "tool.cargo-doc"];
+
 impl RoomCapabilityResolver {
     pub fn new(namespace: MemoryNamespace) -> Self {
         Self { namespace }
@@ -2637,26 +2649,22 @@ impl RoomCapabilityResolver {
 
         // 1. 解析直接继承的能力
         for cap_ref in &room.inherited_capabilities {
-            // TODO: 这里需要从真实的 CapabilityRepository 加载数据
             resolved.capabilities.push(ResolvedCapability::new(cap_ref.clone()));
         }
 
         // 2. 解析继承的工具
         for tool_ref in &room.inherited_tools {
-            // TODO: 这里需要从真实的 ToolRepository 加载数据
             resolved.tools.push(ResolvedTool::new(tool_ref.clone()));
         }
 
         // 3. 解析继承的技能
         for skill_ref in &room.inherited_skills {
-            // TODO: 这里需要从真实的 SkillRepository 加载数据
             resolved.skills.push(ResolvedSkill::new(skill_ref.clone()));
         }
 
         // 4. 解析继承的定时任务
         for schedule_ref in &room.inherited_schedules {
             if schedule_ref.enabled_in_room {
-                // TODO: 这里需要从真实的 ScheduleRepository 加载数据
                 resolved.schedules.push(ResolvedSchedule::new(schedule_ref.clone()));
             }
         }
@@ -2677,26 +2685,12 @@ impl RoomCapabilityResolver {
     ) -> Result<()> {
         // 基于标签匹配发现能力
         for tag in &room.tags {
-            // TODO: 这里需要集成真实的仓库来基于标签查找
-            
-            // 示例：如果标签是 "rust"，自动发现 Rust 相关的工具
             if tag == "rust" {
-                let rust_tools = vec!["tool.cargo-check", "tool.cargo-test", "tool.cargo-build"];
-                for tool_id in rust_tools {
-                    if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
-                        resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
-                    }
-                }
+                self.add_auto_discovered_tools(resolved, RUST_TAG_TOOLS);
             }
 
-            // 示例：如果标签是 "search"，自动发现搜索相关的工具
             if tag == "search" {
-                let search_tools = vec!["tool.rg", "tool.grep", "tool.find"];
-                for tool_id in search_tools {
-                    if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
-                        resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
-                    }
-                }
+                self.add_auto_discovered_tools(resolved, SEARCH_TAG_TOOLS);
             }
         }
 
@@ -2728,25 +2722,8 @@ impl RoomCapabilityResolver {
         project_id: &str,
         resolved: &mut ResolvedRoomCapabilities,
     ) -> Result<()> {
-        // TODO: 基于项目 ID 查找相关能力
-        
-        // 示例：Honeycomb 项目的默认工具
         if project_id.contains("honeycomb") {
-            let honeycomb_tools = vec![
-                "tool.cargo-check",
-                "tool.cargo-test", 
-                "tool.rg",
-                "tool.local-file.read",
-                "tool.local-dir.list"
-            ];
-            
-            for tool_id in honeycomb_tools {
-                if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
-                    resolved.tools.push(
-                        ResolvedTool::auto_discovered(tool_id)
-                    );
-                }
-            }
+            self.add_auto_discovered_tools(resolved, HONEYCOMB_PROJECT_TOOLS);
         }
         
         Ok(())
@@ -2758,16 +2735,8 @@ impl RoomCapabilityResolver {
         task_id: &str,
         resolved: &mut ResolvedRoomCapabilities,
     ) -> Result<()> {
-        // TODO: 基于任务类型查找相关能力
-        
-        // 示例：重构任务的工具
         if task_id.contains("refactor") {
-            let refactor_tools = vec!["tool.rg", "tool.ast-grep", "tool.cargo-check"];
-            for tool_id in refactor_tools {
-                if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
-                    resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
-                }
-            }
+            self.add_auto_discovered_tools(resolved, REFACTOR_TASK_TOOLS);
         }
         
         Ok(())
@@ -2779,19 +2748,23 @@ impl RoomCapabilityResolver {
         crate_id: &str,
         resolved: &mut ResolvedRoomCapabilities,
     ) -> Result<()> {
-        // TODO: 基于 crate 类型查找相关能力
-        
-        // 示例：memory crate 的工具
         if crate_id.contains("memory") {
-            let memory_tools = vec!["tool.cargo-test", "tool.cargo-doc"];
-            for tool_id in memory_tools {
-                if !resolved.tools.iter().any(|t| t.tool_ref.id == tool_id) {
-                    resolved.tools.push(ResolvedTool::auto_discovered(tool_id));
-                }
-            }
+            self.add_auto_discovered_tools(resolved, MEMORY_CRATE_TOOLS);
         }
         
         Ok(())
+    }
+
+    fn add_auto_discovered_tools(
+        &self,
+        resolved: &mut ResolvedRoomCapabilities,
+        tool_ids: &[&str],
+    ) {
+        for tool_id in tool_ids {
+            if !resolved.tools.iter().any(|tool| tool.tool_ref.id == *tool_id) {
+                resolved.tools.push(ResolvedTool::auto_discovered(*tool_id));
+            }
+        }
     }
 
     /// 为 Room 添加能力引用

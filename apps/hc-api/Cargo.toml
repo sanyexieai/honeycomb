@@ -21,3 +21,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-stream = "0.1"
+tracing = "0.1.44"

@@ -299,16 +299,27 @@ pub fn default_model_from_env() -> String {
 }
 
 pub fn provider_api_key_from_env(provider_id: &str) -> Option<String> {
-    env::var("HC_LLM_API_KEY")
-        .ok()
-        .or_else(|| env::var(provider_api_key_var_name(provider_id)).ok())
+    provider_api_key_env_source(provider_id).and_then(|source| env::var(source).ok())
 }
 
 pub fn provider_base_url_from_env(provider_id: &str) -> String {
-    env::var("HC_LLM_BASE_URL")
-        .ok()
-        .or_else(|| env::var(provider_base_url_var_name(provider_id)).ok())
+    provider_base_url_env_source(provider_id)
+        .and_then(|source| env::var(source).ok())
         .unwrap_or_else(|| default_base_url_for_provider(provider_id))
+}
+
+pub fn provider_api_key_env_source(provider_id: &str) -> Option<&'static str> {
+    non_empty_env_source("HC_LLM_API_KEY")
+        .or_else(|| non_empty_env_source(provider_api_key_var_name(provider_id)))
+}
+
+pub fn provider_base_url_env_source(provider_id: &str) -> Option<&'static str> {
+    non_empty_env_source("HC_LLM_BASE_URL")
+        .or_else(|| non_empty_env_source(provider_base_url_var_name(provider_id)))
+}
+
+pub fn provider_requires_api_key(provider_id: &str) -> bool {
+    !provider_id.trim().eq_ignore_ascii_case("ollama")
 }
 
 pub fn default_base_url_for_provider(provider: &str) -> String {
@@ -503,6 +514,13 @@ fn using_legacy_mock_config() -> bool {
         .unwrap_or(false)
 }
 
+fn non_empty_env_source(name: &'static str) -> Option<&'static str> {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| name)
+}
+
 pub fn provider_api_key_var_name(provider_id: &str) -> &'static str {
     match provider_id.trim().to_ascii_lowercase().as_str() {
         "minimax" => "MINIMAX_API_KEY",
@@ -563,11 +581,12 @@ impl LlmRetryPolicy {
         if !self.log_retries {
             return;
         }
-        eprintln!(
-            "llm retry> attempt {attempt}/{} failed: {}; retrying in {}ms",
-            self.max_attempts,
-            error,
-            delay.as_millis()
+        tracing::warn!(
+            attempt,
+            max_attempts = self.max_attempts,
+            error = %error,
+            retry_delay_ms = delay.as_millis(),
+            "llm retry scheduled"
         );
     }
 }

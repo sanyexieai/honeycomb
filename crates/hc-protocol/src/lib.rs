@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_TENANT_ID: &str = "local";
+pub const DEFAULT_USER_ID: &str = "default";
+
 pub mod protocol {
     //! Stable schemas shared across runtime, storage, and UI layers.
 
@@ -260,9 +263,9 @@ pub struct ErrorResponse {
 }
 
 fn default_tenant_id() -> String {
-    "local".to_owned()
+    DEFAULT_TENANT_ID.to_owned()
 }
 
 fn default_user_id() -> String {
-    "default".to_owned()
+    DEFAULT_USER_ID.to_owned()
 }

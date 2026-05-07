@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::GB18030;
-use hc_bootstrap::{load_local_env_file, workspace_root};
+use hc_bootstrap::{load_local_env_file, tenant_id_from_env, user_id_from_env, workspace_root};
 use hc_intent::{IntentInput, IntentResolution, IntentRouter};
 use hc_agent::phrase_match_score;
 use hc_capability::ModelDependence;
@@ -4446,14 +4446,12 @@ fn runtime_namespace() -> WorkspaceNamespace {
     let context = cli_runtime_context();
     let tenant_id = context
         .tenant_id
-        .or_else(|| env::var("HC_TENANT_ID").ok())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "local".to_owned());
+        .unwrap_or_else(tenant_id_from_env);
     let user_id = context
         .user_id
-        .or_else(|| env::var("HC_USER_ID").ok())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "default".to_owned());
+        .unwrap_or_else(user_id_from_env);
     WorkspaceNamespace::new(tenant_id, user_id)
 }
 
@@ -5702,16 +5700,62 @@ fn handle_room_inherit(args: &[String]) -> Result<()> {
         _ => bail!("invalid inheritance type: {} (must be manual, auto, parent, sibling, or direct)", inheritance_type),
     };
     
-    // TODO: 实现实际的继承逻辑
+    let workspace_namespace = runtime_namespace();
+    let memory_namespace = MemoryNamespaceStorage::new(
+        workspace_namespace.tenant_id.clone(),
+        workspace_namespace.user_id.clone(),
+    );
+    let repository = MemoryRoomRepository::with_namespace(
+        workspace_root(),
+        workspace_namespace.clone(),
+    );
+    let resolver = RoomCapabilityResolver::new(memory_namespace);
+    let mut room = repository
+        .get_room_by_id(&room_id)?
+        .with_context(|| format!("room not found: {room_id}"))?;
+
+    match capability_type.as_str() {
+        "capability" => resolver.add_capability_to_room(
+            &mut room,
+            CapabilityRef::new(&capability_id).with_inheritance_type(inheritance),
+        )?,
+        "tool" => resolver.add_tool_to_room(
+            &mut room,
+            ToolRef::new(&capability_id).with_inheritance_type(inheritance),
+        )?,
+        "skill" => resolver.add_skill_to_room(
+            &mut room,
+            SkillRef::new(&capability_id).with_inheritance_type(inheritance),
+        )?,
+        "schedule" => resolver.add_schedule_to_room(
+            &mut room,
+            ScheduleRef::new(&capability_id).with_inheritance_type(inheritance),
+        )?,
+        _ => bail!("invalid type: {} (must be capability, tool, skill, or schedule)", capability_type),
+    }
+
+    let path = repository.write_room(&room)?;
+
     if json {
         println!(
-            r#"{{"success": true, "room_id": "{}", "type": "{}", "capability_id": "{}", "inheritance": "{}"}}"#,
-            room_id, capability_type, capability_id, inheritance_type
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "room_id": room_id,
+                "type": capability_type,
+                "capability_id": capability_id,
+                "inheritance": inheritance_type,
+                "path": path,
+            }))?
         );
     } else {
         println!(
-            "Added {} inheritance of {} {} to room {}",
-            inheritance_type, capability_type, capability_id, room_id
+            "Added {} inheritance of {} {} to room {} at {}",
+            inheritance_type,
+            capability_type,
+            capability_id,
+            room_id,
+            path.display()
         );
     }
     
@@ -6215,58 +6259,19 @@ fn handle_pattern_default(args: &[String]) -> Result<()> {
 /// 验证LLM配置是否正确
 fn validate_llm_configuration(provider: &str, model: &str) -> Result<()> {
     use std::env;
-    use hc_llm::{provider_api_key_var_name, provider_base_url_var_name};
+    use hc_llm::{
+        provider_api_key_env_source, provider_api_key_var_name, provider_base_url_env_source,
+        provider_base_url_var_name, provider_requires_api_key,
+    };
     
     println!("🔍 检查LLM配置...");
     println!("  提供商: {}", provider);
     println!("  模型: {}", model);
     
-    // hc-llm的API密钥查找顺序: HC_LLM_API_KEY -> 提供商专用密钥
-    let generic_api_key = "HC_LLM_API_KEY";
     let provider_api_key = provider_api_key_var_name(provider);
-    let generic_base_url = "HC_LLM_BASE_URL";
     let provider_base_url = provider_base_url_var_name(provider);
-    
-    // 检查API密钥配置 (通用优先，然后提供商专用)
-    let api_key_vars = match provider.to_lowercase().as_str() {
-        "ollama" => vec![], // ollama通常不需要API密钥
-        "azure" => vec!["AZURE_OPENAI_API_KEY"], // azure使用专用密钥
-        _ => vec![generic_api_key, provider_api_key], // 先检查通用，再检查专用
-    };
-    
-    // 检查Base URL配置 (可选)
-    let base_url_vars = match provider.to_lowercase().as_str() {
-        "azure" => vec!["AZURE_OPENAI_ENDPOINT"],
-        "ollama" => vec![provider_base_url], // ollama主要靠base_url
-        _ => vec![generic_base_url, provider_base_url],
-    };
-    
-    // 检查API密钥配置 - 模拟 hc-llm 的逻辑
-    let mut found_api_key = None;
-    
-    // 使用与 hc-llm::provider_api_key_from_env 相同的逻辑
-    if let Ok(value) = env::var("HC_LLM_API_KEY") {
-        if !value.trim().is_empty() {
-            found_api_key = Some("HC_LLM_API_KEY");
-        }
-    } else if let Ok(value) = env::var(provider_api_key) {
-        if !value.trim().is_empty() {
-            found_api_key = Some(provider_api_key);
-        }
-    }
-    
-    // 检查Base URL配置 - 模拟 hc-llm::provider_base_url_from_env 的逻辑
-    let mut found_base_url = None;
-    
-    if let Ok(value) = env::var("HC_LLM_BASE_URL") {
-        if !value.trim().is_empty() {
-            found_base_url = Some("HC_LLM_BASE_URL");
-        }
-    } else if let Ok(value) = env::var(provider_base_url) {
-        if !value.trim().is_empty() {
-            found_base_url = Some(provider_base_url);
-        }
-    }
+    let found_api_key = provider_api_key_env_source(provider);
+    let found_base_url = provider_base_url_env_source(provider);
     
     // 显示结果
     let mut config_info = Vec::new();
@@ -6284,12 +6289,7 @@ fn validate_llm_configuration(provider: &str, model: &str) -> Result<()> {
     }
     
     // 检查是否缺少必要配置
-    let needs_api_key = match provider.to_lowercase().as_str() {
-        "ollama" => false, // ollama通常不需要API密钥
-        _ => true,
-    };
-    
-    if needs_api_key && found_api_key.is_none() {
+    if provider_requires_api_key(provider) && found_api_key.is_none() {
         println!("  ⚠️  缺少API密钥，请设置 HC_LLM_API_KEY 或 {}", provider_api_key);
     }
     

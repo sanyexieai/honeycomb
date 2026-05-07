@@ -17,6 +17,7 @@ use hc_agent::{
     bootstrap_task_workbench, build_workspace_view, materialize_seed, persist_task_artifacts,
     query_task_artifacts,
 };
+use hc_bootstrap::{tenant_id_from_env, user_id_from_env};
 use hc_context::{
     load_agent_planner_input_prompt, load_agent_responder_system_prompt,
     load_agent_work_item_execution_prompt,
@@ -686,7 +687,7 @@ pub fn run() -> Result<()> {
             })();
 
             if let Err(error) = result {
-                eprintln!("failed to start task: {error}");
+                tracing::warn!(%error, "failed to start task");
             }
         });
     }
@@ -794,7 +795,7 @@ fn spawn_materialized_window(
         let registry = Rc::clone(&registry);
         window.on_new_window(move || {
             if let Err(error) = spawn_seeded_window(Rc::clone(&registry)) {
-                eprintln!("failed to open window: {error}");
+                tracing::warn!(%error, "failed to open window");
             }
         });
     }
@@ -804,7 +805,7 @@ fn spawn_materialized_window(
         let window_index = window_index as i32;
         window.on_close_window(move || {
             if let Err(error) = close_window(Rc::clone(&registry), &weak, window_index) {
-                eprintln!("failed to close window: {error}");
+                tracing::warn!(%error, "failed to close window");
             }
         });
     }
@@ -816,7 +817,7 @@ fn spawn_materialized_window(
             if let Err(error) =
                 handle_window_input(Rc::clone(&registry), window_index, text.to_string())
             {
-                eprintln!("input error: {error}");
+                tracing::warn!(%error, "input error");
             }
         });
     }
@@ -827,7 +828,7 @@ fn spawn_materialized_window(
         window.on_focus_agent(move |agent_name| {
             if let Err(error) = set_window_focus_target(&registry, window_index, agent_name.trim())
             {
-                eprintln!("focus agent error: {error}");
+                tracing::warn!(%error, "focus agent error");
             }
         });
     }
@@ -837,7 +838,7 @@ fn spawn_materialized_window(
         let window_index = window_index as i32;
         window.on_clear_focus_target(move || {
             if let Err(error) = clear_window_focus_target(&registry, window_index) {
-                eprintln!("clear focus error: {error}");
+                tracing::warn!(%error, "clear focus error");
             }
         });
     }
@@ -849,7 +850,7 @@ fn spawn_materialized_window(
             if let Err(error) =
                 set_selected_work_item(&registry, window_index, work_item_id.to_string())
             {
-                eprintln!("select work item error: {error}");
+                tracing::warn!(%error, "select work item error");
             }
         });
     }
@@ -867,14 +868,14 @@ fn spawn_materialized_window(
                     score_text.to_string(),
                     reason_text.to_string(),
                 ) {
-                    eprintln!("claim work item error: {error}");
+                    tracing::warn!(%error, "claim work item error");
                 }
             });
         }
 
         window.on_resolve_selected_work_item(move || {
             if let Err(error) = resolve_selected_work_item(&registry, window_index) {
-                eprintln!("resolve work item error: {error}");
+                tracing::warn!(%error, "resolve work item error");
             }
         });
     }
@@ -884,7 +885,7 @@ fn spawn_materialized_window(
         let window_index = window_index as i32;
         window.on_execute_selected_work_item(move || {
             if let Err(error) = execute_selected_work_item(&registry, window_index) {
-                eprintln!("execute work item error: {error}");
+                tracing::warn!(%error, "execute work item error");
             }
         });
     }
@@ -2918,10 +2919,7 @@ fn preferred_default_responder(agent_name: &str, role_name: &str) -> ResponderBi
             ),
         })
     } else {
-        ResponderBinding::Human(HumanResponderConfig::new(
-            Some(env::var("HC_USER_ID").unwrap_or_else(|_| "default".to_owned())),
-            None,
-        ))
+        ResponderBinding::Human(HumanResponderConfig::new(Some(user_id_from_env()), None))
     }
 }
 
@@ -4138,9 +4136,7 @@ fn parse_assign_claim_command(line: &str) -> Option<(String, String, f32, String
 }
 
 fn runtime_namespace() -> RuntimeNamespace {
-    let tenant_id = env::var("HC_TENANT_ID").unwrap_or_else(|_| "local".to_owned());
-    let user_id = env::var("HC_USER_ID").unwrap_or_else(|_| "default".to_owned());
-    RuntimeNamespace::new(tenant_id, user_id)
+    RuntimeNamespace::new(tenant_id_from_env(), user_id_from_env())
 }
 
 fn workspace_namespace(namespace: &RuntimeNamespace) -> hc_store::store::WorkspaceNamespace {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use hc_bootstrap::default_user_id;
 use hc_store::store::{StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -79,7 +80,7 @@ impl ResponderBinding {
                 config
                     .user_ref
                     .clone()
-                    .unwrap_or_else(|| "local".to_owned())
+                    .unwrap_or_else(default_user_id)
             ),
             Self::Rule(config) => format!(
                 "rule:{}",
