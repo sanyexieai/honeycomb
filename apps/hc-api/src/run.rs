@@ -51,8 +51,9 @@ use hc_service::{
     index::{IndexRebuildRequest, IndexSearchRequest, rebuild_index, search_index},
     scheduler::{
         ScheduleRequest, ScheduleStatusRequest, SchedulerRunRequest, dispatch_due_scheduled_runs,
-        dispatch_queued_scheduled_runs, list_scheduled_runs, list_schedules,
-        queue_due_scheduled_runs, set_schedule_status, write_schedule,
+        dispatch_fired_followup_messages_headless, dispatch_queued_scheduled_runs,
+        list_scheduled_runs, list_schedules, queue_due_scheduled_runs, set_schedule_status,
+        write_schedule,
     },
     tool::{
         McpToolCallRequest, McpToolCallResponse, McpToolListRequest, McpToolListResponse,
@@ -78,10 +79,17 @@ const DEFAULT_API_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_SCHEDULER_TICK_SECONDS: u64 = 30;
 const DEFAULT_SWAGGER_UI_DIST_BASE_URL: &str = "https://unpkg.com/swagger-ui-dist@5";
 
+#[derive(Debug, Clone, Copy)]
+enum SchedulerFollowupDeliveryMode {
+    Headless,
+    Off,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiRuntimeConfig {
     pub bind_addr: SocketAddr,
     pub scheduler_tick_seconds: u64,
+    scheduler_followup_delivery_mode: SchedulerFollowupDeliveryMode,
     pub swagger_ui_dist_base_url: String,
 }
 
@@ -97,6 +105,7 @@ impl ApiRuntimeConfig {
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_SCHEDULER_TICK_SECONDS),
+            scheduler_followup_delivery_mode: scheduler_followup_delivery_mode_from_env(),
             swagger_ui_dist_base_url: env::var("HC_SWAGGER_UI_DIST_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_SWAGGER_UI_DIST_BASE_URL.to_owned()),
         })
@@ -393,7 +402,11 @@ pub async fn serve() -> Result<()> {
     let state = AppState {
         service: ServiceConfig::from_env(),
     };
-    start_scheduler_loop_if_enabled(state.service.clone(), runtime_config.scheduler_tick_seconds);
+    start_scheduler_loop_if_enabled(
+        state.service.clone(),
+        runtime_config.scheduler_tick_seconds,
+        runtime_config.scheduler_followup_delivery_mode,
+    );
     let bind_addr = runtime_config.bind_addr;
     let app = build_router(state, runtime_config.swagger_ui_dist_base_url.clone());
     info!(%bind_addr, "hc-api listening");
@@ -626,7 +639,11 @@ async fn conversation_proposal_dismiss(
     Ok(Json(response))
 }
 
-fn start_scheduler_loop_if_enabled(service: ServiceConfig, tick_seconds: u64) {
+fn start_scheduler_loop_if_enabled(
+    service: ServiceConfig,
+    tick_seconds: u64,
+    delivery_mode: SchedulerFollowupDeliveryMode,
+) {
     if !env_flag("HC_SCHEDULER_ENABLED") {
         return;
     }
@@ -647,15 +664,23 @@ fn start_scheduler_loop_if_enabled(service: ServiceConfig, tick_seconds: u64) {
             let service = service.clone();
             let namespace = namespace.clone();
             let result = tokio::task::spawn_blocking(move || {
-                dispatch_due_scheduled_runs(&service, namespace, None)
+                let report = dispatch_due_scheduled_runs(&service, namespace.clone(), None)?;
+                let delivered_followups = deliver_scheduler_followup_messages(
+                    &service,
+                    namespace,
+                    &report.receipts,
+                    delivery_mode,
+                )?;
+                Ok::<_, anyhow::Error>((report, delivered_followups.len()))
             })
             .await;
             match result {
-                Ok(Ok(report)) => {
+                Ok(Ok((report, delivered_followups))) => {
                     if !report.receipts.is_empty() {
                         info!(
                             dispatched = report.receipts.len(),
                             queued = report.queued_count,
+                            delivered_followups,
                             "scheduler dispatched due runs"
                         );
                     }
@@ -1146,8 +1171,20 @@ async fn schedule_dispatch_due(
 ) -> Result<Json<hc_service::scheduler::SchedulerDispatchReport>, ApiError> {
     let namespace =
         normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let service = state.service.clone();
+    let delivery_mode = scheduler_followup_delivery_mode_from_env();
     let response = tokio::task::spawn_blocking(move || {
-        dispatch_due_scheduled_runs(&state.service, namespace, request.now_unix)
+        let report = dispatch_due_scheduled_runs(&service, namespace.clone(), request.now_unix)?;
+        let delivered_followups =
+            deliver_scheduler_followup_messages(&service, namespace, &report.receipts, delivery_mode)?
+                .len();
+        tracing::debug!(
+            dispatched = report.receipts.len(),
+            queued = report.queued_count,
+            delivered_followups,
+            "api schedule dispatch-due completed"
+        );
+        Ok::<_, anyhow::Error>(report)
     })
     .await
     .map_err(|error| ApiError(anyhow!("schedule dispatch-due worker failed: {error}")))?
@@ -1161,13 +1198,49 @@ async fn schedule_dispatch_queued(
 ) -> Result<Json<hc_service::scheduler::SchedulerDispatchReport>, ApiError> {
     let namespace =
         normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let service = state.service.clone();
+    let delivery_mode = scheduler_followup_delivery_mode_from_env();
     let response = tokio::task::spawn_blocking(move || {
-        dispatch_queued_scheduled_runs(&state.service, namespace, request.now_unix)
+        let report = dispatch_queued_scheduled_runs(&service, namespace.clone(), request.now_unix)?;
+        let delivered_followups =
+            deliver_scheduler_followup_messages(&service, namespace, &report.receipts, delivery_mode)?
+                .len();
+        tracing::debug!(
+            dispatched = report.receipts.len(),
+            queued = report.queued_count,
+            delivered_followups,
+            "api schedule dispatch-queued completed"
+        );
+        Ok::<_, anyhow::Error>(report)
     })
     .await
     .map_err(|error| ApiError(anyhow!("schedule dispatch-queued worker failed: {error}")))?
     .map_err(ApiError::from)?;
     Ok(Json(response))
+}
+
+fn scheduler_followup_delivery_mode_from_env() -> SchedulerFollowupDeliveryMode {
+    let raw = env::var("HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE")
+        .unwrap_or_else(|_| "headless".to_owned())
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "off" => SchedulerFollowupDeliveryMode::Off,
+        _ => SchedulerFollowupDeliveryMode::Headless,
+    }
+}
+
+fn deliver_scheduler_followup_messages(
+    service: &ServiceConfig,
+    namespace: ApiNamespace,
+    receipts: &[hc_service::scheduler::SchedulerDispatchReceipt],
+    mode: SchedulerFollowupDeliveryMode,
+) -> Result<Vec<String>> {
+    match mode {
+        SchedulerFollowupDeliveryMode::Headless => {
+            dispatch_fired_followup_messages_headless(service, namespace, receipts)
+        }
+        SchedulerFollowupDeliveryMode::Off => Ok(Vec::new()),
+    }
 }
 
 async fn agent_route(

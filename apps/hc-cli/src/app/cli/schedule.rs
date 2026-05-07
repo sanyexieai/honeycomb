@@ -4,6 +4,7 @@ use hc_scheduler::{
     ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledTarget, ScheduledTask, now_unix,
 };
 use hc_service::ServiceConfig;
+use hc_service::scheduler::SchedulerDispatchReceipt;
 use std::time::Duration;
 
 pub(super) fn handle_schedule(args: &[String]) -> Result<()> {
@@ -347,19 +348,14 @@ fn handle_schedule_watch(args: &[String]) -> Result<()> {
             println!("schedule> tick now={} no due runs", now);
         } else {
             println!("schedule> tick now={} dispatched={}", now, receipts.len());
-            for receipt in receipts {
+            for receipt in &receipts {
                 println!(
                     "dispatch> {} status={}",
-                    receipt
-                        .get("run_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown"),
-                    receipt
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown")
+                    receipt.run_id,
+                    receipt.status
                 );
             }
+            print_timed_followup_messages(&receipts)?;
         }
         ticks += 1;
         if max_ticks.is_some_and(|limit| ticks >= limit) {
@@ -370,7 +366,32 @@ fn handle_schedule_watch(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn dispatch_due_scheduled_runs(now: u64) -> Result<Vec<serde_json::Value>> {
+fn print_timed_followup_messages(receipts: &[SchedulerDispatchReceipt]) -> Result<()> {
+    struct StdoutFollowUpSink;
+    impl hc_service::scheduler::FollowUpMessageSink for StdoutFollowUpSink {
+        fn on_fired_followup_message(
+            &mut self,
+            message: &hc_service::scheduler::FiredFollowUpMessage,
+        ) {
+            println!("assistant> {}", message.message);
+        }
+    }
+
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    let config = ServiceConfig::from_env();
+    let mut sink = StdoutFollowUpSink;
+    hc_service::scheduler::dispatch_fired_followup_messages_from_receipts(
+        &config,
+        super::runtime_namespace().into(),
+        receipts,
+        &mut sink,
+    )?;
+    Ok(())
+}
+
+fn dispatch_due_scheduled_runs(now: u64) -> Result<Vec<SchedulerDispatchReceipt>> {
     let mut receipts = Vec::new();
     super::schedule_repository().queue_due_runs(now)?;
     for run in super::schedule_repository().queued_runs()? {
@@ -408,7 +429,7 @@ fn handle_schedule_dispatch_queued(args: &[String]) -> Result<()> {
     print_schedule_dispatch_receipts(receipts, json)
 }
 
-fn print_schedule_dispatch_receipts(receipts: Vec<serde_json::Value>, json: bool) -> Result<()> {
+fn print_schedule_dispatch_receipts(receipts: Vec<SchedulerDispatchReceipt>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&receipts)?);
         return Ok(());
@@ -418,39 +439,21 @@ fn print_schedule_dispatch_receipts(receipts: Vec<serde_json::Value>, json: bool
     } else {
         for receipt in receipts {
             println!(
-                "dispatch> {} target={:?}:{} status={} result={}",
-                receipt
-                    .get("run_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                receipt
-                    .get("target_kind")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                receipt
-                    .get("target_ref")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                receipt
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                receipt
-                    .get("result_ref")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
+                "dispatch> {} target={}:{} status={} result={}",
+                receipt.run_id,
+                receipt.target_kind,
+                receipt.target_ref,
+                receipt.status,
+                receipt.result_ref.as_deref().unwrap_or("")
             );
         }
     }
     Ok(())
 }
 
-fn dispatch_scheduled_run(run: ScheduledRun, now: u64) -> Result<serde_json::Value> {
+fn dispatch_scheduled_run(run: ScheduledRun, now: u64) -> Result<SchedulerDispatchReceipt> {
     let config = ServiceConfig::from_env();
     let namespace = super::runtime_namespace();
     let repository = super::schedule_repository();
-    let receipt = hc_service::scheduler::dispatch_scheduled_run(
-        &config, &namespace, &repository, run, now,
-    )?;
-    serde_json::to_value(&receipt).map_err(|error| anyhow::anyhow!(error))
+    hc_service::scheduler::dispatch_scheduled_run(&config, &namespace, &repository, run, now)
 }

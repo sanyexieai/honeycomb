@@ -5,14 +5,18 @@
 
 use std::thread;
 use std::time::Duration;
+use std::collections::HashSet;
 
 use anyhow::Result;
 use hc_agent::phrase_match_score;
 use hc_context::runtime::{DEFAULT_TENANT_ID, DEFAULT_USER_ID, default_session_id};
-use hc_conversation::{ConversationRepository, FollowUpStatus, PendingFollowUp};
+use hc_conversation::{ConversationRepository, PendingFollowUp};
 use hc_intent::{IntentResolution, ids as intent_ids};
 use hc_protocol::{ApiChatMessage, ApiMessageRole, ApiNamespace, ChatRequest, ChatResponse};
-use hc_scheduler::now_unix;
+use hc_scheduler::{
+    ScheduleKind, ScheduleRepository, ScheduleSpec, ScheduledTarget, ScheduledTargetKind,
+    ScheduledTask, now_unix,
+};
 use hc_store::store::WorkspaceNamespace;
 use serde::Deserialize;
 
@@ -20,6 +24,23 @@ use crate::{
     ServiceConfig,
     tool_turn::{ToolRoutingTags, load_tool_routing_tags, request_input, request_namespace},
 };
+
+#[derive(Debug, Clone)]
+struct TimedRunSpec {
+    id: String,
+    due_at_unix: u64,
+    draft_message: String,
+    notes: String,
+    payload: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct TimedTaskSpec {
+    agent_id: String,
+    trigger: String,
+    room_id: Option<String>,
+    runs: Vec<TimedRunSpec>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum TimedDeliverMode {
@@ -111,6 +132,24 @@ pub(crate) fn builtin_timed_sequence_rules() -> Vec<TimedSequenceRule> {
         agent_id: None,
         trigger: None,
         scheduled_reply: Some("好，按间隔播报。".to_owned()),
+    }]
+}
+
+pub(crate) fn builtin_reminder_rules() -> Vec<ReminderRule> {
+    vec![ReminderRule {
+        id: "builtin.reminder.cn".to_owned(),
+        hints: vec![
+            "提醒".to_owned(),
+            "叫我".to_owned(),
+            "稍后".to_owned(),
+            "等会".to_owned(),
+            "remind".to_owned(),
+        ],
+        default_delay_seconds: default_reminder_delay_seconds(),
+        agent_id: None,
+        trigger: None,
+        scheduled_reply: Some("好，到时间我会提醒您。".to_owned()),
+        due_reply: Some("到时间了。".to_owned()),
     }]
 }
 
@@ -282,26 +321,27 @@ fn handle_reminder_turn(
         .due_reply
         .clone()
         .unwrap_or_else(|| "到时间了。".to_owned());
-    let mut followup = PendingFollowUp::new(agent_id, trigger, now.saturating_add(delay_seconds));
-    followup.id = reminder_id.clone();
-    followup.room_id = request.session_id.clone();
-    followup.payload.insert(
-        "draft_message".to_owned(),
-        serde_json::Value::String(due_reply),
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "source_turn".to_owned(),
+        serde_json::Value::String(input.clone()),
     );
-    followup
-        .payload
-        .insert("source_turn".to_owned(), serde_json::Value::String(input));
-    followup.notes = format!("Reminder due in {delay_seconds} seconds.");
-    repository.write_followup(&followup)?;
+    let spec = TimedTaskSpec {
+        agent_id,
+        trigger,
+        room_id: request.session_id.clone(),
+        runs: vec![TimedRunSpec {
+            id: reminder_id.clone(),
+            due_at_unix: now.saturating_add(delay_seconds),
+            draft_message: due_reply,
+            notes: format!("Reminder due in {delay_seconds} seconds."),
+            payload,
+        }],
+    };
+    let followup_ids = persist_timed_task_runs(config, &namespace, &repository, spec)?;
 
     if matches!(deliver, TimedDeliverMode::Interactive) {
-        spawn_reminder_worker(
-            config.workspace_root.clone(),
-            namespace,
-            reminder_id,
-            delay_seconds,
-        );
+        spawn_interactive_followup_delivery_worker(config, &namespace_api, followup_ids);
     }
 
     Ok(Some(
@@ -311,33 +351,109 @@ fn handle_reminder_turn(
     ))
 }
 
-fn spawn_reminder_worker(
-    workspace_root: std::path::PathBuf,
-    namespace: WorkspaceNamespace,
-    followup_id: String,
-    delay_seconds: u64,
+fn spawn_interactive_followup_delivery_worker(
+    config: &ServiceConfig,
+    namespace: &ApiNamespace,
+    followup_ids: Vec<String>,
 ) {
+    let config = config.clone();
+    let namespace = namespace.clone();
     thread::spawn(move || {
-        thread::sleep(Duration::from_secs(delay_seconds));
-        let repository = ConversationRepository::with_namespace(workspace_root, namespace);
-        let relative_path = ConversationRepository::followup_relative_path_for(&followup_id);
-        let Ok(mut followup) = repository.read_followup(relative_path) else {
-            return;
-        };
-        if followup.status != FollowUpStatus::Pending {
-            return;
+        if let Err(error) = deliver_followups_interactive(&config, &namespace, &followup_ids) {
+            eprintln!("warning> timed followup delivery failed: {error}");
         }
-        if let Some(message) = followup
-            .payload
-            .get("draft_message")
-            .and_then(serde_json::Value::as_str)
-        {
-            println!("\nassistant> {message}");
-        }
-        followup.status = FollowUpStatus::Fired;
-        followup.notes = format!("Reminder fired at {}", now_unix());
-        let _ = repository.write_followup(&followup);
     });
+}
+
+fn deliver_followups_interactive(
+    config: &ServiceConfig,
+    namespace: &ApiNamespace,
+    followup_ids: &[String],
+) -> Result<()> {
+    struct StdoutFollowUpSink;
+    impl crate::scheduler::FollowUpMessageSink for StdoutFollowUpSink {
+        fn on_fired_followup_message(
+            &mut self,
+            message: &crate::scheduler::FiredFollowUpMessage,
+        ) {
+            println!("assistant> {}", message.message);
+        }
+    }
+
+    let mut pending: HashSet<String> = followup_ids.iter().cloned().collect();
+    let mut sink = StdoutFollowUpSink;
+    while !pending.is_empty() {
+        let report = crate::scheduler::dispatch_due_scheduled_runs(
+            config,
+            namespace.clone(),
+            Some(now_unix()),
+        )?;
+        let delivered_ids = crate::scheduler::dispatch_fired_followup_messages_from_receipts(
+            config,
+            namespace.clone(),
+            &report.receipts,
+            &mut sink,
+        )?;
+        for id in delivered_ids {
+            pending.remove(&id);
+        }
+        if !pending.is_empty() {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    Ok(())
+}
+
+fn persist_timed_task_runs(
+    config: &ServiceConfig,
+    namespace: &WorkspaceNamespace,
+    repository: &ConversationRepository,
+    spec: TimedTaskSpec,
+) -> Result<Vec<String>> {
+    let schedule_repository =
+        ScheduleRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let mut followup_ids = Vec::new();
+    for run in spec.runs {
+        let mut followup = PendingFollowUp::new(
+            spec.agent_id.clone(),
+            spec.trigger.clone(),
+            run.due_at_unix,
+        );
+        followup.id = run.id;
+        followup.room_id = spec.room_id.clone();
+        followup.payload = run.payload;
+        followup.payload.insert(
+            "draft_message".to_owned(),
+            serde_json::Value::String(run.draft_message),
+        );
+        followup.notes = run.notes;
+        repository.write_followup(&followup)?;
+        let mut target_args = serde_json::Map::new();
+        target_args.insert(
+            "followup_id".to_owned(),
+            serde_json::Value::String(followup.id.clone()),
+        );
+        let mut schedule = ScheduledTask::new(
+            format!("timed.followup.{}", followup.id),
+            format!("Timed followup {}", followup.id),
+            ScheduleSpec {
+                kind: ScheduleKind::Once,
+                run_at_unix: Some(followup.due_at_unix),
+                interval_seconds: None,
+            },
+            ScheduledTarget {
+                kind: ScheduledTargetKind::Event,
+                r#ref: "timed.followup".to_owned(),
+                action: Some("timed.followup.fire".to_owned()),
+                args: target_args,
+            },
+        );
+        schedule.tags = vec!["scheduled".to_owned(), "timed".to_owned(), "followup".to_owned()];
+        schedule.notes = "Mirrored from timed_turn followup queue.".to_owned();
+        schedule_repository.write_schedule(&schedule)?;
+        followup_ids.push(followup.id);
+    }
+    Ok(followup_ids)
 }
 
 fn reminder_for_turn(user_turn: &str, routing: &ToolRoutingTags) -> Option<(ReminderRule, u64)> {
@@ -384,7 +500,7 @@ fn execute_timed_sequence(
     deliver: TimedDeliverMode,
 ) -> Result<Option<ChatResponse>> {
     let ws = WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
-    let repository = ConversationRepository::with_namespace(config.workspace_root.clone(), ws);
+    let repository = ConversationRepository::with_namespace(config.workspace_root.clone(), ws.clone());
     let now = now_unix();
     let sequence_prefix = if rule.id.trim().is_empty() {
         "timed-sequence"
@@ -401,28 +517,33 @@ fn execute_timed_sequence(
         .clone()
         .unwrap_or_else(|| "agent.system.timer".to_owned());
 
+    let mut runs = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
-        let mut followup = PendingFollowUp::new(
-            agent_id.clone(),
-            trigger.clone(),
-            now.saturating_add(rule.interval_seconds.saturating_mul(index as u64)),
-        );
-        followup.id = format!("{sequence_id}.{index}");
-        followup.room_id = request.session_id.clone();
-        followup.payload.insert(
+        let mut payload = serde_json::Map::new();
+        payload.insert(
             "sequence_id".to_owned(),
             serde_json::Value::String(sequence_id.clone()),
         );
-        followup
-            .payload
-            .insert("index".to_owned(), serde_json::json!(index));
-        followup.payload.insert(
-            "draft_message".to_owned(),
-            serde_json::Value::String(value.to_string()),
-        );
-        followup.notes = format!("Timed sequence tick {index}: {value}");
-        repository.write_followup(&followup)?;
+        payload.insert("index".to_owned(), serde_json::json!(index));
+        runs.push(TimedRunSpec {
+            id: format!("{sequence_id}.{index}"),
+            due_at_unix: now.saturating_add(rule.interval_seconds.saturating_mul(index as u64)),
+            draft_message: value.to_string(),
+            notes: format!("Timed sequence tick {index}: {value}"),
+            payload,
+        });
     }
+    let followup_ids = persist_timed_task_runs(
+        config,
+        &ws,
+        &repository,
+        TimedTaskSpec {
+            agent_id,
+            trigger,
+            room_id: request.session_id.clone(),
+            runs,
+        },
+    )?;
 
     let ack = rule
         .scheduled_reply
@@ -430,51 +551,10 @@ fn execute_timed_sequence(
         .unwrap_or_else(|| "scheduled timed sequence".to_owned());
 
     if matches!(deliver, TimedDeliverMode::Interactive) {
-        deliver_timed_sequence_followups(&repository, &sequence_id, values.len())?;
+        deliver_followups_interactive(config, namespace, &followup_ids)?;
     }
 
     Ok(Some(chat_response_simple(request, namespace, ack)))
-}
-
-fn deliver_timed_sequence_followups(
-    repository: &ConversationRepository,
-    sequence_id: &str,
-    expected_count: usize,
-) -> Result<()> {
-    let mut delivered = 0usize;
-    while delivered < expected_count {
-        let now = now_unix();
-        let due = repository.due_followups(now)?;
-        let mut matched_any = false;
-        for mut followup in due {
-            if followup
-                .payload
-                .get("sequence_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(sequence_id)
-            {
-                continue;
-            }
-            matched_any = true;
-            if let Some(message) = followup
-                .payload
-                .get("draft_message")
-                .and_then(serde_json::Value::as_str)
-            {
-                println!("assistant> {message}");
-            }
-            followup.status = FollowUpStatus::Fired;
-            repository.write_followup(&followup)?;
-            delivered += 1;
-        }
-        if delivered >= expected_count {
-            break;
-        }
-        if !matched_any {
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn timed_sequence_match_for_turn(
@@ -709,4 +789,17 @@ fn parse_chinese_i64(text: &str) -> Option<i64> {
     }
     let value = if saw_unit { total + current } else { current };
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{builtin_reminder_rules, reminder_delay_seconds};
+
+    #[test]
+    fn builtin_reminder_rule_has_cn_hint_and_seconds_parser_works() {
+        let rules = builtin_reminder_rules();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].hints.iter().any(|hint| hint == "叫我"));
+        assert_eq!(reminder_delay_seconds("两秒后叫我", 60), Some(2));
+    }
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use hc_context::runtime::{RuntimeIdentity, RuntimeVariables};
-use hc_conversation::{ConversationEvent, ConversationRepository};
+use hc_conversation::{ConversationEvent, ConversationRepository, FollowUpStatus};
 use hc_protocol::ApiNamespace;
 use hc_scheduler::{
     ScheduleRepository, ScheduleStatus, ScheduledRun, ScheduledRunStatus, ScheduledTargetKind,
@@ -26,7 +26,7 @@ pub struct SchedulerDispatchReport {
     pub receipts: Vec<SchedulerDispatchReceipt>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerDispatchReceipt {
     pub run_id: String,
     pub schedule_id: String,
@@ -35,6 +35,40 @@ pub struct SchedulerDispatchReceipt {
     pub status: String,
     pub result_ref: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FiredFollowUpMessage {
+    pub followup_id: String,
+    pub message: String,
+}
+
+pub trait FollowUpMessageSink {
+    fn on_fired_followup_message(&mut self, message: &FiredFollowUpMessage);
+}
+
+#[derive(Default)]
+pub struct NoopFollowUpMessageSink;
+
+impl FollowUpMessageSink for NoopFollowUpMessageSink {
+    fn on_fired_followup_message(&mut self, _: &FiredFollowUpMessage) {}
+}
+
+#[derive(Default)]
+pub struct CollectFollowUpMessageSink {
+    messages: Vec<FiredFollowUpMessage>,
+}
+
+impl CollectFollowUpMessageSink {
+    pub fn into_messages(self) -> Vec<FiredFollowUpMessage> {
+        self.messages
+    }
+}
+
+impl FollowUpMessageSink for CollectFollowUpMessageSink {
+    fn on_fired_followup_message(&mut self, message: &FiredFollowUpMessage) {
+        self.messages.push(message.clone());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +196,73 @@ pub fn dispatch_queued_scheduled_runs(
         queued_count: 0,
         receipts,
     })
+}
+
+pub fn fired_followup_messages_from_receipts(
+    config: &ServiceConfig,
+    namespace: ApiNamespace,
+    receipts: &[SchedulerDispatchReceipt],
+) -> Result<Vec<FiredFollowUpMessage>> {
+    let workspace_namespace = workspace_namespace(namespace);
+    let repository =
+        ConversationRepository::with_namespace(config.workspace_root.clone(), workspace_namespace);
+    let mut messages = Vec::new();
+    for receipt in receipts {
+        let Some(result_ref) = receipt.result_ref.as_deref() else {
+            continue;
+        };
+        let Some(raw_followup_id) = result_ref.strip_prefix("followup:") else {
+            continue;
+        };
+        let followup_id = raw_followup_id
+            .split(':')
+            .next()
+            .unwrap_or(raw_followup_id)
+            .to_owned();
+        let relative_path = ConversationRepository::followup_relative_path_for(&followup_id);
+        let Ok(followup) = repository.read_followup(relative_path) else {
+            continue;
+        };
+        if followup.status != FollowUpStatus::Fired {
+            continue;
+        }
+        let Some(message) = followup
+            .payload
+            .get("draft_message")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        messages.push(FiredFollowUpMessage {
+            followup_id,
+            message: message.to_owned(),
+        });
+    }
+    Ok(messages)
+}
+
+pub fn dispatch_fired_followup_messages_from_receipts(
+    config: &ServiceConfig,
+    namespace: ApiNamespace,
+    receipts: &[SchedulerDispatchReceipt],
+    sink: &mut impl FollowUpMessageSink,
+) -> Result<Vec<String>> {
+    let messages = fired_followup_messages_from_receipts(config, namespace, receipts)?;
+    let mut delivered_ids = Vec::with_capacity(messages.len());
+    for message in &messages {
+        sink.on_fired_followup_message(message);
+        delivered_ids.push(message.followup_id.clone());
+    }
+    Ok(delivered_ids)
+}
+
+pub fn dispatch_fired_followup_messages_headless(
+    config: &ServiceConfig,
+    namespace: ApiNamespace,
+    receipts: &[SchedulerDispatchReceipt],
+) -> Result<Vec<String>> {
+    let mut sink = NoopFollowUpMessageSink;
+    dispatch_fired_followup_messages_from_receipts(config, namespace, receipts, &mut sink)
 }
 
 fn dispatch_queued_runs(
@@ -399,6 +500,9 @@ fn dispatch_scheduled_event_run(
     if event_ref.is_empty() {
         bail!("scheduled event target requires non-empty ref");
     }
+    if event_ref == "timed.followup" {
+        return dispatch_timed_followup_event(config, namespace, run);
+    }
     let repository =
         ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
     let kind = run
@@ -416,6 +520,52 @@ fn dispatch_scheduled_event_run(
     event.tags.push("scheduled".to_owned());
     repository.write_event(&event)?;
     Ok(format!("event:{event_ref}"))
+}
+
+fn dispatch_timed_followup_event(
+    config: &ServiceConfig,
+    namespace: &WorkspaceNamespace,
+    run: &ScheduledRun,
+) -> Result<String> {
+    let followup_id = optional_arg_string(&run.target.args, "followup_id")
+        .context("timed.followup event requires args.followup_id")?;
+    let repository =
+        ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let relative = ConversationRepository::followup_relative_path_for(&followup_id);
+    let mut followup = repository.read_followup(relative)?;
+    if followup.status != FollowUpStatus::Pending {
+        return Ok(format!("followup:{followup_id}:already-{:?}", followup.status));
+    }
+    let draft_message = followup
+        .payload
+        .get("draft_message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    followup.status = FollowUpStatus::Fired;
+    followup.notes = format!(
+        "{}\n\nscheduler fired at {}",
+        followup.notes.trim(),
+        now_unix()
+    )
+    .trim()
+    .to_owned();
+    repository.write_followup(&followup)?;
+    let mut event = ConversationEvent::new("timed.followup.fired");
+    event.id = format!("timed-followup-fired.{}", run.id.replace('/', "-"));
+    event.room_id = followup.room_id.clone();
+    event.agent_id = Some(followup.agent_id.clone());
+    event
+        .payload
+        .insert("followup_id".to_owned(), json!(followup_id.clone()));
+    if let Some(message) = draft_message {
+        event
+            .payload
+            .insert("draft_message".to_owned(), json!(message));
+    }
+    event.tags.push("scheduled".to_owned());
+    event.tags.push("timed".to_owned());
+    repository.write_event(&event)?;
+    Ok(format!("followup:{followup_id}"))
 }
 
 fn receipt(
@@ -515,6 +665,7 @@ fn normalized_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hc_conversation::{ConversationRepository, FollowUpStatus, PendingFollowUp};
     use hc_scheduler::{
         ScheduleKind, ScheduleSpec, ScheduledRunStatus, ScheduledTarget, ScheduledTargetKind,
         ScheduledTask,
@@ -606,5 +757,114 @@ mod tests {
         let runs = repository.list_runs().unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, ScheduledRunStatus::Succeeded);
+    }
+
+    #[test]
+    fn timed_followup_event_dispatch_marks_followup_fired_and_emits_event() {
+        let root = temp_root("timed-followup");
+        let config = ServiceConfig::new(&root);
+        let namespace = ApiNamespace::default();
+        let workspace_namespace =
+            WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
+        let schedule_repo = ScheduleRepository::with_namespace(&root, workspace_namespace.clone());
+        let conversation_repo = ConversationRepository::with_namespace(&root, workspace_namespace);
+        let mut followup = PendingFollowUp::new("agent.system.reminder", "reminder.due", 10);
+        followup.id = "test-followup-1".to_owned();
+        followup
+            .payload
+            .insert("draft_message".to_owned(), json!("到时间了"));
+        conversation_repo.write_followup(&followup).unwrap();
+        let mut args = Map::new();
+        args.insert("followup_id".to_owned(), json!("test-followup-1"));
+        let task = ScheduledTask::new(
+            "schedule.service.timed-followup",
+            "Timed Followup Event",
+            ScheduleSpec {
+                kind: ScheduleKind::Once,
+                run_at_unix: Some(10),
+                interval_seconds: None,
+            },
+            ScheduledTarget {
+                kind: ScheduledTargetKind::Event,
+                r#ref: "timed.followup".to_owned(),
+                action: Some("timed.followup.fire".to_owned()),
+                args,
+            },
+        );
+        schedule_repo.write_schedule(&task).unwrap();
+
+        let report = dispatch_due_scheduled_runs(&config, namespace, Some(10)).unwrap();
+        assert_eq!(report.queued_count, 1);
+        assert_eq!(report.receipts.len(), 1);
+        assert_eq!(report.receipts[0].status, "succeeded");
+        assert_eq!(
+            report.receipts[0].result_ref.as_deref(),
+            Some("followup:test-followup-1")
+        );
+
+        let refreshed = conversation_repo
+            .read_followup(ConversationRepository::followup_relative_path_for("test-followup-1"))
+            .unwrap();
+        assert_eq!(refreshed.status, FollowUpStatus::Fired);
+        let events = conversation_repo.list_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "timed.followup.fired"
+                && event
+                    .payload
+                    .get("followup_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("test-followup-1")));
+    }
+
+    #[test]
+    fn collect_sink_receives_fired_followup_messages() {
+        let root = temp_root("collect-sink");
+        let config = ServiceConfig::new(&root);
+        let namespace = ApiNamespace::default();
+        let workspace_namespace =
+            WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
+        let schedule_repo = ScheduleRepository::with_namespace(&root, workspace_namespace.clone());
+        let conversation_repo = ConversationRepository::with_namespace(&root, workspace_namespace);
+        let mut followup = PendingFollowUp::new("agent.system.reminder", "reminder.due", 10);
+        followup.id = "test-followup-collect".to_owned();
+        followup
+            .payload
+            .insert("draft_message".to_owned(), json!("收到了"));
+        conversation_repo.write_followup(&followup).unwrap();
+        let mut args = Map::new();
+        args.insert("followup_id".to_owned(), json!("test-followup-collect"));
+        let task = ScheduledTask::new(
+            "schedule.service.collect-followup",
+            "Collect Followup Event",
+            ScheduleSpec {
+                kind: ScheduleKind::Once,
+                run_at_unix: Some(10),
+                interval_seconds: None,
+            },
+            ScheduledTarget {
+                kind: ScheduledTargetKind::Event,
+                r#ref: "timed.followup".to_owned(),
+                action: Some("timed.followup.fire".to_owned()),
+                args,
+            },
+        );
+        schedule_repo.write_schedule(&task).unwrap();
+
+        let report = dispatch_due_scheduled_runs(&config, namespace.clone(), Some(10)).unwrap();
+        let mut sink = CollectFollowUpMessageSink::default();
+        let delivered = dispatch_fired_followup_messages_from_receipts(
+            &config,
+            namespace,
+            &report.receipts,
+            &mut sink,
+        )
+        .unwrap();
+        let messages = sink.into_messages();
+
+        assert_eq!(delivered, vec!["test-followup-collect".to_owned()]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].followup_id, "test-followup-collect");
+        assert_eq!(messages[0].message, "收到了");
     }
 }

@@ -38,10 +38,12 @@ pub(crate) struct ToolRoutingTags {
 
 impl ToolRoutingTags {
     pub(crate) fn ensure_builtin_timed_sequences(&mut self) {
-        if !self.timed_sequence_rules.is_empty() {
-            return;
+        if self.timed_sequence_rules.is_empty() {
+            self.timed_sequence_rules = crate::timed_turn::builtin_timed_sequence_rules();
         }
-        self.timed_sequence_rules = crate::timed_turn::builtin_timed_sequence_rules();
+        if self.reminder_rules.is_empty() {
+            self.reminder_rules = crate::timed_turn::builtin_reminder_rules();
+        }
     }
 }
 

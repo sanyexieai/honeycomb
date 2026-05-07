@@ -324,6 +324,35 @@ HC_USER_ID=default
 
 The API loop delegates to `hc-service::scheduler`; it does not contain domain-specific scheduling or routing rules.
 
+### Followup Delivery Mode
+
+`hc-api` exposes an explicit scheduler followup delivery strategy:
+
+```text
+HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE=headless|off
+```
+
+Current modes:
+
+- `headless` (default): resolve fired followup messages via scheduler receipts without stdout side effects.
+- `off`: skip followup message delivery pass (dispatch still runs; followup message extraction is disabled).
+
+Behavior matrix:
+
+| Runtime path | Mode | Followup delivery pass |
+| --- | --- | --- |
+| API scheduler loop (`HC_SCHEDULER_ENABLED=true`) | `headless` | enabled |
+| API scheduler loop (`HC_SCHEDULER_ENABLED=true`) | `off` | disabled |
+| `POST /v1/schedules/dispatch-due` | `headless` | enabled |
+| `POST /v1/schedules/dispatch-due` | `off` | disabled |
+| `POST /v1/schedules/dispatch-queued` | `headless` | enabled |
+| `POST /v1/schedules/dispatch-queued` | `off` | disabled |
+
+Notes:
+
+- `hc-cli schedule watch` remains interactive and prints `assistant> ...` for fired followup messages.
+- API logs include `delivered_followups` for scheduler loop and dispatch endpoints.
+
 ## Design Rule
 
 No schedule implementation should contain business-specific matching logic.

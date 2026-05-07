@@ -8,6 +8,8 @@ services:
     environment:
       HC_API_BIND: 0.0.0.0:8787
       HC_WORKSPACE_ROOT: /app/workspace
+      # Scheduler followup delivery mode: headless (default) | off
+      HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE: ${HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE:-headless}
     ports:
       - "${HC_API_PORT:-8787}:8787"
     volumes:
