@@ -6,7 +6,31 @@ use hc_core::{
 use hc_responder::{ReplyRequest, ResponderBackend};
 use serde::{Deserialize, Serialize};
 
+use crate::swarm_routing;
 use crate::{AgentPlan, IncubationReport, MaterializedAgent, TaskRequest};
+use hc_protocol::swarm::{
+    RoutingDecisionRecord, RoutingTier, SwarmRoutingBindingSnapshot, TaskBindingDecisionRecord,
+};
+use hc_trace::{TraceEvent, emit_trace};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwarmMessageClassification {
+    pub routing: RoutingDecisionRecord,
+    pub task_binding: TaskBindingDecisionRecord,
+}
+
+impl SwarmMessageClassification {
+    #[must_use]
+    pub fn routing_binding_snapshot(&self) -> SwarmRoutingBindingSnapshot {
+        SwarmRoutingBindingSnapshot::new(self.routing.clone(), self.task_binding.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NominationCycleOutcome {
+    pub grant: Option<SpeakingGrant>,
+    pub swarm: Option<SwarmMessageClassification>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AgentOrchestrator;
@@ -87,19 +111,68 @@ impl AgentOrchestrator {
         agents: &[MaterializedAgent],
         message: &MessageRecord,
         timestamp_ms: u64,
-    ) -> Result<Option<SpeakingGrant>> {
-        let claims = self.suggest_claims_for_message(runtime, agents, message, timestamp_ms)?;
-        self.submit_suggested_claims(runtime, &claims)?;
-
-        let round = runtime.nomination_for_message(&message.id)?.current_round;
-        let result = runtime.dispatch(RuntimeCommand::ResolveSpeakingGrant {
-            message_id: message.id.clone(),
-            round,
-        })?;
-        let RuntimeCommandResult::SpeakingGrant(grant) = result else {
-            anyhow::bail!("unexpected runtime result while resolving speaking grant");
+        conversation_active_task_id: Option<&str>,
+        task_id_hint: Option<&str>,
+    ) -> Result<NominationCycleOutcome> {
+        let swarm = if matches!(message.kind, MessageKind::Chat) {
+            let routing = swarm_routing::decide_routing_tier(&message.body);
+            let task_binding = swarm_routing::decide_task_binding(
+                &routing,
+                conversation_active_task_id,
+                task_id_hint,
+            );
+            swarm_routing::emit_swarm_message_routing(
+                &routing,
+                &task_binding,
+                &message.id,
+                &message.session_id,
+            );
+            Some(SwarmMessageClassification {
+                routing,
+                task_binding,
+            })
+        } else {
+            None
         };
-        Ok(grant)
+
+        let skip_message_nomination = swarm
+            .as_ref()
+            .is_some_and(|s| matches!(s.routing.routing_tier, RoutingTier::L2 | RoutingTier::L3));
+
+        let grant = if skip_message_nomination {
+            if let Some(ref classified) = swarm {
+                emit_trace(
+                    TraceEvent::info(
+                        "hc-agent",
+                        "swarm",
+                        "message_nomination_skipped_for_routing_tier",
+                        format!(
+                            "{}: skip message-level nomination",
+                            classified.routing.routing_tier
+                        ),
+                    )
+                    .with_field("message_id", message.id.clone())
+                    .with_field("session_id", message.session_id.clone())
+                    .with_field("routing_tier", classified.routing.routing_tier.as_str()),
+                );
+            }
+            None
+        } else {
+            let claims = self.suggest_claims_for_message(runtime, agents, message, timestamp_ms)?;
+            self.submit_suggested_claims(runtime, &claims)?;
+
+            let round = runtime.nomination_for_message(&message.id)?.current_round;
+            let result = runtime.dispatch(RuntimeCommand::ResolveSpeakingGrant {
+                message_id: message.id.clone(),
+                round,
+            })?;
+            let RuntimeCommandResult::SpeakingGrant(grant) = result else {
+                anyhow::bail!("unexpected runtime result while resolving speaking grant");
+            };
+            grant
+        };
+
+        Ok(NominationCycleOutcome { grant, swarm })
     }
 
     pub fn build_reply_request_for_grant(

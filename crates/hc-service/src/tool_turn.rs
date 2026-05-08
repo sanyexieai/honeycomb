@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use hc_agent::routing::phrase_match_score_with_stop_terms;
@@ -11,7 +15,8 @@ use serde_json::{Map, Value};
 use crate::{
     ServiceConfig,
     timed_turn::{ReminderRule, TimedSequenceRule},
-    tool::{McpToolCallRequest, McpToolListRequest, call_configured_mcp_tool, list_mcp_tools},
+    tool::{McpToolListRequest, list_mcp_tools},
+    tool_execution::{execute_tool_invocation, mcp_invocation_plan, require_mcp_metadata},
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -217,6 +222,13 @@ pub struct ToolTurnResult {
     pub result: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingToolExecutionPlan {
+    pub namespace: ApiNamespace,
+    pub session_id: String,
+    pub route: ConfirmedPendingToolRoute,
+}
+
 pub fn try_handle_configured_mcp_turn(
     config: &ServiceConfig,
     request: &ChatRequest,
@@ -232,7 +244,17 @@ pub fn try_handle_configured_mcp_route_turn(
     config: &ServiceConfig,
     request: &ChatRequest,
 ) -> Result<Option<ToolTurnResult>> {
-    let Some(route) = resolve_configured_mcp_route(config, request)? else {
+    try_handle_configured_mcp_route_turn_with_filter(config, request, None)
+}
+
+pub fn try_handle_configured_mcp_route_turn_with_filter(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    allowed_tool_ids: Option<&BTreeSet<String>>,
+) -> Result<Option<ToolTurnResult>> {
+    let Some(route) =
+        resolve_configured_mcp_route_with_policy(config, request, allowed_tool_ids, None, None)?
+    else {
         return Ok(None);
     };
     let result = execute_configured_mcp_route(config, request, route)?;
@@ -246,6 +268,17 @@ pub fn try_handle_persisted_pending_confirmation(
     config: &ServiceConfig,
     request: &ChatRequest,
 ) -> Result<Option<ToolTurnResult>> {
+    let Some(plan) = resolve_persisted_pending_confirmation_plan(config, request)? else {
+        return Ok(None);
+    };
+    let result = execute_persisted_pending_confirmation_plan(config, request, plan)?;
+    Ok(Some(result))
+}
+
+pub fn resolve_persisted_pending_confirmation_plan(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+) -> Result<Option<PendingToolExecutionPlan>> {
     let input = request_input(request)?;
     let namespace = request_namespace(request);
     let session_id = request_session_id(request, &namespace);
@@ -258,20 +291,37 @@ pub fn try_handle_persisted_pending_confirmation(
     else {
         return Ok(None);
     };
+    Ok(Some(PendingToolExecutionPlan {
+        namespace,
+        session_id,
+        route,
+    }))
+}
+
+pub fn execute_persisted_pending_confirmation_plan(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    plan: PendingToolExecutionPlan,
+) -> Result<ToolTurnResult> {
     let tools = list_mcp_tools(
         config,
         McpToolListRequest {
-            namespace: namespace.clone(),
+            namespace: plan.namespace.clone(),
             tenant_id: None,
             user_id: None,
             refresh: false,
             server_id: None,
         },
     )?;
-    let result =
-        execute_confirmed_pending_tool_route(config, request, &namespace, route, &tools.tools)?;
-    clear_tool_turn_session_state(config, &namespace, &session_id)?;
-    Ok(Some(result))
+    let result = execute_confirmed_pending_tool_route(
+        config,
+        request,
+        &plan.namespace,
+        plan.route,
+        &tools.tools,
+    )?;
+    clear_tool_turn_session_state(config, &plan.namespace, &plan.session_id)?;
+    Ok(result)
 }
 
 fn persist_pending_confirmation_for_result(
@@ -326,6 +376,24 @@ pub fn resolve_configured_mcp_route(
     config: &ServiceConfig,
     request: &ChatRequest,
 ) -> Result<Option<ConfiguredMcpRoute>> {
+    resolve_configured_mcp_route_with_filter(config, request, None)
+}
+
+pub fn resolve_configured_mcp_route_with_filter(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    allowed_tool_ids: Option<&BTreeSet<String>>,
+) -> Result<Option<ConfiguredMcpRoute>> {
+    resolve_configured_mcp_route_with_policy(config, request, allowed_tool_ids, None, None)
+}
+
+pub fn resolve_configured_mcp_route_with_policy(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    allowed_tool_ids: Option<&BTreeSet<String>>,
+    provider_argument_override: Option<&Map<String, Value>>,
+    tool_argument_override: Option<&BTreeMap<String, Map<String, Value>>>,
+) -> Result<Option<ConfiguredMcpRoute>> {
     let input = request_input(request)?;
     let namespace = request_namespace(request);
     let routing = load_tool_routing_tags(config, &namespace).unwrap_or_default();
@@ -339,7 +407,7 @@ pub fn resolve_configured_mcp_route(
             server_id: None,
         },
     )?;
-    let Some(tool) = select_mcp_tool(&tools.tools, &routing, &input) else {
+    let Some(tool) = select_mcp_tool(&tools.tools, &routing, &input, allowed_tool_ids) else {
         return Ok(None);
     };
     let Some(server_id) = tool.tool.default_command.get(1).cloned() else {
@@ -354,6 +422,18 @@ pub fn resolve_configured_mcp_route(
         route_arguments_for_tool(config, &namespace, request, &tool.tool, &routing, &input)
     {
         arguments.insert(key, value);
+    }
+    if let Some(overrides) =
+        tool_argument_override.and_then(|overrides| overrides.get(&tool.tool.id))
+    {
+        for (key, value) in overrides {
+            arguments.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(overrides) = provider_argument_override {
+        for (key, value) in overrides {
+            arguments.insert(key.clone(), value.clone());
+        }
     }
     Ok(Some(ConfiguredMcpRoute {
         namespace,
@@ -371,19 +451,19 @@ pub fn execute_configured_mcp_route(
     route: ConfiguredMcpRoute,
 ) -> Result<Option<ToolTurnResult>> {
     let rendering = load_tool_response_rendering(config, &route.namespace).unwrap_or_default();
-    let result = call_configured_mcp_tool(
-        config,
-        McpToolCallRequest {
-            namespace: route.namespace.clone(),
-            tenant_id: None,
-            user_id: None,
-            session_id: request.session_id.clone(),
-            server_id: route.server_id.clone(),
-            tool_name: route.tool_name.clone(),
-            arguments: route.arguments,
-        },
-    )?;
-    let Some(content) = render_tool_result(&rendering, &route.tool, &result.result) else {
+    let invocation = mcp_invocation_plan(
+        route.tool.id.clone(),
+        route.input.clone(),
+        route.tool.default_command.clone(),
+        route.namespace.clone(),
+        request.session_id.clone(),
+        route.server_id.clone(),
+        route.tool_name.clone(),
+        route.arguments,
+    );
+    let outcome = execute_tool_invocation(config, &invocation)?;
+    let (server_id, tool_name, raw_result) = require_mcp_metadata(&outcome)?;
+    let Some(content) = render_tool_result(&rendering, &route.tool, raw_result) else {
         return Ok(None);
     };
     Ok(Some(ToolTurnResult {
@@ -412,6 +492,7 @@ pub fn execute_configured_mcp_route(
             room_id: request.room_id.clone(),
             selected_agent_id: request.agent_id.clone(),
             selected_domain_id: request.domain_id.clone(),
+            selected_provider: None,
             recalled_memories: Vec::new(),
             synthesized_prompt_asset_count: 0,
             room_capabilities_used: Vec::new(),
@@ -420,11 +501,12 @@ pub fn execute_configured_mcp_route(
             behavior_pattern_used: None,
             decision_reasoning: None,
             decision_confidence: None,
+            active_task_id: None,
         },
         tool_id: route.tool.id,
-        server_id: route.server_id,
-        tool_name: route.tool_name,
-        result: result.result,
+        server_id: server_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        result: raw_result.clone(),
     }))
 }
 
@@ -450,23 +532,23 @@ fn execute_confirmed_pending_tool_route(
         let Some(tool_name) = tool.tool.default_command.get(2).cloned() else {
             continue;
         };
-        let result = call_configured_mcp_tool(
-            config,
-            McpToolCallRequest {
-                namespace: namespace.clone(),
-                tenant_id: None,
-                user_id: None,
-                session_id: request.session_id.clone(),
-                server_id: server_id.clone(),
-                tool_name: tool_name.clone(),
-                arguments: route.arguments.clone(),
-            },
-        )?;
-        if is_mcp_error(&result.result) {
-            last_error = Some(result.result);
+        let invocation = mcp_invocation_plan(
+            tool.tool.id.clone(),
+            route.tool_id.clone(),
+            tool.tool.default_command.clone(),
+            namespace.clone(),
+            request.session_id.clone(),
+            server_id.clone(),
+            tool_name.clone(),
+            route.arguments.clone(),
+        );
+        let outcome = execute_tool_invocation(config, &invocation)?;
+        let (_, _, raw_result) = require_mcp_metadata(&outcome)?;
+        if !outcome.success {
+            last_error = Some(raw_result.clone());
             continue;
         }
-        if let Some(content) = render_tool_result(&rendering, &tool.tool, &result.result) {
+        if let Some(content) = render_tool_result(&rendering, &tool.tool, raw_result) {
             return Ok(ToolTurnResult {
                 response: ChatResponse {
                     message: ApiChatMessage {
@@ -482,6 +564,7 @@ fn execute_confirmed_pending_tool_route(
                     room_id: request.room_id.clone(),
                     selected_agent_id: request.agent_id.clone(),
                     selected_domain_id: request.domain_id.clone(),
+                    selected_provider: None,
                     recalled_memories: Vec::new(),
                     synthesized_prompt_asset_count: 0,
                     room_capabilities_used: Vec::new(),
@@ -490,14 +573,15 @@ fn execute_confirmed_pending_tool_route(
                     behavior_pattern_used: None,
                     decision_reasoning: None,
                     decision_confidence: None,
+                    active_task_id: None,
                 },
                 tool_id: tool.tool.id.clone(),
                 server_id,
                 tool_name,
-                result: result.result,
+                result: raw_result.clone(),
             });
         }
-        last_error = Some(result.result);
+        last_error = Some(raw_result.clone());
     }
     let detail = last_error
         .map(|value| value.to_string())
@@ -756,9 +840,11 @@ fn select_mcp_tool(
     tools: &[crate::tool::McpToolSummary],
     routing: &ToolRoutingTags,
     input: &str,
+    allowed_tool_ids: Option<&BTreeSet<String>>,
 ) -> Option<crate::tool::McpToolSummary> {
     tools
         .iter()
+        .filter(|tool| allowed_tool_ids.is_none_or(|allowed| allowed.contains(&tool.tool.id)))
         .filter_map(|tool| {
             let score = score_tool_for_input(&tool.tool, routing, input);
             (score > 0).then_some((tool.clone(), score))
@@ -832,21 +918,23 @@ fn fetch_tool_context(
     rule: &ToolContextCallRule,
 ) -> Option<Value> {
     for tool_name in &rule.tool_names {
-        let result = call_configured_mcp_tool(
-            config,
-            McpToolCallRequest {
-                namespace: namespace.clone(),
-                tenant_id: None,
-                user_id: None,
-                session_id: request.session_id.clone(),
-                server_id: rule.server_id.clone(),
-                tool_name: tool_name.clone(),
-                arguments: Map::new(),
-            },
-        )
-        .ok()?;
-        if !is_mcp_error(&result.result) {
-            return Some(result.result);
+        let invocation = mcp_invocation_plan(
+            format!("mcp.context.{}.{}", rule.server_id, tool_name),
+            format!("context fetch for {}", rule.arg),
+            vec![
+                "hc.mcp.call".to_owned(),
+                rule.server_id.clone(),
+                tool_name.clone(),
+            ],
+            namespace.clone(),
+            request.session_id.clone(),
+            rule.server_id.clone(),
+            tool_name.clone(),
+            Map::new(),
+        );
+        let outcome = execute_tool_invocation(config, &invocation).ok()?;
+        if outcome.success {
+            return outcome.raw_result.clone();
         }
     }
     None

@@ -21,7 +21,7 @@ In addition to the main task lifecycle, Honeycomb also needs a dedicated multi-t
 
 See:
 
-- [channel-conversation.md](/d:/code/honeycomb/docs/channel-conversation.md)
+- [channel-conversation.md](./channel-conversation.md)
 
 That mode is for:
 
@@ -158,8 +158,10 @@ When assigning work:
 
 If no one clears the threshold:
 
-- lower the threshold by round
-- if still nobody fits, create a new seed agent
+- keep the item in claiming or replan according to the active assignment policy
+- if the system later decides no existing agent fits, create a new seed agent
+
+> **Note (P0 vs P1):** per [ADR-003](../adr/ADR-003-work-item-persistence-and-idempotency.md) rollout, **lowering the eligible / claim threshold across rounds** is tracked as **P1** (optional product evolution), not part of the minimal P0 assign rule set. P0 behavior is a **fixed** deterministic winner order and a single eligible bar per round unless replan changes the work item.
 
 ## New Agent Completion
 
@@ -189,6 +191,16 @@ Desired top-level sequence:
 5. Consolidation
 
 The UI should not begin with a static default multi-agent chat unless that team was created by the current task flow.
+
+Default user experience should still remain conversation-first.
+
+This means:
+
+- the main interaction surface may remain a conversation thread
+- implicit `L2` work items may execute behind that thread without forcing the
+  user into a task board
+- explicit planning, assignment, and execution boards are primarily for `L3`
+  flows or when the user expands task detail deliberately
 
 ## Persistence Expectations
 
@@ -222,3 +234,32 @@ Honeycomb should be:
 - agent-generating
 - responder-agnostic
 - persistence-oriented
+
+## Decision Records
+
+For the current narrow-path swarm collaboration rollout, also see:
+
+- [Swarm P0 rollout checklist](./todo/swarm-p0-rollout.md) (implementation status vs ADR-001～005 narrow path)
+
+For the same scope, formal ADRs are listed below.
+
+- [ADR Index](./adr/README.md)
+- [ADR-001 Task Routing Tier](./adr/ADR-001-task-routing-tier.md)
+- [ADR-002 Planner Only Semantics](./adr/ADR-002-planner-only-semantics.md)
+- [ADR-003 Work Item Persistence And Idempotency](./adr/ADR-003-work-item-persistence-and-idempotency.md)
+- [ADR-004 Conversation Task Room Scope](./adr/ADR-004-conversation-task-room-scope.md)
+- [ADR-005 Outward Speaker And Artifact Schema](./adr/ADR-005-outward-speaker-and-artifact-schema.md)
+- [ADR-006 Experience Lane Boundary](./adr/ADR-006-experience-lane-boundary.md)
+
+## Experience Boundary
+
+Honeycomb may later adopt an ACE-inspired experience lane for outcome capture,
+reflection, and curated playbook evolution.
+
+That lane is not the default P0 execution path.
+
+For the current rollout:
+
+- main task execution remains conversation-first and task-scoped
+- learning or playbook evolution must remain opt-in and post-task
+- main completion must not depend on successful learning-side processing

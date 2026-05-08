@@ -9,7 +9,7 @@ use hc_memory::{
 };
 use serde_json;
 
-use super::{parse_common_options, runtime_namespace, CLI_RUNTIME_CONTEXT};
+use super::{CLI_RUNTIME_CONTEXT, parse_common_options, runtime_namespace};
 
 // Room 能力管理命令
 pub(super) fn handle_room(args: &[String]) -> Result<()> {

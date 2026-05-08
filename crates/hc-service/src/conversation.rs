@@ -183,7 +183,7 @@ pub fn draft_agent_turn_proposal(
             tenant_id: Some(namespace.tenant_id.clone()),
             user_id: Some(namespace.user_id.clone()),
             session_id: proposal.room_id.clone(),
-            room_id: None,
+            room_id: proposal.room_id.clone(),
             behavior_pattern: None,
             thinking_depth: None,
             input: Some(prompt),
@@ -209,6 +209,7 @@ pub fn draft_agent_turn_proposal(
             temperature: Some(0.2),
             max_output_tokens: Some(300),
         },
+        None,
     )?;
     proposal.status = AgentTurnProposalStatus::Accepted;
     proposal.payload.insert(

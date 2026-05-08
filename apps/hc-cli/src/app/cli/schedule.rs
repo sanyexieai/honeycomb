@@ -349,11 +349,7 @@ fn handle_schedule_watch(args: &[String]) -> Result<()> {
         } else {
             println!("schedule> tick now={} dispatched={}", now, receipts.len());
             for receipt in &receipts {
-                println!(
-                    "dispatch> {} status={}",
-                    receipt.run_id,
-                    receipt.status
-                );
+                println!("dispatch> {} status={}", receipt.run_id, receipt.status);
             }
             print_timed_followup_messages(&receipts)?;
         }
@@ -429,7 +425,10 @@ fn handle_schedule_dispatch_queued(args: &[String]) -> Result<()> {
     print_schedule_dispatch_receipts(receipts, json)
 }
 
-fn print_schedule_dispatch_receipts(receipts: Vec<SchedulerDispatchReceipt>, json: bool) -> Result<()> {
+fn print_schedule_dispatch_receipts(
+    receipts: Vec<SchedulerDispatchReceipt>,
+    json: bool,
+) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&receipts)?);
         return Ok(());

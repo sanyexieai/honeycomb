@@ -1,5 +1,6 @@
 use super::*;
-use crate::{TaskRequest, bootstrap_task, materialize_plan};
+use crate::{TaskRequest, TaskBootstrapPreset, bootstrap_task_with_preset, materialize_plan};
+use hc_protocol::swarm::RoutingTier;
 use hc_responder::ReplyResponse;
 
 #[derive(Debug, Clone, Default)]
@@ -16,9 +17,10 @@ fn orchestrator_suggests_claims_for_matching_roles() {
     let mut runtime = RuntimeSupervisor::new();
     let session = runtime.create_session("demo");
     let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
-    let plan = bootstrap_task(&task);
-    let agents =
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
         materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
 
     let message = runtime
         .post_message(
@@ -57,9 +59,10 @@ fn orchestrator_can_complete_nomination_cycle() {
     let mut runtime = RuntimeSupervisor::new();
     let session = runtime.create_session("demo");
     let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
-    let plan = bootstrap_task(&task);
-    let agents =
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
         materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
 
     let message = runtime
         .post_message(
@@ -67,7 +70,7 @@ fn orchestrator_can_complete_nomination_cycle() {
             &agents[0].binding.instance_id,
             MessageRoute::Broadcast,
             hc_core::MessageKind::Chat,
-            "please review the risks in this implementation plan",
+            "just answer directly: mention two checklist items worth attention when reviewing a small API change.",
             None,
         )
         .expect("message should succeed");
@@ -77,8 +80,9 @@ fn orchestrator_can_complete_nomination_cycle() {
         .suggest_claims_for_message(&runtime, &agents, &message, 100)
         .expect("claim suggestion should succeed");
     let grant = orchestrator
-        .run_nomination_cycle(&mut runtime, &agents, &message, 100)
+        .run_nomination_cycle(&mut runtime, &agents, &message, 100, None, None)
         .expect("nomination cycle should succeed")
+        .grant
         .expect("winner should exist");
 
     let expected_winner = suggested_claims
@@ -90,28 +94,128 @@ fn orchestrator_can_complete_nomination_cycle() {
 }
 
 #[test]
-fn orchestrator_can_generate_and_post_reply_for_granted_agent() {
+fn orchestrator_nomination_cycle_attaches_swarm_for_chat() {
     let mut runtime = RuntimeSupervisor::new();
     let session = runtime.create_session("demo");
     let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
-    let plan = bootstrap_task(&task);
-    let agents =
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
         materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
+
     let message = runtime
         .post_message(
             &session.id,
             &agents[0].binding.instance_id,
             MessageRoute::Broadcast,
             hc_core::MessageKind::Chat,
-            "please review the risks in this implementation",
+            "say hello",
+            None,
+        )
+        .expect("message should succeed");
+
+    let orchestrator = AgentOrchestrator::new();
+    let outcome = orchestrator
+        .run_nomination_cycle(&mut runtime, &agents, &message, 100, None, None)
+        .expect("nomination cycle should succeed");
+    assert!(
+        outcome.swarm.is_some(),
+        "chat messages should carry swarm classification"
+    );
+    assert!(outcome.swarm.as_ref().unwrap().routing.routing_reason.len() > 2);
+}
+
+#[test]
+fn orchestrator_skips_message_nomination_for_l3_routing() {
+    let mut runtime = RuntimeSupervisor::new();
+    let session = runtime.create_session("demo");
+    let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
+        materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
+
+    let message = runtime
+        .post_message(
+            &session.id,
+            &agents[0].binding.instance_id,
+            MessageRoute::Broadcast,
+            hc_core::MessageKind::Chat,
+            "Please plan this with steps for rollout.",
+            None,
+        )
+        .expect("message should succeed");
+
+    let orchestrator = AgentOrchestrator::new();
+    let outcome = orchestrator
+        .run_nomination_cycle(&mut runtime, &agents, &message, 100, None, None)
+        .expect("nomination cycle should succeed");
+    assert!(
+        outcome.grant.is_none(),
+        "L3 routing should bypass message-level speaking grant selection"
+    );
+    let swarm = outcome.swarm.expect("chat should classify");
+    assert_eq!(swarm.routing.routing_tier, RoutingTier::L3);
+}
+
+#[test]
+fn orchestrator_skips_message_nomination_for_l2_routing() {
+    let mut runtime = RuntimeSupervisor::new();
+    let session = runtime.create_session("demo");
+    let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
+        materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
+
+    let message = runtime
+        .post_message(
+            &session.id,
+            &agents[0].binding.instance_id,
+            MessageRoute::Broadcast,
+            hc_core::MessageKind::Chat,
+            "Please refactor crate::net handshake for clarity.",
+            None,
+        )
+        .expect("message should succeed");
+
+    let orchestrator = AgentOrchestrator::new();
+    let outcome = orchestrator
+        .run_nomination_cycle(&mut runtime, &agents, &message, 100, None, None)
+        .expect("nomination cycle should succeed");
+    assert!(
+        outcome.grant.is_none(),
+        "L2 routing should bypass message-level speaking grant selection"
+    );
+    let swarm = outcome.swarm.expect("chat should classify");
+    assert_eq!(swarm.routing.routing_tier, RoutingTier::L2);
+}
+
+#[test]
+fn orchestrator_can_generate_and_post_reply_for_granted_agent() {
+    let mut runtime = RuntimeSupervisor::new();
+    let session = runtime.create_session("demo");
+    let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
+        materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
+    let message = runtime
+        .post_message(
+            &session.id,
+            &agents[0].binding.instance_id,
+            MessageRoute::Broadcast,
+            hc_core::MessageKind::Chat,
+            "don't split this — list two pitfalls to watch for when reviewing a tiny config tweak.",
             None,
         )
         .expect("message should succeed");
 
     let orchestrator = AgentOrchestrator::new();
     let grant = orchestrator
-        .run_nomination_cycle(&mut runtime, &agents, &message, 100)
+        .run_nomination_cycle(&mut runtime, &agents, &message, 100, None, None)
         .expect("nomination cycle should succeed")
+        .grant
         .expect("winner should exist");
 
     let reply = orchestrator
@@ -131,9 +235,10 @@ fn orchestrator_can_generate_and_post_direct_reply() {
     let mut runtime = RuntimeSupervisor::new();
     let session = runtime.create_session("demo");
     let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo");
-    let plan = bootstrap_task(&task);
-    let agents =
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
+    let outcome =
         materialize_plan(&mut runtime, &session.id, &plan).expect("materialization should succeed");
+    let agents = outcome.agents;
 
     let source = &agents[0];
     let replier = agents

@@ -385,7 +385,7 @@ fn build_decision_traces(
             code_from("WRK", &work_item.id),
             "planning",
             work_item.title.clone(),
-            work_item.status.clone(),
+            work_item.lifecycle.to_string(),
             format!(
                 "stage {} | {}",
                 work_item.stage,
@@ -424,7 +424,7 @@ fn build_work_item_lines(workbench: &AgentWorkbench) -> Vec<String> {
             format!(
                 "- {} [{}] {} :: {}",
                 item.id,
-                item.status,
+                item.lifecycle,
                 item.title,
                 summarize_trace_body(&item.goal)
             )

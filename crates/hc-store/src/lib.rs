@@ -1,6 +1,7 @@
 //! Markdown-first storage primitives.
 
 pub mod index;
+pub mod task_coordination;
 
 pub mod store {
     use anyhow::{Context, Result, bail};
@@ -9,7 +10,8 @@ pub mod store {
     use serde::{Deserialize, Serialize};
     use serde_yaml::Value;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,6 +291,36 @@ pub mod store {
 
             fs::write(&path, body)
                 .with_context(|| format!("failed to write markdown file {}", path.display()))?;
+            Ok(path)
+        }
+
+        /// Append a single UTF-8 line to a file under the namespace (creates parent dirs).
+        /// If `line` does not end with `\n`, a newline is written after the content.
+        pub fn append_utf8_line_in_namespace(
+            &self,
+            namespace: &WorkspaceNamespace,
+            relative_path: impl AsRef<Path>,
+            line: &str,
+        ) -> Result<PathBuf> {
+            let path = self.resolve_in_namespace(namespace, relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent directory {}", parent.display())
+                })?;
+            }
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("failed to open append file {}", path.display()))?;
+            file.write_all(line.as_bytes())
+                .with_context(|| format!("failed to append bytes to {}", path.display()))?;
+            if !line.ends_with('\n') {
+                file.write_all(b"\n").with_context(|| {
+                    format!("failed to write trailing newline to {}", path.display())
+                })?;
+            }
             Ok(path)
         }
 
@@ -1125,7 +1157,6 @@ pub mod store {
     fn normalized_path(path: impl AsRef<Path>) -> String {
         path.as_ref().to_string_lossy().replace('\\', "/")
     }
-
 }
 
 use crate::store::WorkspaceNamespace;

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod swarm;
+
 pub const DEFAULT_TENANT_ID: &str = "local";
 pub const DEFAULT_USER_ID: &str = "default";
 
@@ -144,6 +146,8 @@ pub struct ChatResponse {
     pub selected_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_domain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<String>,
     pub recalled_memories: Vec<MemoryRef>,
     pub synthesized_prompt_asset_count: usize,
     #[serde(default)]
@@ -158,6 +162,10 @@ pub struct ChatResponse {
     pub decision_reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_confidence: Option<f32>,
+    /// Task binding result for this turn (ADR-004); aligns with [`crate::swarm::TaskBindingDecisionRecord::active_task_id`].
+    /// Clients may persist and resend as the next [`ChatRequest::active_task_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

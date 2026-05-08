@@ -293,12 +293,16 @@ source_docs:
   - raw/doc.0001.user-request.md
   - raw/doc.0002.repo-scan.md
 derived_docs:
+  - compressed/task/plan/task-plan.summary.md
+  - compressed/task/plan/assignment-decision.planner.001.md
   - compressed/min.0001.summary.md
   - literary/wenyan.0001.md
 created_at: 2026-04-20T10:00:00+08:00
 updated_at: 2026-04-20T12:00:00+08:00
 ---
 ```
+
+Task room **compressed** assets written by **`persist_task_artifacts`** (`hc-agent`) use the ADR-005 **`task/plan/`** prefix (e.g. `task-plan.summary.md`, `assignment-decision.*.md`); older examples may show flat `compressed/min.*.md` filenames for topic/chat rooms.
 
 ## Relationship Model
 

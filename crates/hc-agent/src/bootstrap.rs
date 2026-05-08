@@ -1,3 +1,5 @@
+use std::env;
+
 use anyhow::Result;
 use hc_capability::{CapabilityNamespace, CapabilityProfile, seed_capability_for_role};
 use hc_context::load_agent_responder_system_prompt;
@@ -60,7 +62,111 @@ pub struct MaterializedAgent {
     pub runtime_budget: AgentRuntimeBudget,
 }
 
+/// Caps for one [`materialize_plan`] / [`materialize_plan_with_limits`] batch (ADR-002 Phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MaterializePlanLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agents_per_task: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_new_agents_per_round: Option<usize>,
+}
+
+impl MaterializePlanLimits {
+    /// Reads **`HC_MAX_AGENTS_PER_TASK`** and **`HC_MAX_NEW_AGENTS_PER_ROUND`** (positive integers).
+    /// Unset or invalid values mean **no limit** for that knob.
+    pub fn from_env() -> Self {
+        Self {
+            max_agents_per_task: parse_env_positive_usize("HC_MAX_AGENTS_PER_TASK"),
+            max_new_agents_per_round: parse_env_positive_usize("HC_MAX_NEW_AGENTS_PER_ROUND"),
+        }
+    }
+
+    pub const fn uncapped() -> Self {
+        Self {
+            max_agents_per_task: None,
+            max_new_agents_per_round: None,
+        }
+    }
+
+    #[must_use]
+    pub fn effective_seed_cap(&self, plan_len: usize) -> usize {
+        let mut cap = plan_len;
+        if let Some(m) = self.max_agents_per_task {
+            cap = cap.min(m);
+        }
+        if let Some(m) = self.max_new_agents_per_round {
+            cap = cap.min(m);
+        }
+        cap
+    }
+}
+
+fn parse_env_positive_usize(key: &str) -> Option<usize> {
+    let raw = env::var(key).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+/// Result of [`materialize_plan`] with optional cap observability (`notices`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializePlanOutcome {
+    pub agents: Vec<MaterializedAgent>,
+    pub planned_seeds: usize,
+    pub limits: MaterializePlanLimits,
+    pub notices: Vec<String>,
+}
+
+/// How many agent seeds [`bootstrap_task`] materializes before assignment / execution ramps up (ADR-002 Phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskBootstrapPreset {
+    /// Default: planner only (`bootstrap_planning_task` equivalent).
+    #[default]
+    PlannerOnly,
+    /// Historical demo/tests: planner + worker + reviewer in one bootstrap.
+    ThreeRolesDemo,
+}
+
+/// Reads [`TaskBootstrapPreset`] from **`HC_TASK_BOOTSTRAP_PRESET`** (case-insensitive):
+/// unset / empty / `planner_only` / `planner-only` → [`TaskBootstrapPreset::PlannerOnly`];
+/// `three_roles` / `three-roles` / `demo` / `full` → [`TaskBootstrapPreset::ThreeRolesDemo`];
+/// unknown values fall back to **planner_only**.
+pub fn bootstrap_task_preset_from_env() -> TaskBootstrapPreset {
+    match env::var("HC_TASK_BOOTSTRAP_PRESET") {
+        Ok(raw) => task_bootstrap_preset_from_str(&raw),
+        Err(_) => TaskBootstrapPreset::PlannerOnly,
+    }
+}
+
+fn task_bootstrap_preset_from_str(raw: &str) -> TaskBootstrapPreset {
+    let key = raw.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "" | "planner_only" | "planner-only" | "planning_only" | "planning-only" => {
+            TaskBootstrapPreset::PlannerOnly
+        }
+        "three_roles" | "three-roles" | "demo" | "full" => TaskBootstrapPreset::ThreeRolesDemo,
+        _ => TaskBootstrapPreset::PlannerOnly,
+    }
+}
+
+#[must_use]
+pub fn bootstrap_task_with_preset(task: &TaskRequest, preset: TaskBootstrapPreset) -> AgentPlan {
+    match preset {
+        TaskBootstrapPreset::PlannerOnly => bootstrap_planning_task(task),
+        TaskBootstrapPreset::ThreeRolesDemo => bootstrap_task_three_roles_demo(task),
+    }
+}
+
 pub fn bootstrap_task(task: &TaskRequest) -> AgentPlan {
+    bootstrap_task_with_preset(task, bootstrap_task_preset_from_env())
+}
+
+fn bootstrap_task_three_roles_demo(task: &TaskRequest) -> AgentPlan {
     let base = task.id.replace(' ', "-");
     let execution_pool = task
         .budget
@@ -122,14 +228,38 @@ pub fn bootstrap_planning_task(task: &TaskRequest) -> AgentPlan {
     }
 }
 
-pub fn materialize_plan(
+pub fn materialize_plan_with_limits(
     runtime: &mut RuntimeSupervisor,
     session_id: &str,
     plan: &AgentPlan,
-) -> Result<Vec<MaterializedAgent>> {
-    let mut agents = Vec::new();
+    limits: MaterializePlanLimits,
+) -> Result<MaterializePlanOutcome> {
+    let planned_seeds = plan.seeds.len();
+    let cap = limits.effective_seed_cap(planned_seeds);
+    let mut notices = Vec::<String>::new();
 
-    for seed in &plan.seeds {
+    if cap == 0 && planned_seeds > 0 {
+        anyhow::bail!(
+            "materialization limits allow 0 agents (planned {planned_seeds} seed(s)); check HC_MAX_AGENTS_PER_TASK / HC_MAX_NEW_AGENTS_PER_ROUND"
+        );
+    }
+
+    if cap < planned_seeds {
+        let msg = format!(
+            "materialization capped: planned {planned_seeds} agent seed(s), materializing first {cap} only (max_agents_per_task={:?}, max_new_agents_per_round={:?}); extra seeds skipped to prevent silent agent inflation",
+            limits.max_agents_per_task,
+            limits.max_new_agents_per_round
+        );
+        tracing::warn!(
+            task_id = %plan.task_id,
+            notice = %msg,
+            "agent materialization limit"
+        );
+        notices.push(msg);
+    }
+
+    let mut agents = Vec::new();
+    for seed in plan.seeds.iter().take(cap) {
         agents.push(materialize_seed(
             runtime,
             session_id,
@@ -143,7 +273,20 @@ pub fn materialize_plan(
         anyhow::bail!("no agent seeds were materialized");
     }
 
-    Ok(agents)
+    Ok(MaterializePlanOutcome {
+        agents,
+        planned_seeds,
+        limits,
+        notices,
+    })
+}
+
+pub fn materialize_plan(
+    runtime: &mut RuntimeSupervisor,
+    session_id: &str,
+    plan: &AgentPlan,
+) -> Result<MaterializePlanOutcome> {
+    materialize_plan_with_limits(runtime, session_id, plan, MaterializePlanLimits::from_env())
 }
 
 pub fn materialize_seed(
@@ -236,6 +379,45 @@ fn render_agent_responder_system_prompt(
         .replace("{{agent_name}}", agent_name)
         .replace("{{role_name}}", role_name)
         .replace("{{style}}", style))
+}
+
+#[cfg(test)]
+mod bootstrap_preset_parse_tests {
+    use super::{TaskBootstrapPreset, task_bootstrap_preset_from_str};
+
+    #[test]
+    fn planner_only_aliases() {
+        for raw in [
+            "",
+            "   ",
+            "PLANNER_ONLY",
+            "planner-only",
+            "Planning-Only",
+        ] {
+            assert_eq!(
+                task_bootstrap_preset_from_str(raw),
+                TaskBootstrapPreset::PlannerOnly
+            );
+        }
+    }
+
+    #[test]
+    fn three_roles_aliases() {
+        for raw in ["three_roles", "THREE-ROLES", "demo", "full"] {
+            assert_eq!(
+                task_bootstrap_preset_from_str(raw),
+                TaskBootstrapPreset::ThreeRolesDemo
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_alias_falls_back_to_planner_only() {
+        assert_eq!(
+            task_bootstrap_preset_from_str("not-a-known-preset"),
+            TaskBootstrapPreset::PlannerOnly
+        );
+    }
 }
 
 #[cfg(test)]

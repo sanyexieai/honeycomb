@@ -19,6 +19,23 @@ use tracing::warn;
 use crate::ServiceConfig;
 use crate::conversation::process_conversation_inbox;
 
+#[derive(Debug, Clone)]
+pub struct ScheduledFollowUpRunSpec {
+    pub id: String,
+    pub due_at_unix: u64,
+    pub draft_message: String,
+    pub notes: String,
+    pub payload: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduledFollowUpTaskSpec {
+    pub agent_id: String,
+    pub trigger: String,
+    pub room_id: Option<String>,
+    pub runs: Vec<ScheduledFollowUpRunSpec>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SchedulerDispatchReport {
     pub now_unix: u64,
@@ -263,6 +280,89 @@ pub fn dispatch_fired_followup_messages_headless(
 ) -> Result<Vec<String>> {
     let mut sink = NoopFollowUpMessageSink;
     dispatch_fired_followup_messages_from_receipts(config, namespace, receipts, &mut sink)
+}
+
+pub fn persist_scheduled_followup_task(
+    config: &ServiceConfig,
+    namespace: &WorkspaceNamespace,
+    spec: ScheduledFollowUpTaskSpec,
+) -> Result<Vec<String>> {
+    let conversation_repository =
+        ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let schedule_repository =
+        ScheduleRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let mut followup_ids = Vec::new();
+    for run in spec.runs {
+        let mut followup = hc_conversation::PendingFollowUp::new(
+            spec.agent_id.clone(),
+            spec.trigger.clone(),
+            run.due_at_unix,
+        );
+        followup.id = run.id;
+        followup.room_id = spec.room_id.clone();
+        followup.payload = run.payload;
+        followup.payload.insert(
+            "draft_message".to_owned(),
+            serde_json::Value::String(run.draft_message),
+        );
+        followup.notes = run.notes;
+        conversation_repository.write_followup(&followup)?;
+
+        let mut target_args = serde_json::Map::new();
+        target_args.insert(
+            "followup_id".to_owned(),
+            serde_json::Value::String(followup.id.clone()),
+        );
+        let mut schedule = ScheduledTask::new(
+            format!("timed.followup.{}", followup.id),
+            format!("Timed followup {}", followup.id),
+            hc_scheduler::ScheduleSpec {
+                kind: hc_scheduler::ScheduleKind::Once,
+                run_at_unix: Some(followup.due_at_unix),
+                interval_seconds: None,
+            },
+            hc_scheduler::ScheduledTarget {
+                kind: hc_scheduler::ScheduledTargetKind::Event,
+                r#ref: "timed.followup".to_owned(),
+                action: Some("timed.followup.fire".to_owned()),
+                args: target_args,
+            },
+        );
+        schedule.tags = vec![
+            "scheduled".to_owned(),
+            "timed".to_owned(),
+            "followup".to_owned(),
+        ];
+        schedule.notes = "Mirrored from timed_turn followup queue.".to_owned();
+        schedule_repository.write_schedule(&schedule)?;
+        followup_ids.push(followup.id);
+    }
+    Ok(followup_ids)
+}
+
+pub fn dispatch_followups_until_fired(
+    config: &ServiceConfig,
+    namespace: &ApiNamespace,
+    followup_ids: &[String],
+    sink: &mut impl FollowUpMessageSink,
+) -> Result<()> {
+    let mut pending: std::collections::BTreeSet<String> = followup_ids.iter().cloned().collect();
+    while !pending.is_empty() {
+        let report = dispatch_due_scheduled_runs(config, namespace.clone(), Some(now_unix()))?;
+        let delivered_ids = dispatch_fired_followup_messages_from_receipts(
+            config,
+            namespace.clone(),
+            &report.receipts,
+            sink,
+        )?;
+        for id in delivered_ids {
+            pending.remove(&id);
+        }
+        if !pending.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    Ok(())
 }
 
 fn dispatch_queued_runs(
@@ -534,7 +634,10 @@ fn dispatch_timed_followup_event(
     let relative = ConversationRepository::followup_relative_path_for(&followup_id);
     let mut followup = repository.read_followup(relative)?;
     if followup.status != FollowUpStatus::Pending {
-        return Ok(format!("followup:{followup_id}:already-{:?}", followup.status));
+        return Ok(format!(
+            "followup:{followup_id}:already-{:?}",
+            followup.status
+        ));
     }
     let draft_message = followup
         .payload
@@ -803,18 +906,20 @@ mod tests {
         );
 
         let refreshed = conversation_repo
-            .read_followup(ConversationRepository::followup_relative_path_for("test-followup-1"))
+            .read_followup(ConversationRepository::followup_relative_path_for(
+                "test-followup-1",
+            ))
             .unwrap();
         assert_eq!(refreshed.status, FollowUpStatus::Fired);
         let events = conversation_repo.list_events().unwrap();
-        assert!(events
-            .iter()
-            .any(|event| event.kind == "timed.followup.fired"
+        assert!(events.iter().any(|event| {
+            event.kind == "timed.followup.fired"
                 && event
                     .payload
                     .get("followup_id")
                     .and_then(serde_json::Value::as_str)
-                    == Some("test-followup-1")));
+                    == Some("test-followup-1")
+        }));
     }
 
     #[test]

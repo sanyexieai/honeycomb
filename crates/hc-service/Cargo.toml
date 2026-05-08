@@ -14,6 +14,7 @@ hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }
 hc-intent = { path = "../hc-intent" }
 hc-llm = { path = "../hc-llm" }
+hc-memory = { path = "../hc-memory" }
 hc-protocol = { path = "../hc-protocol" }
 hc-responder = { path = "../hc-responder" }
 hc-scheduler = { path = "../hc-scheduler" }

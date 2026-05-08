@@ -373,7 +373,11 @@ fn merge_trace_context(mut event: TraceEvent) -> TraceEvent {
 
 pub fn new_trace_id(prefix: &str) -> String {
     let sequence = TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}.{}.{}", hc_bootstrap::wall_clock_ms() as u128, sequence)
+    format!(
+        "{prefix}.{}.{}",
+        hc_bootstrap::wall_clock_ms() as u128,
+        sequence
+    )
 }
 
 pub fn agent_code_from(role: &str, instance_id: &str) -> String {

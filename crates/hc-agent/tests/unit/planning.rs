@@ -1,5 +1,9 @@
 use super::*;
-use crate::{TaskNamespace, TaskRequest};
+use crate::{
+    HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID, TaskNamespace, TaskPlan, TaskPlanStatus, TaskRequest,
+    WorkItem,
+};
+use hc_protocol::swarm::WorkItemLifecycleState;
 
 #[test]
 fn awaiting_plan_starts_empty_and_explicit() {
@@ -66,7 +70,33 @@ fn work_item_claims_can_be_resolved_explicitly() {
     assert_eq!(assignment_id, "work-assignment.0001");
     assert_eq!(plan.work_item_assignments.len(), 1);
     assert_eq!(plan.work_item_assignments[0].agent_name, "reviewer");
-    assert_eq!(plan.work_items[0].status, "assigned");
+    assert_eq!(
+        plan.work_items[0].lifecycle,
+        WorkItemLifecycleState::Assigned
+    );
+}
+
+#[test]
+fn resolve_assignment_is_idempotent_for_active_assignment() {
+    let task = TaskRequest::new("task.plan", "Plan", "Break this task down")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    let work_item_id = plan.add_work_item("phase-1", "Inspect repo", "Understand current layout");
+
+    plan.add_work_item_claim(
+        &work_item_id,
+        "instance.reviewer",
+        "reviewer",
+        0.91,
+        "best fit",
+    );
+    let first = plan
+        .resolve_work_item_assignment(&work_item_id)
+        .expect("first resolve");
+    assert_eq!(plan.work_item_assignments.len(), 1);
+    assert!(plan.resolve_work_item_assignment(&work_item_id).is_none());
+    assert_eq!(plan.work_item_assignments.len(), 1);
+    assert_eq!(plan.work_item_assignments[0].id, first);
 }
 
 #[test]
@@ -84,8 +114,55 @@ fn assigned_work_item_can_enter_execution() {
         .expect("work item should start");
 
     assert_eq!(agent_id, "instance.worker");
-    assert_eq!(plan.work_items[0].status, "in_progress");
+    assert_eq!(
+        plan.work_items[0].lifecycle,
+        WorkItemLifecycleState::Assigned
+    );
     assert_eq!(plan.work_item_assignments[0].status, "executing");
+}
+
+#[test]
+fn assignment_breaks_score_tie_by_lower_workload() {
+    let task = TaskRequest::new("task.plan", "Plan", "Break this task down")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    let w1 = plan.add_work_item("p1", "First", "do first");
+    let w2 = plan.add_work_item("p2", "Second", "do second");
+
+    plan.add_work_item_claim(&w1, "instance.alice", "alice", 0.85, "fit");
+    plan.resolve_work_item_assignment(&w1)
+        .expect("assign first work item");
+
+    plan.add_work_item_claim(&w2, "instance.alice", "alice", 0.81, "tie");
+    plan.add_work_item_claim(&w2, "instance.bob", "bob", 0.81, "tie");
+
+    plan.resolve_work_item_assignment(&w2)
+        .expect("assign second after tie-break");
+    let w2_assignment = plan
+        .work_item_assignments
+        .iter()
+        .find(|a| a.work_item_id == w2)
+        .expect("w2 assignment");
+    assert_eq!(w2_assignment.agent_name, "bob");
+}
+
+#[test]
+fn resolve_assignment_requires_positive_capability_score_under_p0_eligibility() {
+    let task = TaskRequest::new("task.plan", "Plan", "Break this task down")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    let work_item_id = plan.add_work_item("phase-1", "Inspect repo", "Understand layout");
+    plan.add_work_item_claim(
+        &work_item_id,
+        "instance.reviewer",
+        "reviewer",
+        0.0,
+        "scores at floor are ineligible under ADR P0 semantics",
+    );
+    assert!(
+        plan.resolve_work_item_assignment(&work_item_id).is_none(),
+        "claims with capability_score ≤ floor must not assign"
+    );
 }
 
 #[test]
@@ -115,4 +192,51 @@ fn idle_budget_can_be_turned_into_evolution_issue() {
     assert_eq!(issue_id, "evolution-issue.0001");
     assert_eq!(plan.agent_runtime_budgets[0].idle_tokens(), 1800);
     assert_eq!(plan.evolution_issues.len(), 1);
+}
+
+#[test]
+fn prune_http_implicit_holder_keeps_seed_when_only_implicit_placeholder() {
+    let task = TaskRequest::new("task.imp.keep", "T", "g")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    plan.work_items.push(WorkItem {
+        id: HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID.to_owned(),
+        title: "HTTP implicit intent holder".to_owned(),
+        goal: "hold".to_owned(),
+        stage: "implicit".to_owned(),
+        lifecycle: WorkItemLifecycleState::Planned,
+        estimated_token_cost: 0,
+        estimated_time_minutes: 0,
+    });
+
+    plan.prune_http_implicit_work_item_placeholder();
+
+    assert_eq!(plan.work_items.len(), 1);
+    assert_eq!(plan.work_items[0].id, HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID);
+}
+
+#[test]
+fn prune_http_implicit_holder_drops_placeholder_when_other_work_items_exist() {
+    let task = TaskRequest::new("task.imp.prune", "T", "g")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    plan.work_items.push(WorkItem {
+        id: HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID.to_owned(),
+        title: "HTTP implicit intent holder".to_owned(),
+        goal: "hold".to_owned(),
+        stage: "implicit".to_owned(),
+        lifecycle: WorkItemLifecycleState::Planned,
+        estimated_token_cost: 0,
+        estimated_time_minutes: 0,
+    });
+    let real_id = plan.add_work_item(
+        "phase-1",
+        "Planner-owned item",
+        "supersedes implicit HTTP seed row",
+    );
+
+    plan.prune_http_implicit_work_item_placeholder();
+
+    assert_eq!(plan.work_items.len(), 1);
+    assert_eq!(plan.work_items[0].id, real_id);
 }

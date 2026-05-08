@@ -2,11 +2,14 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use hc_core::{RuntimeNamespace, RuntimeSupervisor};
+use hc_core::{MessageKind, MessageRecord, MessageRoute, RuntimeNamespace, RuntimeSupervisor};
+use hc_protocol::swarm::{ImplicitIntentDedupeKey, ImplicitIntentDedupeRecord, WorkItemLifecycleState};
+use hc_store::task_coordination::task_plan_markdown_relative;
 
 use crate::{
-    IncubationObservation, IncubationReport, PromotionDecision, TaskNamespace, TaskPlan,
-    TaskRequest, bootstrap_task, materialize_plan,
+    HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID, IncubationObservation, IncubationReport,
+    PromotionDecision, SwarmMessageClassification, TaskNamespace, TaskPlan, TaskRequest, WorkItem,
+    TaskBootstrapPreset, bootstrap_task_with_preset, materialize_plan, swarm_routing,
 };
 
 use super::*;
@@ -37,14 +40,15 @@ fn materialized_agents_can_be_persisted_to_workspace() {
     let root = unique_temp_dir("agent-persist");
     let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo")
         .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
-    let plan = bootstrap_task(&task);
+    let plan = bootstrap_task_with_preset(&task, TaskBootstrapPreset::ThreeRolesDemo);
     let mut runtime = RuntimeSupervisor::new();
     let session =
         runtime.create_session_in_namespace("demo", RuntimeNamespace::new("tenant-a", "user-a"));
 
-    let agents = materialize_plan(&mut runtime, &session.id, &plan)
+    let outcome = materialize_plan(&mut runtime, &session.id, &plan)
         .context("plan should materialize")
         .expect("materialization should succeed");
+    let agents = outcome.agents;
 
     let persisted = persist_materialized_agents(&root, &agents)
         .context("agents should persist")
@@ -92,7 +96,7 @@ fn incubation_reports_can_be_persisted_to_memory_workspace() {
 }
 
 #[test]
-fn task_artifacts_can_be_persisted_to_decision_workspace() {
+fn task_artifacts_can_be_persisted_under_coordination_subdirectory() {
     let root = unique_temp_dir("task-artifacts");
     let task = TaskRequest::new("task.demo", "Demo Task", "Build a demo")
         .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
@@ -128,18 +132,19 @@ fn task_artifacts_can_be_persisted_to_decision_workspace() {
             .task_plan_path
             .to_string_lossy()
             .replace('/', "\\")
-            .contains("tenants\\tenant-a\\users\\user-a\\decisions\\")
+            .contains("coordination\\task.demo\\")
     );
     assert!(persisted
         .task_plan_memory_path
         .to_string_lossy()
-        .replace('/', "\\")
-        .contains("tenants\\tenant-a\\users\\user-a\\memory\\rooms\\task\\room.task.task.demo\\compressed\\"));
+        .replace('\\', "/")
+        .contains("compressed/task/plan/task-plan.summary.md"));
 
     let task_plan_content =
         fs::read_to_string(&persisted.task_plan_path).expect("task plan file should be readable");
     assert!(task_plan_content.contains("type: task_plan"));
     assert!(task_plan_content.contains("Inspect runtime"));
+    assert!(task_plan_content.contains("# Work Item Claims"));
 
     let assignment_content = fs::read_to_string(&persisted.assignment_paths[0])
         .expect("assignment file should be readable");
@@ -153,6 +158,12 @@ fn task_artifacts_can_be_persisted_to_decision_workspace() {
         .expect("task plan room memory sidecar should be readable");
     assert!(task_plan_memory_meta.contains(r#""type": "memory_room_asset""#));
     assert!(task_plan_memory_meta.contains(r#""memory_kind": "summary""#));
+
+    assert!(persisted
+        .assignment_memory_paths[0]
+        .to_string_lossy()
+        .replace('\\', "/")
+        .contains("compressed/task/plan/assignment-decision.work.assignment.0001.md"));
 
     let assignment_memory_content = fs::read_to_string(&persisted.assignment_memory_paths[0])
         .expect("assignment room memory should be readable");
@@ -243,6 +254,320 @@ fn task_artifacts_can_be_rebuilt_queried_and_read() {
     assert!(document.body.contains("Inspect decisions"));
     assert!(persisted.task_plan_memory_path.exists());
     assert_eq!(persisted.assignment_memory_paths.len(), 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn routing_binding_coordination_append_writes_one_json_line() {
+    let root = unique_temp_dir("routing-binding-coord");
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    let message = MessageRecord {
+        id: "msg.1".into(),
+        session_id: "session.1".into(),
+        from: "instance.1".into(),
+        route: MessageRoute::Broadcast,
+        kind: MessageKind::Chat,
+        body: "plan this with steps".into(),
+        reply_to: None,
+    };
+    let routing = swarm_routing::decide_routing_tier(&message.body);
+    let task_binding = swarm_routing::decide_task_binding(&routing, None, Some("task.demo"));
+    let swarm = SwarmMessageClassification {
+        routing,
+        task_binding,
+    };
+    let line = build_routing_binding_log_line_v1(4242, &message, "task.demo", &swarm);
+    let written = append_routing_binding_log_line(&root, &namespace, "task.demo", &line)
+        .expect("routing binding append should succeed");
+
+    let store = WorkspaceStore::new(&root);
+    let expected = store.resolve_in_namespace(&namespace, "coordination/task.demo.routing.jsonl");
+    assert_eq!(written, expected);
+    assert!(written.exists(), "expected {:?}", written);
+    let text = fs::read_to_string(&written).expect("log readable");
+    let first = text.lines().next().expect("one line");
+    let parsed: RoutingBindingLogLineV1 = serde_json::from_str(first).expect("valid json");
+    assert_eq!(parsed.schema, ROUTING_BINDING_LOG_SCHEMA_V1);
+    assert_eq!(parsed.message_id, "msg.1");
+    assert_eq!(parsed.task_scope_id, "task.demo");
+    assert_eq!(parsed.conversation_id.as_deref(), Some("session.1"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn routing_binding_headless_matches_message_record_line_for_same_body() {
+    let message = MessageRecord {
+        id: "msg.1".into(),
+        session_id: "session.1".into(),
+        from: "instance.1".into(),
+        route: MessageRoute::Broadcast,
+        kind: MessageKind::Chat,
+        body: "plan this with steps".into(),
+        reply_to: None,
+    };
+    let routing = swarm_routing::decide_routing_tier(&message.body);
+    let task_binding = swarm_routing::decide_task_binding(&routing, None, Some("task.demo"));
+    let swarm = SwarmMessageClassification {
+        routing: routing.clone(),
+        task_binding: task_binding.clone(),
+    };
+    let from_record = build_routing_binding_log_line_v1(4242, &message, "task.demo", &swarm);
+    let headless = build_routing_binding_log_line_v1_headless(
+        4242,
+        "msg.1",
+        "session.1",
+        "task.demo",
+        &message.body,
+        routing,
+        task_binding,
+    );
+    assert_eq!(
+        from_record.intent_fingerprint_hex,
+        headless.intent_fingerprint_hex
+    );
+    assert_eq!(from_record.routing, headless.routing);
+    assert_eq!(from_record.task_binding, headless.task_binding);
+
+    let from_snap = build_routing_binding_log_line_v1_headless_from_snapshot(
+        4242,
+        "msg.1",
+        "session.1",
+        "task.demo",
+        &message.body,
+        swarm.routing_binding_snapshot(),
+    );
+    assert_eq!(from_record, from_snap);
+
+    assert_eq!(
+        from_record.routing_binding_snapshot(),
+        from_snap.routing_binding_snapshot()
+    );
+}
+
+#[test]
+fn implicit_intent_dedupe_load_roundtrip() {
+    let root = unique_temp_dir("implicit-intent-dedupe");
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    let key = ImplicitIntentDedupeKey::from_trigger("conv.1", "msg.1", "plan this with steps");
+    let rec = ImplicitIntentDedupeRecord::from_key(&key, 99);
+    append_implicit_intent_dedupe_record(&root, &namespace, "task.demo", &rec)
+        .expect("append implicit intent record");
+    let loaded = load_implicit_intent_dedupe_keys(&root, &namespace, "task.demo")
+        .expect("load implicit intent keys");
+    assert!(loaded.contains(&key));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn implicit_intent_journal_duplicate_appends_collapse_to_one_logical_key() {
+    let root = unique_temp_dir("implicit-intent-dedupe-dup");
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    let key = ImplicitIntentDedupeKey::from_trigger("conv.1", "msg.1", "plan this with steps");
+    let rec = ImplicitIntentDedupeRecord::from_key(&key, 99);
+    append_implicit_intent_dedupe_record(&root, &namespace, "task.demo", &rec)
+        .expect("first append");
+    append_implicit_intent_dedupe_record(&root, &namespace, "task.demo", &rec)
+        .expect("duplicate append (replay / double dispatch)");
+    let loaded = load_implicit_intent_dedupe_keys(&root, &namespace, "task.demo")
+        .expect("load implicit intent keys");
+    assert_eq!(
+        loaded.len(),
+        1,
+        "ADR-003 duplicate key must not appear twice in the dedupe set consumed by orchestration"
+    );
+    assert!(loaded.contains(&key));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn work_item_coordination_journals_roundtrip_via_hydrate() {
+    let root = unique_temp_dir("wi-coord-journals");
+    let namespace = WorkspaceNamespace::new("tenant-a", "user-a");
+    let task = TaskRequest::new(
+        "task.journal.demo",
+        "Journal Demo",
+        "replay claims and assignments from jsonl journals",
+    )
+    .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    let work_item_id = plan.add_work_item(
+        "phase-1",
+        "Inspect pipelines",
+        "Confirm replay restores submitted and resolved claims",
+    );
+    let claim_id = plan.add_work_item_claim(
+        &work_item_id,
+        "instance.0101",
+        "planner",
+        0.91,
+        "Strong fit",
+    );
+
+    append_work_item_claim_journal_line(
+        &root,
+        &namespace,
+        &task.id,
+        plan.work_item_claims
+            .iter()
+            .find(|row| row.id == claim_id)
+            .expect("claim exists"),
+    )
+    .expect("append claim journal line");
+
+    let assignment_id = plan
+        .resolve_work_item_assignment(&work_item_id)
+        .expect("assignment should resolve");
+    for claim in plan
+        .work_item_claims
+        .iter()
+        .filter(|row| row.work_item_id == work_item_id)
+    {
+        append_work_item_claim_journal_line(&root, &namespace, &task.id, claim)
+            .expect("append post-resolve claim snapshot");
+    }
+    append_work_item_assignment_journal_line(
+        &root,
+        &namespace,
+        &task.id,
+        plan.work_item_assignments
+            .iter()
+            .find(|row| row.id == assignment_id)
+            .expect("assignment exists"),
+    )
+    .expect("append assignment journal line");
+
+    let mut replay_plan = TaskPlan::awaiting_planner_input(&task);
+    replay_plan.work_items = plan.work_items.clone();
+    hydrate_task_plan_work_item_coordination_journals(&root, &namespace, &task.id, &mut replay_plan)
+        .expect("hydrate journals into task plan");
+
+    assert_eq!(
+        replay_plan.work_item_claims, plan.work_item_claims,
+        "claims hydrated from journals should equal committed plan snapshot"
+    );
+    assert_eq!(replay_plan.work_item_assignments, plan.work_item_assignments);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn http_implicit_task_plan_stub_idempotent_when_body_nonempty() {
+    let root = unique_temp_dir("http-implicit-stub-idem");
+    let namespace = hc_store::store::WorkspaceNamespace::new("tenant-a", "user-a");
+    let task_id = "task.http.implicit.777001";
+    ensure_http_implicit_task_plan_stub(
+        &root,
+        &namespace,
+        task_id,
+        "first goal line for stub",
+        "test.routing.msg.1",
+        "test.session.1",
+    )
+        .expect("first stub write");
+    let first = read_task_artifact(&root, &namespace, task_plan_markdown_relative(task_id))
+        .expect("read task_plan after stub");
+    assert!(
+        first.body.contains("first goal line for stub"),
+        "awaiting_planner_input render should embed the triggering goal"
+    );
+    assert!(
+        first.body.contains("routing_message_id=test.routing.msg.1"),
+        "stub should record routing_message_id in planning notes"
+    );
+    assert!(
+        first.body.contains("session_id=test.session.1"),
+        "stub should record session_id in planning notes"
+    );
+    assert!(
+        first.body.contains(HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID),
+        "stub should persist the implicit Planned work-item placeholder"
+    );
+
+    ensure_http_implicit_task_plan_stub(
+        &root,
+        &namespace,
+        task_id,
+        "second call must not replace an existing non-empty plan",
+        "ignored.msg",
+        "ignored.session",
+    )
+    .expect("second call is a no-op");
+    let second = read_task_artifact(&root, &namespace, task_plan_markdown_relative(task_id))
+        .expect("read task_plan after idempotent call");
+    assert_eq!(
+        second.body, first.body,
+        "ensure_http_implicit_task_plan_stub must not clobber materialized task_plan.md"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn persist_task_plan_drops_http_implicit_holder_when_planner_adds_work_items() {
+    let root = unique_temp_dir("implicit-holder-prune-persist");
+    let task = TaskRequest::new("task.imp.prpersist", "Prpersist", "user goal snippet")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    plan.work_items.push(WorkItem {
+        id: HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID.to_owned(),
+        title: "HTTP implicit intent holder".to_owned(),
+        goal: "seed".to_owned(),
+        stage: "implicit".to_owned(),
+        lifecycle: WorkItemLifecycleState::Planned,
+        estimated_token_cost: 0,
+        estimated_time_minutes: 0,
+    });
+    let _wi = plan.add_work_item(
+        "phase-a",
+        "Real coordination item",
+        "Replaces implicit HTTP placeholder on persist",
+    );
+
+    let persisted = persist_task_artifacts(&root, &task, &plan).expect("persist task_plan");
+    let md_raw = fs::read_to_string(&persisted.task_plan_path).expect("read task_plan.md");
+    assert!(
+        !md_raw.contains(HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID),
+        "persist strips implicit holder once planner work items coexist in the same TaskPlan",
+    );
+
+    assert!(
+        md_raw.contains("Real coordination item"),
+        "real planner work item title should appear in rendered body"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn persist_task_artifacts_with_in_memory_prune_updates_live_plan() {
+    let root = unique_temp_dir("implicit-inmem-prune");
+    let task = TaskRequest::new("task.imp.sync", "Sync", "g")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    plan.work_items.push(WorkItem {
+        id: HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID.to_owned(),
+        title: "holder".into(),
+        goal: "h".into(),
+        stage: "implicit".into(),
+        lifecycle: WorkItemLifecycleState::Planned,
+        estimated_token_cost: 0,
+        estimated_time_minutes: 0,
+    });
+    let _ = plan.add_work_item("p", "real", "r");
+
+    persist_task_artifacts_with_in_memory_prune(&root, &task, &mut plan).expect("persist+sync");
+
+    assert!(
+        plan.work_items
+            .iter()
+            .all(|w| w.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID),
+        "mutable plan should drop implicit holder after wrapper persist when other work items exist"
+    );
+    assert_eq!(plan.work_items.len(), 1);
 
     let _ = fs::remove_dir_all(root);
 }

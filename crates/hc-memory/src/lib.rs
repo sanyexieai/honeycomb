@@ -571,7 +571,7 @@ fn default_schedule_enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RoomConfig {
     /// 是否自动继承父级 Room 的能力
     #[serde(default)]
@@ -591,6 +591,9 @@ pub struct RoomConfig {
     /// 执行上下文配置
     #[serde(default)]
     pub execution_context: ExecutionContext,
+    /// 路由控制配置
+    #[serde(default)]
+    pub routing: RoomRoutingConfig,
 }
 
 impl RoomConfig {
@@ -625,6 +628,97 @@ impl RoomConfig {
 
     pub fn with_execution_context(mut self, context: ExecutionContext) -> Self {
         self.execution_context = context;
+        self
+    }
+
+    pub fn with_routing(mut self, routing: RoomRoutingConfig) -> Self {
+        self.routing = routing;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RoomRoutingConfig {
+    #[serde(default)]
+    pub enabled_providers: Vec<String>,
+    #[serde(default)]
+    pub disabled_providers: Vec<String>,
+    #[serde(default)]
+    pub provider_weights: std::collections::BTreeMap<String, i32>,
+    #[serde(default)]
+    pub tool_whitelist: Vec<String>,
+    #[serde(default)]
+    pub tool_blacklist: Vec<String>,
+    #[serde(default)]
+    pub capability_whitelist: Vec<String>,
+    #[serde(default)]
+    pub capability_blacklist: Vec<String>,
+    #[serde(default)]
+    pub skill_whitelist: Vec<String>,
+    #[serde(default)]
+    pub skill_blacklist: Vec<String>,
+    #[serde(default)]
+    pub provider_argument_overrides:
+        std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+}
+
+impl RoomRoutingConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_enabled_provider(mut self, provider_id: impl Into<String>) -> Self {
+        self.enabled_providers.push(provider_id.into());
+        self
+    }
+
+    pub fn with_disabled_provider(mut self, provider_id: impl Into<String>) -> Self {
+        self.disabled_providers.push(provider_id.into());
+        self
+    }
+
+    pub fn with_provider_weight(mut self, provider_id: impl Into<String>, weight: i32) -> Self {
+        self.provider_weights.insert(provider_id.into(), weight);
+        self
+    }
+
+    pub fn with_tool_whitelist(mut self, tool_id: impl Into<String>) -> Self {
+        self.tool_whitelist.push(tool_id.into());
+        self
+    }
+
+    pub fn with_tool_blacklist(mut self, tool_id: impl Into<String>) -> Self {
+        self.tool_blacklist.push(tool_id.into());
+        self
+    }
+
+    pub fn with_capability_whitelist(mut self, capability_id: impl Into<String>) -> Self {
+        self.capability_whitelist.push(capability_id.into());
+        self
+    }
+
+    pub fn with_capability_blacklist(mut self, capability_id: impl Into<String>) -> Self {
+        self.capability_blacklist.push(capability_id.into());
+        self
+    }
+
+    pub fn with_skill_whitelist(mut self, skill_id: impl Into<String>) -> Self {
+        self.skill_whitelist.push(skill_id.into());
+        self
+    }
+
+    pub fn with_skill_blacklist(mut self, skill_id: impl Into<String>) -> Self {
+        self.skill_blacklist.push(skill_id.into());
+        self
+    }
+
+    pub fn with_provider_argument_override(
+        mut self,
+        provider_id: impl Into<String>,
+        args: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.provider_argument_overrides
+            .insert(provider_id.into(), args);
         self
     }
 }
@@ -667,7 +761,7 @@ impl ExecutionContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryRoom {
     pub id: String,
     #[serde(default)]
@@ -1352,7 +1446,7 @@ struct MemoryFrontmatter {
     confidence_milli: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct MemoryRoomFrontmatter {
     id: String,
     r#type: String,

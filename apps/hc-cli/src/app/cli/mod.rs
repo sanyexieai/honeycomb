@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use encoding_rs::GB18030;
 use hc_agent::phrase_match_score;
 use hc_bootstrap::{
-    init_console_tracing, load_local_env_file, tenant_id_from_env, user_id_from_env,
-    unix_timestamp_secs, wall_clock_ms, workspace_root,
+    init_console_tracing, load_local_env_file, tenant_id_from_env, unix_timestamp_secs,
+    user_id_from_env, wall_clock_ms, workspace_root,
 };
 use hc_capability::ModelDependence;
 use hc_context::{
@@ -35,22 +35,25 @@ use hc_protocol::{ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, 
 use hc_scheduler::{ScheduleRepository, ScheduledTargetKind};
 use hc_service::{
     ServiceConfig,
+    chat::{emit_swarm_observability_for_chat_like_request, workspace_namespace_from_chat_request},
     conversation::{conversation_inbox_snapshot, process_conversation_inbox},
     human_inbox::{complete_human_inbox_item, list_human_inbox_pending},
+    room_routing::{RoomRoutingContext, resolve_room_routing_context},
+    timed_turn::TimedDeliverMode,
+    tool_execution::{execute_tool_invocation, mcp_invocation_plan, mcp_result_observations},
     tool_turn::{
         PendingToolConfirmation, ToolTurnSessionState, load_tool_turn_session_state,
-        save_tool_turn_session_state, try_handle_configured_mcp_route_turn,
-        try_handle_persisted_pending_confirmation,
+        save_tool_turn_session_state,
     },
+    turn::{ServiceTurnOutcome, try_handle_service_turn},
 };
 use hc_skill::{SkillProfile, SkillRepository};
 use hc_store::store::WorkspaceNamespace;
 use hc_tag_system::{TagSystemManager, TagVector};
 use hc_toolchain::{
-    CommandToolExecutor, McpServerRepository, McpTransportKind, ToolCatalog,
-    ToolComposition, ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository,
-    ToolSpec, ToolStability, build_default_tool_execution_plan, call_mcp_tool,
-    default_tool_catalog, is_mcp_tool_command,
+    CommandToolExecutor, McpServerRepository, McpTransportKind, ToolCatalog, ToolComposition,
+    ToolExecutionKind, ToolExecutionOutcome, ToolExecutor, ToolRepository, ToolSpec, ToolStability,
+    build_default_tool_execution_plan, default_tool_catalog, is_mcp_tool_command,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::Deserialize;
@@ -60,7 +63,6 @@ mod pattern;
 mod room;
 mod schedule;
 mod workspace_index;
-
 
 #[derive(Debug, Clone, Default)]
 struct CliRuntimeContext {
@@ -153,6 +155,8 @@ struct TurnFrame {
     runtime: RuntimeVariables,
     namespace: MemoryNamespace,
     workspace_namespace: WorkspaceNamespace,
+    /// When set (e.g. via `HC_ACTIVE_TASK_ID`), matches API `active_task_id` for swarm coordination logs.
+    active_task_id: Option<String>,
     session_id: Option<String>,
     turn_index: usize,
     selection_input: String,
@@ -208,15 +212,26 @@ impl TurnFrame {
         selection: ToolSelection,
         recalled_memories: Vec<RetrievedMemory>,
         intent_resolution: IntentResolution,
+        active_task_id_cli: Option<String>,
     ) -> Self {
         let user_turn = user_turn.into();
         let runtime = runtime_variables_for_namespace(&namespace, session_id.as_deref());
         let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+        let active_task_id = active_task_id_cli
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_owned())
+            .or_else(|| {
+                std::env::var("HC_ACTIVE_TASK_ID").ok().and_then(|value| {
+                    let trimmed = value.trim().to_owned();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                })
+            });
         Self {
             user_turn,
             runtime,
             namespace,
             workspace_namespace,
+            active_task_id,
             session_id,
             turn_index,
             selection_input,
@@ -544,6 +559,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
     apply_cli_context_to_chat_options(&mut memory_options, &mut capture_options);
     let mut show_memory = false;
     let mut output_options = ChatOutputOptions::from_env();
+    let mut active_task_id_cli: Option<String> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -597,6 +613,14 @@ fn handle_chat(args: &[String]) -> Result<()> {
                     args.get(index + 1)
                         .cloned()
                         .context("missing value for --session-id")?,
+                );
+                index += 2;
+            }
+            "--active-task-id" => {
+                active_task_id_cli = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --active-task-id")?,
                 );
                 index += 2;
             }
@@ -702,9 +726,27 @@ fn handle_chat(args: &[String]) -> Result<()> {
         },
         output_options.phased_delay_ms
     );
+    let effective_active_task = active_task_id_cli
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            env::var("HC_ACTIVE_TASK_ID")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(t) = effective_active_task {
+        println!(
+            "active_task_id={t} (swarm routing JSONL; --active-task-id overrides HC_ACTIVE_TASK_ID)"
+        );
+    }
 
     // 检查API配置
     validate_llm_configuration(&provider, &model)?;
+
+    let service_config = ServiceConfig::from_env();
 
     let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
     let mut history = vec![ChatMessage::new(MessageRole::System, tool_prompt)];
@@ -761,6 +803,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
             tool_selection,
             recalled_memories,
             intent_resolution,
+            active_task_id_cli.clone(),
         );
         if env_flag("HC_CHAT_DEBUG_INTENT") {
             tracing::info!(
@@ -781,22 +824,15 @@ fn handle_chat(args: &[String]) -> Result<()> {
         {
             println!("warning> chat memory write skipped: {error}");
         }
-        if let Some(node_reply) = run_pending_confirmation_node(&mut frame, &catalog)? {
-            apply_turn_node_reply_state(&node_reply, &mut pending_confirmation);
-            save_cli_pending_confirmation(
-                &memory_options.namespace,
-                capture_options.room_id.as_deref(),
-                &pending_confirmation,
-            )?;
-            print_turn_node_warning(&node_reply);
-            if emit_turn_node_reply(&frame, &node_reply, &mut history, chat_room.as_ref())? {
-                continue;
-            }
-            if node_reply.stop_pipeline {
-                continue;
-            }
-        }
-        if let Some(node_reply) = run_timed_sequence_node(&frame, &history)? {
+        let turn_chat_request = chat_request_from_turn_frame(&frame, &history);
+        let room_routing_owned = resolve_room_routing_context(&service_config, &turn_chat_request)
+            .ok()
+            .flatten();
+        let room_rr = room_routing_owned.as_ref();
+
+        if let Some(node_reply) =
+            run_service_turn_node(&service_config, &mut frame, &history, room_rr)?
+        {
             apply_turn_node_reply_state(&node_reply, &mut pending_confirmation);
             save_cli_pending_confirmation(
                 &memory_options.namespace,
@@ -809,53 +845,41 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 continue;
             }
         }
-        if let Some(node_reply) = run_configured_agent_mcp_node(&mut frame, &catalog)? {
-            apply_turn_node_reply_state(&node_reply, &mut pending_confirmation);
-            save_cli_pending_confirmation(
-                &memory_options.namespace,
-                capture_options.room_id.as_deref(),
-                &pending_confirmation,
-            )?;
-            print_turn_node_warning(&node_reply);
-            emit_turn_node_reply(&frame, &node_reply, &mut history, chat_room.as_ref())?;
-            if node_reply.stop_pipeline {
-                continue;
-            }
-        } else {
-            let node_reply = run_llm_tool_router_node(
-                &registry,
-                &provider,
-                &model,
-                &mut frame,
-                &catalog,
-                system_message.as_deref(),
-            )?;
-            print_turn_node_warning(&node_reply);
-            if node_reply.reset_system_prompt {
-                let catalog = load_cli_tool_catalog()?;
-                history.clear();
-                history.push(ChatMessage::new(
-                    MessageRole::System,
-                    render_tool_chat_system_prompt(
-                        &catalog,
-                        system_message.as_deref(),
-                        &memory_options.namespace,
-                        capture_options.room_id.as_deref(),
-                    )?,
-                ));
-            }
-            if node_reply.stop_pipeline {
-                continue;
-            }
+        let node_reply = run_llm_tool_router_node(
+            &registry,
+            &provider,
+            &model,
+            &mut frame,
+            &catalog,
+            system_message.as_deref(),
+        )?;
+        print_turn_node_warning(&node_reply);
+        if node_reply.reset_system_prompt {
+            let catalog = load_cli_tool_catalog()?;
+            history.clear();
+            history.push(ChatMessage::new(
+                MessageRole::System,
+                render_tool_chat_system_prompt(
+                    &catalog,
+                    system_message.as_deref(),
+                    &memory_options.namespace,
+                    capture_options.room_id.as_deref(),
+                )?,
+            ));
+        }
+        if node_reply.stop_pipeline {
+            continue;
         }
         print!("assistant> ");
         io::stdout().flush().context("failed to flush stdout")?;
         match run_normal_chat_node(
+            &service_config,
             &registry,
             &provider,
             &model,
             &history,
             &frame,
+            room_rr,
             &mut |delta| {
                 print!("{delta}");
                 io::stdout()
@@ -1584,7 +1608,7 @@ fn run_explicit_command_node(
             );
             println!("/mcp add|list|tools|call ...");
             println!(
-                "chat options: --tenant-id <id> --user-id <id> --session-id <id> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
+                "chat options: --tenant-id <id> --user-id <id> --session-id <id> --active-task-id <task> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
             );
             println!("/quit");
             Ok(Some(ExplicitCommandNodeResult::Continue))
@@ -1652,30 +1676,6 @@ fn reset_chat_history(
     Ok(())
 }
 
-fn run_pending_confirmation_node(
-    frame: &mut TurnFrame,
-    _: &ToolCatalog,
-) -> Result<Option<TurnNodeReply>> {
-    let request = chat_request_from_turn_frame(frame);
-    let Some(tool_result) =
-        try_handle_persisted_pending_confirmation(&ServiceConfig::from_env(), &request)?
-    else {
-        return Ok(None);
-    };
-    frame.set_tool_execution_context(format!(
-        "Service-layer pending confirmation handled by {}/{}.",
-        tool_result.server_id, tool_result.tool_name
-    ));
-    Ok(Some(TurnNodeReply {
-        reply: Some(tool_result.response.message.content),
-        warning: None,
-        clear_pending_confirmation: true,
-        next_pending_confirmation: None,
-        stop_pipeline: true,
-        reset_system_prompt: false,
-    }))
-}
-
 fn api_messages_for_timed_match(history: &[ChatMessage]) -> Vec<ApiChatMessage> {
     history
         .iter()
@@ -1695,89 +1695,98 @@ fn api_messages_for_timed_match(history: &[ChatMessage]) -> Vec<ApiChatMessage> 
         .collect()
 }
 
-fn run_timed_sequence_node(
-    frame: &TurnFrame,
-    history: &[ChatMessage],
-) -> Result<Option<TurnNodeReply>> {
-    let request = chat_request_from_turn_frame(frame);
-    let history_api = api_messages_for_timed_match(history);
-    let Some(response) = hc_service::timed_turn::try_handle_timed_chat_turn(
-        &ServiceConfig::from_env(),
-        &request,
-        &frame.intent_resolution,
-        hc_service::timed_turn::TimedDeliverMode::Interactive,
-        &history_api,
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(TurnNodeReply {
-        reply: Some(response.message.content),
-        warning: None,
-        clear_pending_confirmation: false,
-        next_pending_confirmation: None,
-        stop_pipeline: true,
-        reset_system_prompt: false,
-    }))
-}
-
-fn run_configured_agent_mcp_node(
+fn run_service_turn_node(
+    config: &ServiceConfig,
     frame: &mut TurnFrame,
-    _: &ToolCatalog,
+    history: &[ChatMessage],
+    room_routing_cache: Option<&RoomRoutingContext>,
 ) -> Result<Option<TurnNodeReply>> {
-    let request = chat_request_from_turn_frame(frame);
-    let tool_result = match try_handle_configured_mcp_route_turn(
-        &ServiceConfig::from_env(),
+    let request = chat_request_from_turn_frame(frame, history);
+    let history_api = api_messages_for_timed_match(history);
+    match try_handle_service_turn(
+        config,
         &request,
+        TimedDeliverMode::Interactive,
+        &history_api,
+        room_routing_cache,
     ) {
-        Ok(Some(tool_result)) => tool_result,
-        Ok(None) => return Ok(None),
+        Ok(ServiceTurnOutcome::PendingConfirmation(tool_result)) => {
+            frame.set_tool_execution_context(format!(
+                "Service-layer pending confirmation handled by {}/{}.",
+                tool_result.server_id, tool_result.tool_name
+            ));
+            Ok(Some(TurnNodeReply {
+                reply: Some(tool_result.response.message.content),
+                warning: None,
+                clear_pending_confirmation: true,
+                next_pending_confirmation: None,
+                stop_pipeline: true,
+                reset_system_prompt: false,
+            }))
+        }
+        Ok(ServiceTurnOutcome::Timed(response)) => Ok(Some(TurnNodeReply {
+            reply: Some(response.message.content),
+            warning: None,
+            clear_pending_confirmation: false,
+            next_pending_confirmation: None,
+            stop_pipeline: true,
+            reset_system_prompt: false,
+        })),
+        Ok(ServiceTurnOutcome::McpTool(tool_result)) => {
+            frame.set_tool_execution_context(format!(
+                "Service-layer MCP tool handled by {}/{}.",
+                tool_result.server_id, tool_result.tool_name
+            ));
+            Ok(Some(TurnNodeReply {
+                reply: Some(tool_result.response.message.content),
+                warning: None,
+                clear_pending_confirmation: false,
+                next_pending_confirmation: None,
+                stop_pipeline: true,
+                reset_system_prompt: false,
+            }))
+        }
+        Ok(ServiceTurnOutcome::ChatFallback { .. }) => Ok(None),
         Err(error) => {
             frame.set_tool_execution_context(format!(
-                "Internal note: configured MCP turn failed before producing a user-presentable result: {}. Continue ordinary intent handling without inventing concrete tool data.",
+                "Internal note: service turn orchestration failed before producing a user-presentable result: {}. Continue ordinary intent handling without inventing concrete tool data.",
                 compact_single_line(&error.to_string(), 300)
             ));
-            return Ok(Some(TurnNodeReply {
+            Ok(Some(TurnNodeReply {
                 reply: None,
                 warning: None,
                 clear_pending_confirmation: false,
                 next_pending_confirmation: None,
                 stop_pipeline: false,
                 reset_system_prompt: false,
-            }));
+            }))
         }
-    };
-    Ok(Some(TurnNodeReply {
-        reply: Some(tool_result.response.message.content),
-        warning: None,
-        clear_pending_confirmation: false,
-        next_pending_confirmation: None,
-        stop_pipeline: true,
-        reset_system_prompt: false,
-    }))
+    }
 }
 
-fn chat_request_from_turn_frame(frame: &TurnFrame) -> ChatRequest {
+fn chat_request_from_turn_frame(frame: &TurnFrame, history: &[ChatMessage]) -> ChatRequest {
+    let mut messages = api_messages_for_timed_match(history);
+    messages.push(ApiChatMessage {
+        role: ApiMessageRole::User,
+        content: frame.user_turn.clone(),
+        name: None,
+    });
     ChatRequest {
         tenant_id: Some(frame.runtime.identity.tenant_id.clone()),
         user_id: Some(frame.runtime.identity.user_id.clone()),
         session_id: Some(frame.runtime.identity.session_id.clone()),
-        room_id: None,
+        room_id: frame.session_id.clone(),
         behavior_pattern: None,
         thinking_depth: None,
         input: Some(frame.user_turn.clone()),
-        messages: vec![ApiChatMessage {
-            role: ApiMessageRole::User,
-            content: frame.user_turn.clone(),
-            name: None,
-        }],
+        messages,
         provider: None,
         model: None,
         system_prompt: None,
         agent_id: frame.selected_agent_id.clone(),
         domain_id: frame.selected_domain_id.clone(),
         active_agent_id: frame.selected_agent_id.clone(),
-        active_task_id: None,
+        active_task_id: frame.active_task_id.clone(),
         memory: ApiMemoryQuery {
             namespace: (&frame.namespace).into(),
             scope: None,
@@ -1883,13 +1892,25 @@ fn run_llm_tool_router_node(
 }
 
 fn run_normal_chat_node(
+    config: &ServiceConfig,
     registry: &ProviderRegistry,
     provider: &str,
     model: &str,
     history: &[ChatMessage],
     frame: &TurnFrame,
+    cached_room_rr: Option<&RoomRoutingContext>,
     on_delta: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<NormalChatNodeResult> {
+    let swarm_request = chat_request_from_turn_frame(frame, history);
+    let wns = workspace_namespace_from_chat_request(&swarm_request);
+    emit_swarm_observability_for_chat_like_request(
+        config,
+        &wns,
+        &swarm_request,
+        "cli.chat",
+        cached_room_rr,
+    );
+
     let request_history = build_chat_request_history(
         history,
         merge_optional_contexts([
@@ -2199,11 +2220,8 @@ fn load_cli_pending_confirmation(
 ) -> Result<Option<PendingToolConfirmation>> {
     let api_namespace = cli_api_namespace(namespace);
     let session_id = cli_session_id(namespace, session_id);
-    let state = load_tool_turn_session_state(
-        &ServiceConfig::from_env(),
-        &api_namespace,
-        &session_id,
-    )?;
+    let state =
+        load_tool_turn_session_state(&ServiceConfig::from_env(), &api_namespace, &session_id)?;
     Ok(state.pending_confirmation)
 }
 
@@ -2307,29 +2325,23 @@ fn execute_mcp_tool(
         .default_command
         .get(2)
         .context("mcp tool command missed tool name")?;
-    let server = mcp_server_repository().get_server(server_id)?;
     let mut arguments = arguments_from_run_args(&options.args, options.content.as_deref())?;
     insert_missing_platform_mcp_runtime_arguments(&mut arguments);
-    let arguments = serde_json::Value::Object(arguments);
-    let result = call_mcp_tool(&server, tool_name, arguments)?;
-    let success = !result
-        .get("isError")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    Ok(ToolExecutionOutcome {
-        tool_id: plan.tool_id.clone(),
-        parent_tool_id: None,
-        invoked_tool_ids: Vec::new(),
-        goal: goal.to_owned(),
-        command: plan.suggested_command.clone(),
-        success,
-        summary: if success {
-            "mcp tool call completed".to_owned()
-        } else {
-            "mcp tool call returned an error result".to_owned()
-        },
-        observations: mcp_result_observations(&result),
-    })
+    let namespace = runtime_namespace();
+    let invocation = mcp_invocation_plan(
+        plan.tool_id.clone(),
+        goal.to_owned(),
+        plan.suggested_command.clone(),
+        ApiNamespace::from_tenant_user(namespace.tenant_id.clone(), namespace.user_id.clone()),
+        cli_runtime_context().session_id,
+        server_id.clone(),
+        tool_name.clone(),
+        arguments,
+    );
+    Ok(
+        execute_tool_invocation(&ServiceConfig::from_env(), &invocation)?
+            .into_tool_execution_outcome(),
+    )
 }
 
 fn execute_local_file_read(
@@ -2519,26 +2531,6 @@ fn parse_key_value(value: &str) -> Result<(String, String)> {
         bail!("key cannot be empty");
     }
     Ok((key.to_owned(), value.trim().to_owned()))
-}
-
-fn mcp_result_observations(result: &serde_json::Value) -> Vec<String> {
-    let mut observations = Vec::new();
-    if let Some(content) = result.get("content").and_then(serde_json::Value::as_array) {
-        for item in content.iter().take(40) {
-            if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
-                observations.push(format!("text: {text}"));
-            } else {
-                observations.push(format!("content: {item}"));
-            }
-        }
-        if content.len() > 40 {
-            observations.push("content: ... truncated".to_owned());
-        }
-    }
-    if observations.is_empty() {
-        observations.push(format!("result: {result}"));
-    }
-    observations
 }
 
 fn render_unrenderable_tool_reply(outcome: &ToolExecutionOutcome) -> String {
@@ -4364,7 +4356,6 @@ fn get_tag_system_manager() -> Option<&'static TagSystemManager> {
     TAG_SYSTEM_MANAGER.get()
 }
 
-
 fn is_help(value: &str) -> bool {
     matches!(value, "help" | "--help" | "-h")
 }
@@ -4372,7 +4363,9 @@ fn is_help(value: &str) -> bool {
 fn print_help() {
     println!("hc-cli                         # start tool-aware chat");
     println!("global options: --tenant-id <id> --user-id <id> --session-id <id>");
-    println!("hc-cli chat [--provider <id>] [--model <name>] [--system <text>]");
+    println!(
+        "hc-cli chat [--provider <id>] [--model <name>] [--system <text>] [--active-task-id <task>] ..."
+    );
     println!(
         "hc-cli create <tool-id> <name> --description <text> --command <token> [--command <token>] [--kind <cli|builtin|script|workflow|service>] [--tag <tag>] [--json]"
     );
@@ -4430,7 +4423,6 @@ fn print_help() {
         "hc-cli run <tool.local-file.read|tool.local-file.write|tool.local-dir.list> <path> [--content <text>] [--path <dir>] [--json]"
     );
 }
-
 
 /// 验证LLM配置是否正确
 fn validate_llm_configuration(provider: &str, model: &str) -> Result<()> {

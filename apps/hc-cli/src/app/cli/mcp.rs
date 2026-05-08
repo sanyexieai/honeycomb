@@ -1,8 +1,6 @@
 //! `hc-cli mcp` 子命令。
 use anyhow::{Result, bail};
-use hc_toolchain::{
-    McpServerSpec, McpTransportKind, call_mcp_tool, normalize_mcp_server_id,
-};
+use hc_toolchain::{McpServerSpec, McpTransportKind, call_mcp_tool, normalize_mcp_server_id};
 use std::collections::BTreeMap;
 
 pub(super) fn handle_mcp(args: &[String]) -> Result<()> {

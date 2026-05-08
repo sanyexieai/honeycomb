@@ -1,14 +1,20 @@
 use anyhow::Result;
-use hc_bootstrap::wall_clock_ms;
+use hc_bootstrap::{wall_clock_ms, workspace_root};
 use hc_core::{
     ChannelRecord, MessageRecord, MessageRoute, NominationStatus, RuntimeNamespace,
     RuntimeSupervisor, SessionRecord,
 };
 use serde::{Deserialize, Serialize};
 
+use hc_store::store::WorkspaceNamespace;
+
 use crate::{
-    AgentPlan, ChannelConversation, ConversationParticipant, MaterializedAgent, TaskPlan,
-    TaskRequest, bootstrap_planning_task, materialize_plan,
+    AgentPlan, ChannelConversation, ConversationParticipant, MaterializePlanOutcome,
+    MaterializedAgent, TaskPlan, TaskRequest, bootstrap_planning_task, materialize_plan,
+};
+use crate::persistence::{
+    MaterializationNoticeRecordV1, MATERIALIZATION_NOTICE_SCHEMA_V1,
+    append_materialization_notice_record,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,7 +223,15 @@ pub fn bootstrap_task_workbench(
         .create_session_in_namespace(format!("task-{}", task.id.replace(' ', "-")), namespace);
     let plan = bootstrap_planning_task(&task);
     let mut task_plan = TaskPlan::awaiting_planner_input(&task);
-    let agents = materialize_plan(runtime, &session.id, &plan)?;
+    let outcome = materialize_plan(runtime, &session.id, &plan)?;
+    if let Err(error) = persist_materialization_notices(&plan, &outcome) {
+        tracing::warn!(
+            ?error,
+            task_id = %plan.task_id,
+            "append materialization notice journal"
+        );
+    }
+    let agents = outcome.agents;
     for agent in &agents {
         task_plan.register_agent_runtime_budget(agent.runtime_budget.clone());
     }
@@ -231,6 +245,27 @@ pub fn bootstrap_task_workbench(
         agents,
         channel_conversations: Vec::new(),
     })
+}
+
+fn persist_materialization_notices(plan: &AgentPlan, outcome: &MaterializePlanOutcome) -> Result<()> {
+    if outcome.notices.is_empty() {
+        return Ok(());
+    }
+    let root = workspace_root();
+    let namespace =
+        WorkspaceNamespace::new(plan.namespace.tenant_id.clone(), plan.namespace.user_id.clone());
+    let record = MaterializationNoticeRecordV1 {
+        schema: MATERIALIZATION_NOTICE_SCHEMA_V1.to_owned(),
+        created_at_ms: wall_clock_ms(),
+        task_id: plan.task_id.clone(),
+        notice: outcome.notices.join(" | "),
+        planned_seed_count: outcome.planned_seeds,
+        materialized_count: outcome.agents.len(),
+        limit_max_agents_per_task: outcome.limits.max_agents_per_task,
+        limit_max_new_agents_per_round: outcome.limits.max_new_agents_per_round,
+    };
+    append_materialization_notice_record(&root, &namespace, &plan.task_id, &record)?;
+    Ok(())
 }
 
 #[cfg(test)]

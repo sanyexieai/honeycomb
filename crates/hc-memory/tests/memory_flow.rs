@@ -30,6 +30,7 @@ use hc_memory::{
     MemoryVisibility,
     RoomCapabilityResolver,
     RoomConfig,
+    RoomRoutingConfig,
     ScheduleRef,
     SkillRef,
     ToolRef,
@@ -874,6 +875,26 @@ fn room_capability_inheritance_roundtrips_through_storage() {
                     .with_default_namespace("honeycomb")
                     .with_environment_var("RUST_LOG", "debug")
                     .with_working_directory("/workspace/honeycomb"),
+            )
+            .with_routing(
+                RoomRoutingConfig::new()
+                    .with_enabled_provider("mcp_tool")
+                    .with_disabled_provider("timed")
+                    .with_provider_weight("mcp_tool", 250)
+                    .with_tool_whitelist("tool.cargo-test")
+                    .with_tool_blacklist("tool.rm")
+                    .with_capability_whitelist("capability.rust.development")
+                    .with_capability_blacklist("capability.forbidden")
+                    .with_skill_whitelist("skill.rust.review")
+                    .with_skill_blacklist("skill.blocked")
+                    .with_provider_argument_override("mcp_tool", {
+                        let mut args = serde_json::Map::new();
+                        args.insert(
+                            "audience".to_string(),
+                            serde_json::Value::String("room".to_string()),
+                        );
+                        args
+                    }),
             ),
     );
 
@@ -961,6 +982,79 @@ fn room_capability_inheritance_roundtrips_through_storage() {
             .environment
             .get("RUST_LOG"),
         Some(&"debug".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .enabled_providers
+            .contains(&"mcp_tool".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .disabled_providers
+            .contains(&"timed".to_string())
+    );
+    assert_eq!(
+        loaded_room
+            .room_config
+            .routing
+            .provider_weights
+            .get("mcp_tool"),
+        Some(&250)
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .tool_whitelist
+            .contains(&"tool.cargo-test".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .tool_blacklist
+            .contains(&"tool.rm".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .capability_whitelist
+            .contains(&"capability.rust.development".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .capability_blacklist
+            .contains(&"capability.forbidden".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .skill_whitelist
+            .contains(&"skill.rust.review".to_string())
+    );
+    assert!(
+        loaded_room
+            .room_config
+            .routing
+            .skill_blacklist
+            .contains(&"skill.blocked".to_string())
+    );
+    assert_eq!(
+        loaded_room
+            .room_config
+            .routing
+            .provider_argument_overrides
+            .get("mcp_tool")
+            .and_then(|args| args.get("audience")),
+        Some(&serde_json::Value::String("room".to_string()))
     );
 
     let _ = fs::remove_dir_all(root);

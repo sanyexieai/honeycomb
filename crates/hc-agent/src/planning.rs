@@ -1,3 +1,7 @@
+use hc_protocol::swarm::{
+    WorkItemLifecycleState, claim_capability_eligible_for_p0_assign_v1,
+    select_assign_winner_claim_index_v1,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::TaskRequest;
@@ -44,10 +48,14 @@ pub struct WorkItem {
     pub title: String,
     pub goal: String,
     pub stage: String,
-    pub status: String,
+    pub lifecycle: WorkItemLifecycleState,
     pub estimated_token_cost: u32,
     pub estimated_time_minutes: u32,
 }
+
+/// Seeded only by [`crate::persistence::ensure_http_implicit_task_plan_stub`]; stripped on
+/// subsequent [`crate::persist_task_artifacts`] when at least one other work item exists.
+pub const HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID: &str = "work-item.http.implicit.holder";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentProposal {
@@ -124,6 +132,25 @@ impl TaskPlan {
         }
     }
 
+    /// Drops [`HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID`] once the planner (or tooling) adds at least one other work item.
+    pub fn prune_http_implicit_work_item_placeholder(&mut self) {
+        let has_holder = self
+            .work_items
+            .iter()
+            .any(|item| item.id == HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID);
+        if !has_holder {
+            return;
+        }
+        let non_placeholder_work_items = self
+            .work_items
+            .iter()
+            .filter(|item| item.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID)
+            .count();
+        if non_placeholder_work_items > 0 {
+            self.work_items.retain(|item| item.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID);
+        }
+    }
+
     pub fn add_note(&mut self, note: impl Into<String>) {
         self.status = TaskPlanStatus::Drafted;
         self.planning_notes.push(note.into());
@@ -153,7 +180,7 @@ impl TaskPlan {
             title: title.into(),
             goal: goal.into(),
             stage: stage.into(),
-            status: "planned".to_owned(),
+            lifecycle: WorkItemLifecycleState::Planned,
             estimated_token_cost,
             estimated_time_minutes,
         });
@@ -243,15 +270,51 @@ impl TaskPlan {
         id
     }
 
+    /// Assignments to non-terminal work items (`assigned` / `executing`) for capacity tie-break (ADR-003).
+    #[must_use]
+    pub fn current_workload_for_agent(&self, agent_instance_id: &str) -> u32 {
+        self.work_item_assignments
+            .iter()
+            .filter(|a| {
+                a.agent_instance_id == agent_instance_id
+                    && matches!(a.status.as_str(), "assigned" | "executing")
+            })
+            .filter(|a| {
+                self.work_items
+                    .iter()
+                    .find(|w| w.id == a.work_item_id)
+                    .map(|w| !w.lifecycle.is_terminal())
+                    .unwrap_or(false)
+            })
+            .count() as u32
+    }
+
+    /// Resolve one **assign winner** for `work_item_id` (ADR-003 P0 ordering via
+    /// [`select_assign_winner_claim_index_v1`](hc_protocol::swarm::select_assign_winner_claim_index_v1)).
     pub fn resolve_work_item_assignment(&mut self, work_item_id: &str) -> Option<String> {
-        let best_claim_index = self
+        if self.work_item_assignments.iter().any(|assignment| {
+            assignment.work_item_id == work_item_id
+                && matches!(assignment.status.as_str(), "assigned" | "executing")
+        }) {
+            return None;
+        }
+
+        let eligible_rows: Vec<_> = self
             .work_item_claims
             .iter()
             .enumerate()
             .filter(|(_, claim)| claim.work_item_id == work_item_id && claim.status == "submitted")
-            .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
-            .map(|(index, _)| index)?;
+            .filter(|(_, claim)| claim_capability_eligible_for_p0_assign_v1(claim.score))
+            .map(|(ix, claim)| {
+                (
+                    ix,
+                    claim.score,
+                    self.current_workload_for_agent(&claim.agent_instance_id),
+                )
+            })
+            .collect();
 
+        let best_claim_index = select_assign_winner_claim_index_v1(&eligible_rows)?;
         let best_claim = self.work_item_claims[best_claim_index].clone();
         self.work_item_claims[best_claim_index].status = "won".to_owned();
         for claim in &mut self.work_item_claims {
@@ -267,7 +330,7 @@ impl TaskPlan {
             .iter_mut()
             .find(|item| item.id == work_item_id)
         {
-            work_item.status = "assigned".to_owned();
+            work_item.lifecycle = WorkItemLifecycleState::Assigned;
         }
         let assignment_id = format!(
             "work-assignment.{:04}",
@@ -285,11 +348,9 @@ impl TaskPlan {
     }
 
     pub fn start_work_item_execution(&mut self, work_item_id: &str) -> Option<String> {
-        let work_item = self
-            .work_items
-            .iter_mut()
-            .find(|item| item.id == work_item_id && item.status == "assigned")?;
-        work_item.status = "in_progress".to_owned();
+        self.work_items.iter().find(|item| {
+            item.id == work_item_id && item.lifecycle == WorkItemLifecycleState::Assigned
+        })?;
 
         let assignment = self.work_item_assignments.iter_mut().find(|assignment| {
             assignment.work_item_id == work_item_id && assignment.status == "assigned"

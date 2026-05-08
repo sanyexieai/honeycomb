@@ -364,6 +364,102 @@ fn workspace_retriever_prefers_room_compressed_assets() {
 }
 
 #[test]
+fn workspace_retriever_task_room_anchor_filters_parallel_task_assets() {
+    let root = unique_temp_dir("context-task-anchor-isolation");
+    let namespace = MemoryNamespace::new("tenant-anchor", "user-anchor");
+    let workspace_namespace = workspace_namespace_from_memory_namespace(&namespace);
+    let room_repo = MemoryRoomRepository::with_namespace(&root, workspace_namespace.clone());
+
+    let id_a = "room.task.parallel.alpha.demo";
+    let id_b = "room.task.parallel.beta.demo";
+
+    for (id, title) in [
+        (id_a, "Alpha task room"),
+        (id_b, "Beta task room"),
+    ] {
+        let room = MemoryRoom::new(
+            id,
+            MemoryLayer::Task,
+            title,
+            "plan execution notes for task deliverables.",
+        )
+        .with_namespace(namespace.clone())
+        .with_tag("isolation-fixture");
+        room_repo.write_room(&room).expect("room should be written");
+        let asset = MemoryRoomAsset::new(
+            format!("asset.{id}.summary"),
+            room.id.clone(),
+            "min.summary.md",
+            MemoryLayer::Task,
+            MemoryRoomAssetKind::Compressed,
+            "Plan artifact",
+            "plan execution notes for task deliverables.",
+        )
+        .with_namespace(namespace.clone())
+        .with_memory_kind(MemoryKind::Knowledge)
+        .with_owner(MemoryOwnerRef::task(id))
+        .with_tag("isolation-fixture");
+        room_repo
+            .write_asset(&room, &asset)
+            .expect("compressed asset should be written");
+    }
+
+    let mem_repo = MemoryRepository::with_namespace(&root, workspace_namespace.clone());
+    for (rec_id, owner_room) in [
+        ("memory.parallel.alpha.flat", id_a),
+        ("memory.parallel.beta.flat", id_b),
+    ] {
+        let record = MemoryRecord::new(
+            rec_id,
+            MemoryScope::Task,
+            MemoryOwnerRef::task(owner_room),
+            MemoryKind::Summary,
+            "Plan artifact",
+            "plan execution notes for task deliverables.",
+        )
+        .with_namespace(namespace.clone())
+        .with_visibility(MemoryVisibility::Private)
+        .with_tag("isolation-fixture")
+        .with_confidence_milli(800);
+        mem_repo
+            .write_record(&record)
+            .expect("memory record should be written");
+    }
+
+    let retriever = WorkspaceMemoryRetriever::new(&root, workspace_namespace);
+    let matches = retriever
+        .retrieve(
+            &ContextMemoryQuery::default()
+                .for_namespace(namespace.clone())
+                .with_scope(MemoryScope::Task)
+                .with_room_anchor(id_a.to_owned())
+                .with_tag("isolation-fixture")
+                .with_text("plan execution")
+                .with_limit(20),
+        )
+        .expect("memory retrieval should succeed");
+
+    assert!(
+        !matches.iter().any(|m| m.id.contains(id_b)),
+        "unexpected recall from parallel task room B {:?}",
+        matches
+    );
+
+    assert!(
+        matches.iter().any(|m| m.id == "memory.parallel.alpha.flat"),
+        "missing alpha scoped flat record {:?}",
+        matches
+    );
+    assert!(
+        matches.iter().any(|m| m.id.contains(id_a)),
+        "missing alpha room asset {:?}",
+        matches
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_retriever_skips_stale_room_asset_index_entries() {
     let root = unique_temp_dir("context-stale-room-asset-index");
     let namespace = MemoryNamespace::new("tenant-a", "user-a");

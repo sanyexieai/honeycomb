@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    convert::Infallible,
-    env,
-    net::SocketAddr,
-    time::Duration,
-};
+use std::{collections::BTreeSet, convert::Infallible, env, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -49,6 +43,10 @@ use hc_service::{
     },
     human_inbox::{complete_human_inbox_item, list_human_inbox_pending},
     index::{IndexRebuildRequest, IndexSearchRequest, rebuild_index, search_index},
+    room_routing::{
+        RoomRoutingContext, RoomRoutingExplain, resolve_room_routing_context,
+        resolve_room_routing_explain,
+    },
     scheduler::{
         ScheduleRequest, ScheduleStatusRequest, SchedulerRunRequest, dispatch_due_scheduled_runs,
         dispatch_fired_followup_messages_headless, dispatch_queued_scheduled_runs,
@@ -62,7 +60,7 @@ use hc_service::{
     },
     turn::{TurnStreamEvent, handle_turn_request, handle_turn_stream_request},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_stream::{
     Stream,
@@ -261,6 +259,63 @@ async fn chat_ws_session(mut socket: WebSocket, state: AppState) {
         }
     };
 
+    let (enhanced_request, _decision, room_ctx) =
+        match enhance_chat_request_with_room_capabilities(&state, &request).await {
+            Ok(triple) => triple,
+            Err(error) => {
+                let _ = socket
+                    .send(Message::Text(
+                        json!({
+                            "event": "chat.error",
+                            "id": format!("chat.error.{}", now_unix()),
+                            "data": {
+                                "type": "chat_error",
+                                "error": format!(
+                                    "Room capability enhancement failed: {}",
+                                    error.0
+                                ),
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+    let room_caps_data =
+        match room_capabilities_stream_data(&state, &request, room_ctx.as_ref()).await {
+            Ok(data) => data,
+            Err(error) => {
+                let _ = socket
+                    .send(Message::Text(
+                        json!({
+                            "event": "chat.error",
+                            "id": format!("chat.error.{}", now_unix()),
+                            "data": {
+                                "type": "chat_error",
+                                "error": format!("Room capabilities metadata failed: {}", error.0),
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                return;
+            }
+        };
+    if let Some(data) = room_caps_data {
+        let _ = socket
+            .send(Message::Text(
+                json!({
+                    "event": "chat.room_capabilities",
+                    "id": format!("chat.room_capabilities.{}", now_unix()),
+                    "data": data,
+                })
+                .to_string(),
+            ))
+            .await;
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
     let tx_blocking = tx.clone();
     let service = state.service.clone();
@@ -281,7 +336,7 @@ async fn chat_ws_session(mut socket: WebSocket, state: AppState) {
                     .map_err(|_| anyhow!("chat ws client disconnected"))?;
                 Ok(())
             };
-            handle_turn_stream_request(&service, request, &mut on_event)
+            handle_turn_stream_request(&service, enhanced_request, room_ctx, &mut on_event)
         })
         .await
         .map_err(|error| anyhow!("chat ws worker failed: {error}"))
@@ -368,6 +423,10 @@ pub fn build_router(state: AppState, swagger_ui_dist_base_url: String) -> Router
         .route(
             "/v1/memory/rooms/:room_id/capabilities",
             get(memory_room_capabilities),
+        )
+        .route(
+            "/v1/memory/rooms/:room_id/routing",
+            get(memory_room_routing),
         )
         .route(
             "/v1/memory/rooms/:room_id/capabilities/inherit",
@@ -839,24 +898,34 @@ async fn chat(
     State(state): State<AppState>,
     Json(request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ApiError> {
-    let (enhanced_request, decision) =
+    let (enhanced_request, decision, room_ctx) =
         enhance_chat_request_with_room_capabilities(&state, &request).await?;
-    let service = state.service.clone();
-    let mut response =
-        tokio::task::spawn_blocking(move || handle_turn_request(&service, enhanced_request))
-            .await
-            .map_err(|error| ApiError(anyhow!("chat worker failed: {error}")))?
-            .map_err(ApiError::from)?;
 
-    // 添加房间信息到响应
-    response.room_id = request.room_id.clone();
     let chat_namespace = normalized_request_namespace(
         ApiNamespace::default(),
         request.tenant_id.clone(),
         request.user_id.clone(),
     );
-    if let Some(room_id) = &request.room_id {
-        let capabilities_info = get_room_capabilities_info(room_id, &chat_namespace).await?;
+    let capabilities_info_opt: Option<RoomCapabilitiesInfo> = match request.room_id.as_ref() {
+        None => None,
+        Some(room_id) => Some(if let Some(ref ctx) = room_ctx {
+            room_capabilities_info_from_routing(ctx)
+        } else {
+            get_room_capabilities_info(&state, room_id, &chat_namespace).await?
+        }),
+    };
+
+    let service = state.service.clone();
+    let mut response = tokio::task::spawn_blocking(move || {
+        handle_turn_request(&service, enhanced_request, room_ctx)
+    })
+    .await
+    .map_err(|error| ApiError(anyhow!("chat worker failed: {error}")))?
+    .map_err(ApiError::from)?;
+
+    // 添加房间信息到响应
+    response.room_id = request.room_id.clone();
+    if let Some(capabilities_info) = capabilities_info_opt {
         response.room_capabilities_used = capabilities_info.capabilities;
         response.room_tools_used = capabilities_info.tools;
         response.room_skills_used = capabilities_info.skills;
@@ -880,9 +949,9 @@ async fn chat_stream(
     let service = state.service.clone();
 
     // 增强请求以包含房间能力
-    let (enhanced_request, _decision) =
+    let (enhanced_request, _decision, room_ctx) =
         match enhance_chat_request_with_room_capabilities(&state, &request).await {
-            Ok((req, dec)) => (req, dec),
+            Ok(triple) => triple,
             Err(error) => {
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
@@ -904,8 +973,41 @@ async fn chat_stream(
             }
         };
 
+    let room_caps_data =
+        match room_capabilities_stream_data(&state, &request, room_ctx.as_ref()).await {
+            Ok(data) => data,
+            Err(error) => {
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx_clone
+                        .send(Ok(Event::default().event("chat.error").data(
+                            json!({
+                                "type": "chat_error",
+                                "error": format!(
+                                    "Room capabilities metadata failed: {}",
+                                    error.0
+                                ),
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                });
+                return Sse::new(ReceiverStream::new(rx)).keep_alive(
+                    KeepAlive::new()
+                        .interval(Duration::from_secs(15))
+                        .text("keep-alive"),
+                );
+            }
+        };
+
     tokio::spawn(async move {
         let tx_for_events = tx.clone();
+        if let Some(payload) = room_caps_data {
+            let id = format!("chat.room_capabilities.{}", now_unix());
+            if let Ok(event) = sse_json_event("chat.room_capabilities", id, payload) {
+                let _ = tx_for_events.send(Ok(event)).await;
+            }
+        }
         let response = tokio::task::spawn_blocking(move || {
             let mut on_event = |event: TurnStreamEvent| -> Result<()> {
                 let event_name = turn_stream_event_name(&event);
@@ -916,7 +1018,7 @@ async fn chat_stream(
                     .map_err(|error| anyhow!("chat stream client disconnected: {error}"))?;
                 Ok(())
             };
-            handle_turn_stream_request(&service, enhanced_request, &mut on_event)
+            handle_turn_stream_request(&service, enhanced_request, room_ctx, &mut on_event)
         })
         .await
         .map_err(|error| anyhow!("chat stream worker failed: {error}"))
@@ -1175,9 +1277,13 @@ async fn schedule_dispatch_due(
     let delivery_mode = scheduler_followup_delivery_mode_from_env();
     let response = tokio::task::spawn_blocking(move || {
         let report = dispatch_due_scheduled_runs(&service, namespace.clone(), request.now_unix)?;
-        let delivered_followups =
-            deliver_scheduler_followup_messages(&service, namespace, &report.receipts, delivery_mode)?
-                .len();
+        let delivered_followups = deliver_scheduler_followup_messages(
+            &service,
+            namespace,
+            &report.receipts,
+            delivery_mode,
+        )?
+        .len();
         tracing::debug!(
             dispatched = report.receipts.len(),
             queued = report.queued_count,
@@ -1202,9 +1308,13 @@ async fn schedule_dispatch_queued(
     let delivery_mode = scheduler_followup_delivery_mode_from_env();
     let response = tokio::task::spawn_blocking(move || {
         let report = dispatch_queued_scheduled_runs(&service, namespace.clone(), request.now_unix)?;
-        let delivered_followups =
-            deliver_scheduler_followup_messages(&service, namespace, &report.receipts, delivery_mode)?
-                .len();
+        let delivered_followups = deliver_scheduler_followup_messages(
+            &service,
+            namespace,
+            &report.receipts,
+            delivery_mode,
+        )?
+        .len();
         tracing::debug!(
             dispatched = report.receipts.len(),
             queued = report.queued_count,
@@ -1331,7 +1441,7 @@ fn openapi_document() -> Value {
                 "post": {
                     "summary": "Generate a chat response over Server-Sent Events",
                     "operationId": "streamChat",
-                    "description": "Streams chat lifecycle events and model deltas. Events include turn.started, turn.tool, turn.completed, chat.started, chat.delta, chat.completed, and chat.error.",
+                    "description": "Streams chat lifecycle events and model deltas. SSE `event` names include `chat.room_capabilities` (optional, emitted first when `ChatRequest.room_id` is set; `data` matches `#/components/schemas/RoomCapabilitiesStreamData`), `turn.started`, `turn.tool`, `turn.completed`, `chat.started`, `chat.delta`, `chat.completed`, and `chat.error`.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -1356,7 +1466,7 @@ fn openapi_document() -> Value {
                 "get": {
                     "summary": "WebSocket chat stream",
                     "operationId": "streamChatWebSocket",
-                    "description": "Open WebSocket upgrade on GET. After the handshake, send one text frame containing a ChatRequest JSON body; the server streams JSON event messages with the same payload shape as SSE /v1/chat/stream (fields event, id, data). OpenAPI cannot fully describe WebSocket frames; use this entry as a capability marker."
+                    "description": "Open WebSocket upgrade on GET. After the handshake, send one text frame containing a ChatRequest JSON body; the server streams JSON event messages with the same payload shape as SSE /v1/chat/stream (fields `event`, `id`, `data`), including optional leading `chat.room_capabilities` when `room_id` is set. OpenAPI cannot fully describe WebSocket frames; use this entry as a capability marker."
                 }
             },
             "/v1/agents": {
@@ -1952,6 +2062,7 @@ fn openapi_document() -> Value {
                         "room_id": { "type": "string" },
                         "selected_agent_id": { "type": "string" },
                         "selected_domain_id": { "type": "string" },
+                        "selected_provider": { "type": "string" },
                         "recalled_memories": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/MemoryRef" }
@@ -1974,6 +2085,46 @@ fn openapi_document() -> Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "List of room skills that were used in this response"
+                        },
+                        "behavior_pattern_used": { "type": "string" },
+                        "decision_reasoning": { "type": "string" },
+                        "decision_confidence": {
+                            "type": "number",
+                            "format": "float"
+                        },
+                        "active_task_id": {
+                            "type": "string",
+                            "description": "ADR-004 task binding: canonical active task for this session after this turn (client may persist as next request ChatRequest.active_task_id)."
+                        }
+                    }
+                },
+                "RoomCapabilitiesStreamData": {
+                    "type": "object",
+                    "required": [
+                        "type",
+                        "room_id",
+                        "room_capabilities_used",
+                        "room_tools_used",
+                        "room_skills_used"
+                    ],
+                    "description": "SSE/WS `chat.room_capabilities` payload (`data` field). Aligns with non-stream `ChatResponse` room list fields.",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["room_capabilities"]
+                        },
+                        "room_id": { "type": "string" },
+                        "room_capabilities_used": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "room_tools_used": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "room_skills_used": {
+                            "type": "array",
+                            "items": { "type": "string" }
                         }
                     }
                 },
@@ -2414,6 +2565,18 @@ struct RoomCapabilitiesResponse {
     resolved_schedules: Vec<ResolvedScheduleResponse>,
 }
 
+#[derive(Debug, Serialize)]
+struct RoomRoutingResponse {
+    room_id: String,
+    enabled_providers: Vec<String>,
+    provider_weights: std::collections::BTreeMap<String, i32>,
+    capability_ids: Vec<String>,
+    skill_ids: Vec<String>,
+    allowed_tool_ids: Vec<String>,
+    provider_argument_override_keys: std::collections::BTreeMap<String, Vec<String>>,
+    tool_argument_override_keys: std::collections::BTreeMap<String, Vec<String>>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ResolvedCapabilityResponse {
     capability_ref: CapabilityRef,
@@ -2739,6 +2902,23 @@ async fn memory_room_capabilities(
     }
 }
 
+async fn memory_room_routing(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Query(query): Query<NamespaceQuery>,
+) -> Result<Json<RoomRoutingResponse>, ApiError> {
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.tenant_id),
+        Some(query.user_id),
+    );
+    let request = room_lookup_request(&room_id, &namespace);
+    let explain = resolve_room_routing_explain(&state.service, &request)
+        .map_err(|e| ApiError(anyhow!("Failed to resolve room routing: {}", e)))?
+        .ok_or_else(|| ApiError(anyhow!("Room not found: {}", room_id)))?;
+    Ok(Json(room_routing_response(explain)))
+}
+
 async fn memory_room_inherit_capability(
     State(_state): State<AppState>,
     Path(room_id): Path<String>,
@@ -2863,10 +3043,26 @@ struct RoomCapabilitiesInfo {
     skills: Vec<String>,
 }
 
+fn room_capabilities_info_from_routing(ctx: &RoomRoutingContext) -> RoomCapabilitiesInfo {
+    let lists = ctx.response_capability_lists();
+    RoomCapabilitiesInfo {
+        capabilities: lists.capabilities,
+        tools: lists.tools,
+        skills: lists.skills,
+    }
+}
+
 async fn enhance_chat_request_with_room_capabilities(
-    _state: &AppState,
+    state: &AppState,
     request: &ChatRequest,
-) -> Result<(ChatRequest, Option<DecisionRecord>), ApiError> {
+) -> Result<
+    (
+        ChatRequest,
+        Option<DecisionRecord>,
+        Option<RoomRoutingContext>,
+    ),
+    ApiError,
+> {
     let mut enhanced_request = request.clone();
 
     // 构建行为上下文
@@ -2908,40 +3104,15 @@ async fn enhance_chat_request_with_room_capabilities(
             .make_decision(DecisionType::ResponseStyle, options)
             .map_err(|e| ApiError(anyhow::anyhow!("Behavior decision failed: {}", e)))?;
 
-        return Ok((enhanced_request, Some(decision)));
+        return Ok((enhanced_request, Some(decision), None));
     };
 
-    // 构建命名空间
-    let tenant_id = request.tenant_id.clone().unwrap_or_else(default_tenant_id);
-    let user_id = request.user_id.clone().unwrap_or_else(default_user_id);
-    let namespace = hc_store::store::WorkspaceNamespace::new(&tenant_id, &user_id);
-
-    // 获取房间
-    let repository = MemoryRoomRepository::with_namespace(workspace_root(), namespace.clone());
-
-    // 查找房间
-    let room = match repository.get_room_by_id(room_id) {
-        Ok(Some(room)) => room,
-        Ok(None) => {
-            // 房间不存在，返回原请求（可选择记录日志或返回错误）
-            return Ok((enhanced_request, None));
-        }
+    let room_routing = match resolve_room_routing_context(&state.service, request) {
+        Ok(Some(context)) => context,
+        Ok(None) => return Ok((enhanced_request, None, None)),
         Err(err) => {
-            error!(%room_id, error = %err, "failed to load room");
-            return Ok((enhanced_request, None));
-        }
-    };
-
-    // 构建内存命名空间
-    let memory_namespace = MemoryNamespace::new(&tenant_id, &user_id);
-
-    // 解析房间能力
-    let resolver = RoomCapabilityResolver::new(memory_namespace);
-    let capabilities = match resolver.resolve_room_capabilities(&room) {
-        Ok(caps) => caps,
-        Err(err) => {
-            error!(%room_id, error = %err, "failed to resolve room capabilities");
-            return Ok((enhanced_request, None));
+            error!(%room_id, error = %err, "failed to resolve room routing context");
+            return Ok((enhanced_request, None, None));
         }
     };
 
@@ -2961,65 +3132,109 @@ async fn enhance_chat_request_with_room_capabilities(
 
     // 根据决策结果增强系统提示
     enhanced_request.system_prompt = enhance_system_prompt_with_behavior_and_room_capabilities(
-        &capabilities,
-        &room,
+        &room_routing.resolved,
+        &room_routing.room,
         &behavior_config,
         &decision,
         &enhanced_request.system_prompt,
     );
 
-    Ok((enhanced_request, Some(decision)))
+    Ok((enhanced_request, Some(decision), Some(room_routing)))
 }
 
 async fn get_room_capabilities_info(
+    state: &AppState,
     room_id: &str,
     namespace: &ApiNamespace,
 ) -> Result<RoomCapabilitiesInfo, ApiError> {
-    let workspace_ns =
-        hc_store::store::WorkspaceNamespace::new(&namespace.tenant_id, &namespace.user_id);
-    let repository = MemoryRoomRepository::with_namespace(workspace_root(), workspace_ns);
-
-    // 查找房间
-    let room = match repository
-        .get_room_by_id(room_id)
-        .map_err(|e| ApiError(anyhow!("Failed to load room: {}", e)))?
-    {
-        Some(room) => room,
-        None => {
-            return Ok(RoomCapabilitiesInfo {
-                capabilities: Vec::new(),
-                tools: Vec::new(),
-                skills: Vec::new(),
-            });
-        }
+    let request = room_lookup_request(room_id, namespace);
+    let Some(context) = resolve_room_routing_context(&state.service, &request)
+        .map_err(|e| ApiError(anyhow!("Failed to resolve room routing: {}", e)))?
+    else {
+        return Ok(RoomCapabilitiesInfo {
+            capabilities: Vec::new(),
+            tools: Vec::new(),
+            skills: Vec::new(),
+        });
     };
 
-    let memory_namespace = MemoryNamespace::new(&namespace.tenant_id, &namespace.user_id);
+    Ok(room_capabilities_info_from_routing(&context))
+}
 
-    // 解析房间能力
-    let resolver = RoomCapabilityResolver::new(memory_namespace);
-    let capabilities = resolver
-        .resolve_room_capabilities(&room)
-        .map_err(|e| ApiError(anyhow!("Failed to resolve room capabilities: {}", e)))?;
+/// Payload for SSE/WS event `chat.room_capabilities` (matches REST `ChatResponse` `room_*_used`).
+async fn room_capabilities_stream_data(
+    state: &AppState,
+    request: &ChatRequest,
+    room_ctx: Option<&RoomRoutingContext>,
+) -> Result<Option<Value>, ApiError> {
+    let Some(room_id) = request
+        .room_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let chat_namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        request.tenant_id.clone(),
+        request.user_id.clone(),
+    );
+    let info = if let Some(ctx) = room_ctx {
+        room_capabilities_info_from_routing(ctx)
+    } else {
+        get_room_capabilities_info(state, room_id, &chat_namespace).await?
+    };
+    Ok(Some(json!({
+        "type": "room_capabilities",
+        "room_id": room_id,
+        "room_capabilities_used": info.capabilities,
+        "room_tools_used": info.tools,
+        "room_skills_used": info.skills,
+    })))
+}
 
-    // 提取实际的能力列表
-    Ok(RoomCapabilitiesInfo {
-        capabilities: capabilities
-            .capabilities
-            .iter()
-            .map(|c| c.capability_ref.id.clone())
-            .collect(),
-        tools: capabilities
-            .tools
-            .iter()
-            .map(|t| t.tool_ref.id.clone())
-            .collect(),
-        skills: capabilities
-            .skills
-            .iter()
-            .map(|s| s.skill_ref.id.clone())
-            .collect(),
-    })
+fn room_lookup_request(room_id: &str, namespace: &ApiNamespace) -> ChatRequest {
+    ChatRequest {
+        tenant_id: Some(namespace.tenant_id.clone()),
+        user_id: Some(namespace.user_id.clone()),
+        session_id: None,
+        room_id: Some(room_id.to_owned()),
+        behavior_pattern: None,
+        thinking_depth: None,
+        input: None,
+        messages: Vec::new(),
+        provider: None,
+        model: None,
+        system_prompt: None,
+        agent_id: None,
+        domain_id: None,
+        active_agent_id: None,
+        active_task_id: None,
+        memory: hc_protocol::ApiMemoryQuery {
+            namespace: namespace.clone(),
+            scope: None,
+            kind: None,
+            tag: None,
+            text: None,
+            limit: None,
+        },
+        temperature: None,
+        max_output_tokens: None,
+    }
+}
+
+fn room_routing_response(explain: RoomRoutingExplain) -> RoomRoutingResponse {
+    RoomRoutingResponse {
+        room_id: explain.room_id,
+        enabled_providers: explain.enabled_providers,
+        provider_weights: explain.provider_weights,
+        capability_ids: explain.capability_ids,
+        skill_ids: explain.skill_ids,
+        allowed_tool_ids: explain.allowed_tool_ids,
+        provider_argument_override_keys: explain.provider_argument_override_keys,
+        tool_argument_override_keys: explain.tool_argument_override_keys,
+    }
 }
 
 fn enhance_system_prompt_with_behavior_and_room_capabilities(

@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::HashSet,
     io::{BufRead, BufReader, Read},
     process::{Command, Stdio},
     rc::Rc,
@@ -12,8 +13,11 @@ use anyhow::{Context, Result, bail};
 use hc_agent::{
     ActivityItemView, AgentOrchestrator, AgentPlan, AgentSeed, AgentWorkbench, MaterializedAgent,
     TaskArtifactSummary, TaskBudget, TaskNamespace, TaskPlan, TaskRequest, WorkspacePhase,
-    bootstrap_task_workbench, build_workspace_view, materialize_seed, persist_task_artifacts,
-    query_task_artifacts,
+    append_implicit_intent_dedupe_record, append_routing_binding_log_line,
+    append_work_item_assignment_journal_line, append_work_item_claim_journal_line,
+    bootstrap_task_workbench, build_routing_binding_log_line_v1, build_workspace_view,
+    hydrate_task_plan_work_item_coordination_journals, load_implicit_intent_dedupe_keys,
+    materialize_seed, persist_task_artifacts_with_in_memory_prune, query_task_artifacts,
 };
 use hc_bootstrap::{tenant_id_from_env, user_id_from_env};
 use hc_context::{
@@ -27,6 +31,10 @@ use hc_core::{
 use hc_llm::{
     ProviderRegistry, default_model_from_env, default_provider_from_env, default_registry_from_env,
     provider_api_key_from_env,
+};
+use hc_protocol::swarm::{
+    ImplicitIntentDedupeKey, ImplicitIntentDedupeRecord, RoutingTier, TaskBindingAction,
+    WorkItemLifecycleState,
 };
 use hc_responder::{
     HumanInboxRepository, HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse,
@@ -586,6 +594,8 @@ struct UiRegistry {
     runtime: RuntimeSupervisor,
     orchestrator: AgentOrchestrator,
     session_id: String,
+    /// Task id this runtime session treats as the active conversation binding (ADR-004); may diverge from workspace `task_id` later.
+    conversation_active_task_id: Option<String>,
     task_id: String,
     task_title: String,
     task_goal: String,
@@ -594,6 +604,7 @@ struct UiRegistry {
     namespace: RuntimeNamespace,
     agents: Vec<MaterializedAgent>,
     task_artifacts: Vec<TaskArtifactSummary>,
+    implicit_intent_seen: HashSet<ImplicitIntentDedupeKey>,
     windows: Vec<WindowController>,
     next_window_index: usize,
     events_rx: Receiver<UiEvent>,
@@ -773,10 +784,28 @@ fn build_registry_for_task(
         .cloned()
         .context("expected at least one materialized agent window")?;
 
+    let store_namespace = hc_store::store::WorkspaceNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    );
+    let implicit_intent_seen = load_implicit_intent_dedupe_keys(
+        hc_bootstrap::workspace_root(),
+        &store_namespace,
+        &workbench.task.id,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            ?error,
+            "load implicit-intent dedupe keys from workspace; continuing with empty set"
+        );
+        HashSet::new()
+    });
+
     let registry = Rc::new(RefCell::new(UiRegistry {
         runtime,
         orchestrator: AgentOrchestrator::new(),
         session_id: workbench.session.id.clone(),
+        conversation_active_task_id: Some(workbench.task.id.clone()),
         task_id: workbench.task.id.clone(),
         task_title: workbench.task.title.clone(),
         task_goal: workbench.task.goal.clone(),
@@ -785,6 +814,7 @@ fn build_registry_for_task(
         namespace,
         agents: workbench.agents,
         task_artifacts: Vec::new(),
+        implicit_intent_seen,
         windows: Vec::new(),
         next_window_index: 0,
         events_rx,
@@ -793,6 +823,17 @@ fn build_registry_for_task(
 
     {
         let mut registry_ref = registry.borrow_mut();
+        let namespace = hc_store::store::WorkspaceNamespace::new(
+            registry_ref.namespace.tenant_id.clone(),
+            registry_ref.namespace.user_id.clone(),
+        );
+        let task_id = registry_ref.task_id.clone();
+        hydrate_task_plan_work_item_coordination_journals(
+            hc_bootstrap::workspace_root(),
+            &namespace,
+            &task_id,
+            &mut registry_ref.task_plan,
+        )?;
         refresh_persisted_task_artifacts(&mut registry_ref)?;
     }
 
@@ -1585,10 +1626,9 @@ fn send_window_message(
                                 ));
                         }
                         Err(error) => {
-                            registry_ref.windows[from_index].transcript_lines.push(format!(
-                                "[llm error] {} could not reply: {error}",
-                                to_name
-                            ));
+                            registry_ref.windows[from_index]
+                                .transcript_lines
+                                .push(format!("[llm error] {} could not reply: {error}", to_name));
                         }
                     }
                 }
@@ -1608,6 +1648,8 @@ fn broadcast_window_message(
     from_window_index: i32,
     body: &str,
 ) -> Result<()> {
+    let mut steer_planner_nl_followup = None::<String>;
+    let mut assignment_routed_followup = false;
     {
         let mut registry_ref = registry.borrow_mut();
         let from_index = registry_ref
@@ -1647,12 +1689,120 @@ fn broadcast_window_message(
 
         let orchestrator = registry_ref.orchestrator.clone();
         let agents = registry_ref.agents.clone();
-        if let Some(grant) = orchestrator.run_nomination_cycle(
+        let conversation_active = registry_ref.conversation_active_task_id.clone();
+        let task_scope_id = registry_ref.task_id.clone();
+        let ts = current_timestamp_ms();
+        let nomination = orchestrator.run_nomination_cycle(
             &mut registry_ref.runtime,
             &agents,
             &message,
-            current_timestamp_ms(),
-        )? {
+            ts,
+            conversation_active.as_deref(),
+            Some(task_scope_id.as_str()),
+        )?;
+        if let Some(ref swarm) = nomination.swarm {
+            registry_ref.conversation_active_task_id = swarm.task_binding.active_task_id.clone();
+
+            if swarm.task_binding.task_binding_action == TaskBindingAction::CreateImplicitTask {
+                let key = ImplicitIntentDedupeKey::from_trigger(
+                    message.session_id.clone(),
+                    message.id.clone(),
+                    &message.body,
+                );
+                if registry_ref.implicit_intent_seen.contains(&key) {
+                    tracing::info!(
+                        message_id = %message.id,
+                        session_id = %message.session_id,
+                        "implicit work intent dedupe: duplicate ADR-003 key, skip journal append"
+                    );
+                } else {
+                    let record = ImplicitIntentDedupeRecord::from_key(&key, ts);
+                    if let Err(error) = append_implicit_intent_dedupe_record(
+                        hc_bootstrap::workspace_root(),
+                        &workspace_namespace(&registry_ref.namespace),
+                        task_scope_id.as_str(),
+                        &record,
+                    ) {
+                        tracing::warn!(?error, "append implicit intent dedupe record");
+                    } else {
+                        registry_ref.implicit_intent_seen.insert(key);
+                    }
+                }
+            }
+
+            let line =
+                build_routing_binding_log_line_v1(ts, &message, task_scope_id.as_str(), swarm);
+            if let Err(error) = append_routing_binding_log_line(
+                hc_bootstrap::workspace_root(),
+                &workspace_namespace(&registry_ref.namespace),
+                task_scope_id.as_str(),
+                &line,
+            ) {
+                tracing::warn!(?error, "append routing binding coordination log");
+            }
+        }
+        if nomination
+            .swarm
+            .as_ref()
+            .is_some_and(|s| matches!(s.routing.routing_tier, RoutingTier::L2 | RoutingTier::L3))
+            && nomination.grant.is_none()
+        {
+            let label = nomination
+                .swarm
+                .as_ref()
+                .expect("tier branch implies swarm exists")
+                .routing
+                .routing_tier
+                .to_string();
+            let note = if matches!(registry_ref.workspace_phase, WorkspacePhase::Planning) {
+                format!(
+                    "[routing {label}] task-scoped path: routing this broadcast to planner drafting"
+                )
+            } else if matches!(
+                registry_ref.workspace_phase,
+                WorkspacePhase::Assignment | WorkspacePhase::Execution
+            ) && registry_ref
+                .task_plan
+                .work_items
+                .iter()
+                .any(|item| item.lifecycle == WorkItemLifecycleState::Planned)
+            {
+                format!(
+                    "[routing {label}] task-scoped path: running assignment for planned work items"
+                )
+            } else if matches!(
+                registry_ref.workspace_phase,
+                WorkspacePhase::Assignment | WorkspacePhase::Execution
+            ) {
+                format!(
+                    "[routing {label}] task-scoped path: no planned work items to assign — add work items in the plan or return to planning"
+                )
+            } else {
+                format!(
+                    "[routing {label}] skipped message-level nomination — use planner / work items"
+                )
+            };
+            for window in &mut registry_ref.windows {
+                window.transcript_lines.push(note.clone());
+            }
+            match registry_ref.workspace_phase {
+                WorkspacePhase::Planning => {
+                    steer_planner_nl_followup = Some(message.body.clone());
+                }
+                WorkspacePhase::Assignment | WorkspacePhase::Execution => {
+                    let has_planned = registry_ref
+                        .task_plan
+                        .work_items
+                        .iter()
+                        .any(|item| item.lifecycle == WorkItemLifecycleState::Planned);
+                    if has_planned {
+                        assignment_routed_followup = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(grant) = nomination.grant {
             let speaker_name = registry_ref
                 .windows
                 .iter()
@@ -1739,6 +1889,23 @@ fn broadcast_window_message(
     }
 
     sync_windows(registry);
+    if let Some(planner_line) = steer_planner_nl_followup {
+        if let Err(error) = run_planner_natural_language_input(registry, &planner_line, false) {
+            tracing::warn!(
+                ?error,
+                "L2/L3 broadcast: planner drafting from chat failed after routing"
+            );
+        }
+    }
+    if assignment_routed_followup {
+        if let Err(error) = maybe_auto_assign_on_task_routed_chat(registry) {
+            tracing::warn!(
+                ?error,
+                "L2/L3 broadcast: auto-assign / execute after task routing failed"
+            );
+        }
+        sync_windows(registry);
+    }
     Ok(())
 }
 
@@ -1857,6 +2024,8 @@ fn send_channel_message(
     channel_name: &str,
     body: &str,
 ) -> Result<()> {
+    let mut steer_planner_nl_followup = None::<String>;
+    let mut assignment_routed_followup = false;
     {
         let mut registry_ref = registry.borrow_mut();
         let from_index = registry_ref
@@ -1929,12 +2098,120 @@ fn send_channel_message(
 
         let orchestrator = registry_ref.orchestrator.clone();
         let agents = registry_ref.agents.clone();
-        if let Some(grant) = orchestrator.run_nomination_cycle(
+        let conversation_active = registry_ref.conversation_active_task_id.clone();
+        let task_scope_id = registry_ref.task_id.clone();
+        let ts = current_timestamp_ms();
+        let nomination = orchestrator.run_nomination_cycle(
             &mut registry_ref.runtime,
             &agents,
             &message,
-            current_timestamp_ms(),
-        )? {
+            ts,
+            conversation_active.as_deref(),
+            Some(task_scope_id.as_str()),
+        )?;
+        if let Some(ref swarm) = nomination.swarm {
+            registry_ref.conversation_active_task_id = swarm.task_binding.active_task_id.clone();
+
+            if swarm.task_binding.task_binding_action == TaskBindingAction::CreateImplicitTask {
+                let key = ImplicitIntentDedupeKey::from_trigger(
+                    message.session_id.clone(),
+                    message.id.clone(),
+                    &message.body,
+                );
+                if registry_ref.implicit_intent_seen.contains(&key) {
+                    tracing::info!(
+                        message_id = %message.id,
+                        session_id = %message.session_id,
+                        "implicit work intent dedupe: duplicate ADR-003 key, skip journal append"
+                    );
+                } else {
+                    let record = ImplicitIntentDedupeRecord::from_key(&key, ts);
+                    if let Err(error) = append_implicit_intent_dedupe_record(
+                        hc_bootstrap::workspace_root(),
+                        &workspace_namespace(&registry_ref.namespace),
+                        task_scope_id.as_str(),
+                        &record,
+                    ) {
+                        tracing::warn!(?error, "append implicit intent dedupe record");
+                    } else {
+                        registry_ref.implicit_intent_seen.insert(key);
+                    }
+                }
+            }
+
+            let line =
+                build_routing_binding_log_line_v1(ts, &message, task_scope_id.as_str(), swarm);
+            if let Err(error) = append_routing_binding_log_line(
+                hc_bootstrap::workspace_root(),
+                &workspace_namespace(&registry_ref.namespace),
+                task_scope_id.as_str(),
+                &line,
+            ) {
+                tracing::warn!(?error, "append routing binding coordination log");
+            }
+        }
+        if nomination
+            .swarm
+            .as_ref()
+            .is_some_and(|s| matches!(s.routing.routing_tier, RoutingTier::L2 | RoutingTier::L3))
+            && nomination.grant.is_none()
+        {
+            let label = nomination
+                .swarm
+                .as_ref()
+                .expect("tier branch implies swarm exists")
+                .routing
+                .routing_tier
+                .to_string();
+            let note = if matches!(registry_ref.workspace_phase, WorkspacePhase::Planning) {
+                format!(
+                    "[routing {label}] task-scoped path: routing this channel post to planner drafting"
+                )
+            } else if matches!(
+                registry_ref.workspace_phase,
+                WorkspacePhase::Assignment | WorkspacePhase::Execution
+            ) && registry_ref
+                .task_plan
+                .work_items
+                .iter()
+                .any(|item| item.lifecycle == WorkItemLifecycleState::Planned)
+            {
+                format!(
+                    "[routing {label}] task-scoped path: running assignment for planned work items"
+                )
+            } else if matches!(
+                registry_ref.workspace_phase,
+                WorkspacePhase::Assignment | WorkspacePhase::Execution
+            ) {
+                format!(
+                    "[routing {label}] task-scoped path: no planned work items to assign — add work items in the plan or return to planning"
+                )
+            } else {
+                format!(
+                    "[routing {label}] skipped message-level nomination — use planner / work items"
+                )
+            };
+            for window in &mut registry_ref.windows {
+                window.transcript_lines.push(note.clone());
+            }
+            match registry_ref.workspace_phase {
+                WorkspacePhase::Planning => {
+                    steer_planner_nl_followup = Some(message.body.clone());
+                }
+                WorkspacePhase::Assignment | WorkspacePhase::Execution => {
+                    let has_planned = registry_ref
+                        .task_plan
+                        .work_items
+                        .iter()
+                        .any(|item| item.lifecycle == WorkItemLifecycleState::Planned);
+                    if has_planned {
+                        assignment_routed_followup = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(grant) = nomination.grant {
             let speaker_name = registry_ref
                 .windows
                 .iter()
@@ -2014,6 +2291,23 @@ fn send_channel_message(
     }
 
     sync_windows(registry);
+    if let Some(planner_line) = steer_planner_nl_followup {
+        if let Err(error) = run_planner_natural_language_input(registry, &planner_line, false) {
+            tracing::warn!(
+                ?error,
+                "L2/L3 channel chat: planner drafting failed after routing"
+            );
+        }
+    }
+    if assignment_routed_followup {
+        if let Err(error) = maybe_auto_assign_on_task_routed_chat(registry) {
+            tracing::warn!(
+                ?error,
+                "L2/L3 channel chat: auto-assign / execute after task routing failed"
+            );
+        }
+        sync_windows(registry);
+    }
     Ok(())
 }
 
@@ -2522,13 +2816,87 @@ fn refresh_persisted_task_artifacts(registry: &mut UiRegistry) -> Result<()> {
         registry.namespace.tenant_id.clone(),
         registry.namespace.user_id.clone(),
     );
-    persist_task_artifacts(hc_bootstrap::workspace_root(), &task, &registry.task_plan)?;
+    persist_task_artifacts_with_in_memory_prune(hc_bootstrap::workspace_root(), &task, &mut registry.task_plan)?;
     registry.task_artifacts = query_task_artifacts(
         hc_bootstrap::workspace_root(),
         &namespace,
         &hc_agent::TaskArtifactQuery::default().for_task(registry.task_id.clone()),
     )?;
     Ok(())
+}
+
+fn ui_store_namespace(registry: &UiRegistry) -> hc_store::store::WorkspaceNamespace {
+    hc_store::store::WorkspaceNamespace::new(
+        registry.namespace.tenant_id.clone(),
+        registry.namespace.user_id.clone(),
+    )
+}
+
+fn append_work_item_claim_journal_for_id(registry: &UiRegistry, claim_id: &str) -> Result<()> {
+    let claim = registry
+        .task_plan
+        .work_item_claims
+        .iter()
+        .find(|row| row.id == claim_id)
+        .ok_or_else(|| anyhow::anyhow!("missing work item claim row: {claim_id}"))?;
+    append_work_item_claim_journal_line(
+        hc_bootstrap::workspace_root(),
+        &ui_store_namespace(registry),
+        &registry.task_id,
+        claim,
+    )
+    .map(|_| ())
+}
+
+fn append_work_item_claims_journal_for_work_item(
+    registry: &UiRegistry,
+    work_item_id: &str,
+) -> Result<()> {
+    let root = hc_bootstrap::workspace_root();
+    let namespace = ui_store_namespace(registry);
+    for claim in registry
+        .task_plan
+        .work_item_claims
+        .iter()
+        .filter(|row| row.work_item_id == work_item_id)
+    {
+        append_work_item_claim_journal_line(&root, &namespace, &registry.task_id, claim)?;
+    }
+    Ok(())
+}
+
+fn append_work_item_assignment_journal_for_id(registry: &UiRegistry, assignment_id: &str) -> Result<()> {
+    let assignment = registry
+        .task_plan
+        .work_item_assignments
+        .iter()
+        .find(|row| row.id == assignment_id)
+        .ok_or_else(|| anyhow::anyhow!("missing work item assignment row: {assignment_id}"))?;
+    append_work_item_assignment_journal_line(
+        hc_bootstrap::workspace_root(),
+        &ui_store_namespace(registry),
+        &registry.task_id,
+        assignment,
+    )
+    .map(|_| ())
+}
+
+fn append_journal_for_executing_assignment(registry: &UiRegistry, work_item_id: &str) -> Result<()> {
+    let assignment = registry
+        .task_plan
+        .work_item_assignments
+        .iter()
+        .find(|row| row.work_item_id == work_item_id && row.status == "executing");
+    let Some(assignment) = assignment else {
+        return Ok(());
+    };
+    append_work_item_assignment_journal_line(
+        hc_bootstrap::workspace_root(),
+        &ui_store_namespace(registry),
+        &registry.task_id,
+        assignment,
+    )
+    .map(|_| ())
 }
 
 fn render_window_transcript(
@@ -3151,6 +3519,8 @@ fn add_work_item_claim(
         ));
     }
 
+    append_work_item_claim_journal_for_id(&registry_ref, &claim_id)?;
+
     refresh_persisted_task_artifacts(&mut registry_ref)?;
     drop(registry_ref);
     sync_windows(registry);
@@ -3185,6 +3555,9 @@ fn resolve_work_item_assignment(
             assignment.id, assignment.work_item_id, assignment.agent_name, assignment.rationale
         ));
     }
+
+    append_work_item_claims_journal_for_work_item(&registry_ref, work_item_id)?;
+    append_work_item_assignment_journal_for_id(&registry_ref, &assignment_id)?;
 
     refresh_persisted_task_artifacts(&mut registry_ref)?;
     drop(registry_ref);
@@ -3518,12 +3891,17 @@ fn apply_planner_draft(
     Ok(())
 }
 
+fn maybe_auto_assign_on_task_routed_chat(registry: &Rc<RefCell<UiRegistry>>) -> Result<()> {
+    let mut registry_ref = registry.borrow_mut();
+    auto_assign_and_execute(&mut registry_ref)
+}
+
 fn auto_assign_and_execute(registry_ref: &mut UiRegistry) -> Result<()> {
     let work_item_ids = registry_ref
         .task_plan
         .work_items
         .iter()
-        .filter(|item| item.status == "planned")
+        .filter(|item| item.lifecycle == WorkItemLifecycleState::Planned)
         .map(|item| item.id.clone())
         .collect::<Vec<_>>();
 
@@ -3569,10 +3947,13 @@ fn auto_assign_and_execute(registry_ref: &mut UiRegistry) -> Result<()> {
             score,
             reason.clone(),
         );
+        append_work_item_claim_journal_for_id(&registry_ref, &claim_id)?;
         let assignment_id = registry_ref
             .task_plan
             .resolve_work_item_assignment(&work_item.id)
             .ok_or_else(|| anyhow::anyhow!("auto assignment failed for {}", work_item.id))?;
+        append_work_item_claims_journal_for_work_item(&registry_ref, &work_item.id)?;
+        append_work_item_assignment_journal_for_id(&registry_ref, &assignment_id)?;
         let assignment = registry_ref
             .task_plan
             .work_item_assignments
@@ -3597,7 +3978,7 @@ fn auto_assign_and_execute(registry_ref: &mut UiRegistry) -> Result<()> {
         .task_plan
         .work_items
         .iter()
-        .filter(|item| item.status == "assigned")
+        .filter(|item| item.lifecycle == WorkItemLifecycleState::Assigned)
         .map(|item| item.id.clone())
         .collect::<Vec<_>>();
 
@@ -3627,6 +4008,7 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
         .task_plan
         .start_work_item_execution(work_item_id)
         .ok_or_else(|| anyhow::anyhow!("work item is not ready for execution: {work_item_id}"))?;
+    append_journal_for_executing_assignment(&*registry_ref, work_item_id)?;
     let work_item = registry_ref
         .task_plan
         .work_items
@@ -3718,23 +4100,29 @@ fn auto_execute_work_item(registry_ref: &mut UiRegistry, work_item_id: &str) -> 
                             reply.id, source_name, reply.body
                         ));
                     }
-                    registry_ref.windows[source_index].transcript_lines.push(format!(
-                        "[recv {}] {} -> you: {}",
-                        reply.id, target_name, reply.body
-                    ));
+                    registry_ref.windows[source_index]
+                        .transcript_lines
+                        .push(format!(
+                            "[recv {}] {} -> you: {}",
+                            reply.id, target_name, reply.body
+                        ));
                 }
                 Err(error) => {
-                    registry_ref.windows[source_index].transcript_lines.push(format!(
-                        "[llm error] {target_name} could not execute: {error}"
-                    ));
+                    registry_ref.windows[source_index]
+                        .transcript_lines
+                        .push(format!(
+                            "[llm error] {target_name} could not execute: {error}"
+                        ));
                 }
             }
         }
     } else {
-        registry_ref.windows[source_index].transcript_lines.push(format!(
-            "[responder] {} has no responder bound",
-            target_name
-        ));
+        registry_ref.windows[source_index]
+            .transcript_lines
+            .push(format!(
+                "[responder] {} has no responder bound",
+                target_name
+            ));
     }
 
     refresh_persisted_task_artifacts(registry_ref)?;
@@ -3840,6 +4228,7 @@ fn execute_work_item(
             .task_plan
             .start_work_item_execution(work_item_id)
             .ok_or_else(|| anyhow::anyhow!("work item is not in assigned state: {work_item_id}"))?;
+        append_journal_for_executing_assignment(&*registry_ref, work_item_id)?;
         registry_ref.workspace_phase = WorkspacePhase::Execution;
 
         let work_item = registry_ref
@@ -3936,23 +4325,29 @@ fn execute_work_item(
                                 reply.id, source_name, reply.body
                             ));
                         }
-                        registry_ref.windows[source_index].transcript_lines.push(format!(
-                            "[recv {}] {} -> you: {}",
-                            reply.id, target_name, reply.body
-                        ));
+                        registry_ref.windows[source_index]
+                            .transcript_lines
+                            .push(format!(
+                                "[recv {}] {} -> you: {}",
+                                reply.id, target_name, reply.body
+                            ));
                     }
                     Err(error) => {
-                        registry_ref.windows[source_index].transcript_lines.push(format!(
-                            "[llm error] {target_name} could not execute: {error}"
-                        ));
+                        registry_ref.windows[source_index]
+                            .transcript_lines
+                            .push(format!(
+                                "[llm error] {target_name} could not execute: {error}"
+                            ));
                     }
                 }
             }
         } else {
-            registry_ref.windows[source_index].transcript_lines.push(format!(
-                "[responder] {} has no responder bound",
-                target_name
-            ));
+            registry_ref.windows[source_index]
+                .transcript_lines
+                .push(format!(
+                    "[responder] {} has no responder bound",
+                    target_name
+                ));
         }
 
         refresh_persisted_task_artifacts(&mut registry_ref)?;

@@ -4,24 +4,22 @@
 //! merged with [`ToolRoutingTags`] in [`crate::tool_turn`].
 
 use std::thread;
-use std::time::Duration;
-use std::collections::HashSet;
 
 use anyhow::Result;
 use hc_agent::phrase_match_score;
 use hc_context::runtime::{DEFAULT_TENANT_ID, DEFAULT_USER_ID, default_session_id};
-use hc_conversation::{ConversationRepository, PendingFollowUp};
 use hc_intent::{IntentResolution, ids as intent_ids};
 use hc_protocol::{ApiChatMessage, ApiMessageRole, ApiNamespace, ChatRequest, ChatResponse};
-use hc_scheduler::{
-    ScheduleKind, ScheduleRepository, ScheduleSpec, ScheduledTarget, ScheduledTargetKind,
-    ScheduledTask, now_unix,
-};
+use hc_scheduler::now_unix;
 use hc_store::store::WorkspaceNamespace;
 use serde::Deserialize;
 
 use crate::{
     ServiceConfig,
+    scheduler::{
+        FiredFollowUpMessage, FollowUpMessageSink, ScheduledFollowUpRunSpec,
+        ScheduledFollowUpTaskSpec, dispatch_followups_until_fired, persist_scheduled_followup_task,
+    },
     tool_turn::{ToolRoutingTags, load_tool_routing_tags, request_input, request_namespace},
 };
 
@@ -40,6 +38,18 @@ struct TimedTaskSpec {
     trigger: String,
     room_id: Option<String>,
     runs: Vec<TimedRunSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TimedTurnPlan {
+    Reminder {
+        rule: ReminderRule,
+        delay_seconds: u64,
+    },
+    Sequence {
+        rule: TimedSequenceRule,
+        values: Vec<i64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,53 +184,66 @@ pub fn try_timed_stream_plan(
     intent: &IntentResolution,
     history_for_match: &[ApiChatMessage],
 ) -> Result<Option<TimedStreamPlan>> {
-    let input = request_input(request)?;
+    let Some(plan) = resolve_timed_turn_plan(config, request, intent, history_for_match)? else {
+        return Ok(None);
+    };
+    timed_stream_plan_from_plan(config, request, plan)
+}
+
+pub fn timed_stream_plan_from_plan(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    plan: TimedTurnPlan,
+) -> Result<Option<TimedStreamPlan>> {
     let namespace = request_namespace(request);
-    let mut routing =
-        load_tool_routing_tags(config, &namespace).unwrap_or_else(|_| ToolRoutingTags::default());
-    routing.ensure_builtin_timed_sequences();
+    match plan {
+        TimedTurnPlan::Reminder {
+            rule,
+            delay_seconds,
+        } => {
+            let text = execute_reminder_turn(
+                config,
+                request,
+                &namespace,
+                rule,
+                delay_seconds,
+                TimedDeliverMode::Headless,
+            )?;
+            let final_response = chat_response_simple(request, &namespace, text.clone());
+            Ok(Some(TimedStreamPlan {
+                chunks: vec![text],
+                pause_between_chunks_ms: 0,
+                final_response,
+            }))
+        }
+        TimedTurnPlan::Sequence { rule, values } => {
+            let Some(final_response) = execute_timed_sequence(
+                config,
+                request,
+                &namespace,
+                rule.clone(),
+                values.clone(),
+                TimedDeliverMode::Headless,
+            )?
+            else {
+                return Ok(None);
+            };
 
-    if let Some(text) = handle_reminder_turn(config, request, &routing, TimedDeliverMode::Headless)?
-    {
-        let final_response = chat_response_simple(request, &namespace, text.clone());
-        return Ok(Some(TimedStreamPlan {
-            chunks: vec![text],
-            pause_between_chunks_ms: 0,
-            final_response,
-        }));
+            let mut chunks: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            let ack = rule
+                .scheduled_reply
+                .clone()
+                .unwrap_or_else(|| "scheduled timed sequence".to_owned());
+            chunks.push(ack);
+
+            let pause_between_chunks_ms = rule.interval_seconds.saturating_mul(1000);
+            Ok(Some(TimedStreamPlan {
+                chunks,
+                pause_between_chunks_ms,
+                final_response,
+            }))
+        }
     }
-
-    if let Some((rule, values)) =
-        timed_sequence_match_for_turn(&routing, &input, history_for_match, intent)
-    {
-        let Some(final_response) = execute_timed_sequence(
-            config,
-            request,
-            &namespace,
-            rule.clone(),
-            values.clone(),
-            TimedDeliverMode::Headless,
-        )?
-        else {
-            return Ok(None);
-        };
-
-        let mut chunks: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-        let ack = rule
-            .scheduled_reply
-            .clone()
-            .unwrap_or_else(|| "scheduled timed sequence".to_owned());
-        chunks.push(ack);
-
-        let pause_between_chunks_ms = rule.interval_seconds.saturating_mul(1000);
-        return Ok(Some(TimedStreamPlan {
-            chunks,
-            pause_between_chunks_ms,
-            final_response,
-        }));
-    }
-
-    Ok(None)
 }
 
 /// Intent-aware timed sequence / reminder handling. Call after pending confirmation, before MCP.
@@ -231,23 +254,60 @@ pub fn try_handle_timed_chat_turn(
     deliver: TimedDeliverMode,
     history_for_match: &[ApiChatMessage],
 ) -> Result<Option<ChatResponse>> {
+    let Some(plan) = resolve_timed_turn_plan(config, request, intent, history_for_match)? else {
+        return Ok(None);
+    };
+    execute_timed_turn_plan(config, request, deliver, plan)
+}
+
+pub fn resolve_timed_turn_plan(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    intent: &IntentResolution,
+    history_for_match: &[ApiChatMessage],
+) -> Result<Option<TimedTurnPlan>> {
     let input = request_input(request)?;
     let namespace = request_namespace(request);
     let mut routing =
         load_tool_routing_tags(config, &namespace).unwrap_or_else(|_| ToolRoutingTags::default());
     routing.ensure_builtin_timed_sequences();
 
-    if let Some(text) = handle_reminder_turn(config, request, &routing, deliver)? {
-        return Ok(Some(chat_response_simple(request, &namespace, text)));
+    if let Some((rule, delay_seconds)) = reminder_for_turn(&input, &routing) {
+        return Ok(Some(TimedTurnPlan::Reminder {
+            rule,
+            delay_seconds,
+        }));
     }
 
     if let Some((rule, values)) =
         timed_sequence_match_for_turn(&routing, &input, history_for_match, intent)
     {
-        return execute_timed_sequence(config, request, &namespace, rule, values, deliver);
+        return Ok(Some(TimedTurnPlan::Sequence { rule, values }));
     }
 
     Ok(None)
+}
+
+pub fn execute_timed_turn_plan(
+    config: &ServiceConfig,
+    request: &ChatRequest,
+    deliver: TimedDeliverMode,
+    plan: TimedTurnPlan,
+) -> Result<Option<ChatResponse>> {
+    let namespace = request_namespace(request);
+    match plan {
+        TimedTurnPlan::Reminder {
+            rule,
+            delay_seconds,
+        } => Ok(Some(chat_response_simple(
+            request,
+            &namespace,
+            execute_reminder_turn(config, request, &namespace, rule, delay_seconds, deliver)?,
+        ))),
+        TimedTurnPlan::Sequence { rule, values } => {
+            execute_timed_sequence(config, request, &namespace, rule, values, deliver)
+        }
+    }
 }
 
 fn chat_response_simple(
@@ -274,6 +334,7 @@ fn chat_response_simple(
         room_id: request.room_id.clone(),
         selected_agent_id: request.agent_id.clone(),
         selected_domain_id: request.domain_id.clone(),
+        selected_provider: None,
         recalled_memories: Vec::new(),
         synthesized_prompt_asset_count: 0,
         room_capabilities_used: Vec::new(),
@@ -282,26 +343,23 @@ fn chat_response_simple(
         behavior_pattern_used: None,
         decision_reasoning: None,
         decision_confidence: None,
+        active_task_id: None,
     }
 }
 
-fn handle_reminder_turn(
+fn execute_reminder_turn(
     config: &ServiceConfig,
     request: &ChatRequest,
-    routing: &ToolRoutingTags,
+    namespace_api: &ApiNamespace,
+    rule: ReminderRule,
+    delay_seconds: u64,
     deliver: TimedDeliverMode,
-) -> Result<Option<String>> {
+) -> Result<String> {
     let input = request_input(request)?;
-    let Some((rule, delay_seconds)) = reminder_for_turn(&input, routing) else {
-        return Ok(None);
-    };
-    let namespace_api = request_namespace(request);
     let namespace = WorkspaceNamespace::new(
         namespace_api.tenant_id.clone(),
         namespace_api.user_id.clone(),
     );
-    let repository =
-        ConversationRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
     let now = now_unix();
     let reminder_prefix = if rule.id.trim().is_empty() {
         "reminder"
@@ -338,17 +396,16 @@ fn handle_reminder_turn(
             payload,
         }],
     };
-    let followup_ids = persist_timed_task_runs(config, &namespace, &repository, spec)?;
+    let followup_ids = persist_timed_task_runs(config, &namespace, spec)?;
 
     if matches!(deliver, TimedDeliverMode::Interactive) {
         spawn_interactive_followup_delivery_worker(config, &namespace_api, followup_ids);
     }
 
-    Ok(Some(
-        rule.scheduled_reply
-            .clone()
-            .unwrap_or_else(|| "好，到时间我会提醒您。".to_owned()),
-    ))
+    Ok(rule
+        .scheduled_reply
+        .clone()
+        .unwrap_or_else(|| "好，到时间我会提醒您。".to_owned()))
 }
 
 fn spawn_interactive_followup_delivery_worker(
@@ -371,89 +428,41 @@ fn deliver_followups_interactive(
     followup_ids: &[String],
 ) -> Result<()> {
     struct StdoutFollowUpSink;
-    impl crate::scheduler::FollowUpMessageSink for StdoutFollowUpSink {
-        fn on_fired_followup_message(
-            &mut self,
-            message: &crate::scheduler::FiredFollowUpMessage,
-        ) {
+    impl FollowUpMessageSink for StdoutFollowUpSink {
+        fn on_fired_followup_message(&mut self, message: &FiredFollowUpMessage) {
             println!("assistant> {}", message.message);
         }
     }
 
-    let mut pending: HashSet<String> = followup_ids.iter().cloned().collect();
     let mut sink = StdoutFollowUpSink;
-    while !pending.is_empty() {
-        let report = crate::scheduler::dispatch_due_scheduled_runs(
-            config,
-            namespace.clone(),
-            Some(now_unix()),
-        )?;
-        let delivered_ids = crate::scheduler::dispatch_fired_followup_messages_from_receipts(
-            config,
-            namespace.clone(),
-            &report.receipts,
-            &mut sink,
-        )?;
-        for id in delivered_ids {
-            pending.remove(&id);
-        }
-        if !pending.is_empty() {
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
-    Ok(())
+    dispatch_followups_until_fired(config, namespace, followup_ids, &mut sink)
 }
 
 fn persist_timed_task_runs(
     config: &ServiceConfig,
     namespace: &WorkspaceNamespace,
-    repository: &ConversationRepository,
     spec: TimedTaskSpec,
 ) -> Result<Vec<String>> {
-    let schedule_repository =
-        ScheduleRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
-    let mut followup_ids = Vec::new();
-    for run in spec.runs {
-        let mut followup = PendingFollowUp::new(
-            spec.agent_id.clone(),
-            spec.trigger.clone(),
-            run.due_at_unix,
-        );
-        followup.id = run.id;
-        followup.room_id = spec.room_id.clone();
-        followup.payload = run.payload;
-        followup.payload.insert(
-            "draft_message".to_owned(),
-            serde_json::Value::String(run.draft_message),
-        );
-        followup.notes = run.notes;
-        repository.write_followup(&followup)?;
-        let mut target_args = serde_json::Map::new();
-        target_args.insert(
-            "followup_id".to_owned(),
-            serde_json::Value::String(followup.id.clone()),
-        );
-        let mut schedule = ScheduledTask::new(
-            format!("timed.followup.{}", followup.id),
-            format!("Timed followup {}", followup.id),
-            ScheduleSpec {
-                kind: ScheduleKind::Once,
-                run_at_unix: Some(followup.due_at_unix),
-                interval_seconds: None,
-            },
-            ScheduledTarget {
-                kind: ScheduledTargetKind::Event,
-                r#ref: "timed.followup".to_owned(),
-                action: Some("timed.followup.fire".to_owned()),
-                args: target_args,
-            },
-        );
-        schedule.tags = vec!["scheduled".to_owned(), "timed".to_owned(), "followup".to_owned()];
-        schedule.notes = "Mirrored from timed_turn followup queue.".to_owned();
-        schedule_repository.write_schedule(&schedule)?;
-        followup_ids.push(followup.id);
-    }
-    Ok(followup_ids)
+    persist_scheduled_followup_task(
+        config,
+        namespace,
+        ScheduledFollowUpTaskSpec {
+            agent_id: spec.agent_id,
+            trigger: spec.trigger,
+            room_id: spec.room_id,
+            runs: spec
+                .runs
+                .into_iter()
+                .map(|run| ScheduledFollowUpRunSpec {
+                    id: run.id,
+                    due_at_unix: run.due_at_unix,
+                    draft_message: run.draft_message,
+                    notes: run.notes,
+                    payload: run.payload,
+                })
+                .collect(),
+        },
+    )
 }
 
 fn reminder_for_turn(user_turn: &str, routing: &ToolRoutingTags) -> Option<(ReminderRule, u64)> {
@@ -500,7 +509,6 @@ fn execute_timed_sequence(
     deliver: TimedDeliverMode,
 ) -> Result<Option<ChatResponse>> {
     let ws = WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
-    let repository = ConversationRepository::with_namespace(config.workspace_root.clone(), ws.clone());
     let now = now_unix();
     let sequence_prefix = if rule.id.trim().is_empty() {
         "timed-sequence"
@@ -536,7 +544,6 @@ fn execute_timed_sequence(
     let followup_ids = persist_timed_task_runs(
         config,
         &ws,
-        &repository,
         TimedTaskSpec {
             agent_id,
             trigger,

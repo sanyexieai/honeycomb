@@ -5,11 +5,15 @@ pub mod chat;
 pub mod conversation;
 pub mod human_inbox;
 pub mod index;
+pub mod room_routing;
+pub(crate) mod session_swarm_state;
 pub mod scheduler;
 pub mod timed_turn;
 pub mod tool;
+pub mod tool_execution;
 pub mod tool_turn;
 pub mod turn;
+pub mod turn_router;
 
 use std::path::PathBuf;
 

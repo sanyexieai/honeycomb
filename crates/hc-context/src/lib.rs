@@ -1219,6 +1219,8 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             query,
         )?;
         trace_stats.room_candidate_count = room_candidates.len();
+        let task_room_allowlist =
+            task_scoped_room_allowlist_for_retrieval(query, &room_candidates);
         let room_candidate_boosts = room_candidates
             .iter()
             .map(|candidate| (candidate.room_id.clone(), candidate.score_milli))
@@ -1252,6 +1254,13 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
                 }
                 Err(error) => return Err(error),
             };
+            if let Some(allow) = task_room_allowlist.as_ref() {
+                if record.scope == MemoryScope::Task && record.owner.kind == MemoryOwnerKind::Task {
+                    if !allow.contains(&record.owner.id) {
+                        continue;
+                    }
+                }
+            }
             trace_stats.record_reads += 1;
             catalog.insert(record);
         }
@@ -1287,6 +1296,15 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             if !room_asset_entry_may_match_query(query, &entry) {
                 trace_stats.room_entry_prefiltered += 1;
                 continue;
+            }
+            if let Some(allow) = task_room_allowlist.as_ref() {
+                match entry.room_id.as_deref() {
+                    Some(room_id) if allow.contains(room_id) => {}
+                    _ => {
+                        trace_stats.room_entry_prefiltered += 1;
+                        continue;
+                    }
+                }
             }
             let asset = match room_repository.read_asset(&entry.relative_path) {
                 Ok(asset) => asset,
@@ -1688,6 +1706,45 @@ fn room_kind_budget(kind: &str) -> usize {
         "global" => 1,
         _ => 2,
     }
+}
+
+/// When retrieving with [`MemoryScope::Task`] and non-empty [`ContextMemoryQuery::room_anchor_ids`],
+/// restrict task-bound flat records and indexed room assets to the anchor room ids plus rooms
+/// discovered with `anchor-room` / `anchor-related` reasons (avoids parallel task rooms mixing on
+/// incidental text matches; aligns with swarm chat default when a task room anchor is known).
+#[must_use]
+fn task_scoped_room_allowlist_for_retrieval(
+    query: &ContextMemoryQuery,
+    room_candidates: &[RoomCandidate],
+) -> Option<BTreeSet<String>> {
+    if !matches!(query.memory_query.scope, Some(MemoryScope::Task)) {
+        return None;
+    }
+    if query.room_anchor_ids.is_empty() {
+        return None;
+    }
+
+    let mut allow = BTreeSet::new();
+    for anchor in &query.room_anchor_ids {
+        let trimmed = anchor.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        allow.insert(trimmed.to_owned());
+    }
+
+    for candidate in room_candidates {
+        if !candidate
+            .reasons
+            .iter()
+            .any(|reason| reason == "anchor-room" || reason == "anchor-related")
+        {
+            continue;
+        }
+        allow.insert(candidate.room_id.clone());
+    }
+
+    Some(allow)
 }
 
 pub fn discover_room_candidates(

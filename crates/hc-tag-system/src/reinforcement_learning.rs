@@ -875,10 +875,9 @@ impl ReinforcementLearningManager {
             .len()
             .max(if cjk_units > 0 { 1 } else { 0 });
 
-        let complexity_score = (inferred_words as f32 * 0.3
-            + char_count as f32 * 0.01
-            + unique_words as f32 * 0.5)
-            / 10.0;
+        let complexity_score =
+            (inferred_words as f32 * 0.3 + char_count as f32 * 0.01 + unique_words as f32 * 0.5)
+                / 10.0;
 
         let mut score = complexity_score.clamp(0.0, 9.0) as u8;
         if score == 0 {
