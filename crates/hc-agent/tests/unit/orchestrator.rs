@@ -1,5 +1,5 @@
 use super::*;
-use crate::{TaskRequest, TaskBootstrapPreset, bootstrap_task_with_preset, materialize_plan};
+use crate::{TaskBootstrapPreset, TaskRequest, bootstrap_task_with_preset, materialize_plan};
 use hc_protocol::swarm::RoutingTier;
 use hc_responder::ReplyResponse;
 

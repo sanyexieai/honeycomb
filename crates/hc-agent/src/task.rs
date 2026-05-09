@@ -53,6 +53,9 @@ pub struct TaskRequest {
     pub budget: TaskBudget,
     pub project_ref: Option<String>,
     pub context_refs: Vec<String>,
+    /// Task-level opt-in for ADR-006 experience-lane features (e.g. learning); must still pass tenant/env gates.
+    #[serde(default)]
+    pub enable_learning: bool,
 }
 
 impl TaskRequest {
@@ -65,6 +68,7 @@ impl TaskRequest {
             budget: TaskBudget::default(),
             project_ref: None,
             context_refs: Vec::new(),
+            enable_learning: false,
         }
     }
 
@@ -75,6 +79,11 @@ impl TaskRequest {
 
     pub fn with_namespace(mut self, namespace: TaskNamespace) -> Self {
         self.namespace = namespace;
+        self
+    }
+
+    pub fn with_enable_learning(mut self, enable: bool) -> Self {
+        self.enable_learning = enable;
         self
     }
 

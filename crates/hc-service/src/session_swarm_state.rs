@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use hc_bootstrap::wall_clock_ms;
-use hc_context::runtime::{default_session_id, DEFAULT_TENANT_ID, DEFAULT_USER_ID};
+use hc_context::runtime::{DEFAULT_TENANT_ID, DEFAULT_USER_ID, default_session_id};
 use hc_protocol::ChatRequest;
 use hc_store::{
     store::{WorkspaceNamespace, WorkspaceStore},
@@ -82,7 +82,9 @@ pub(crate) fn persisted_conversation_active_task_hint(
         return None;
     }
     let key = swarm_session_key(request);
-    load_session_swarm_active_task_id(workspace_root, namespace, &key).ok().flatten()
+    load_session_swarm_active_task_id(workspace_root, namespace, &key)
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn persist_session_swarm_active_task_binding(
@@ -124,6 +126,7 @@ mod tests {
             domain_id: None,
             active_agent_id: None,
             active_task_id: None,
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace: ApiNamespace {
                     tenant_id: DEFAULT_TENANT_ID.to_owned(),
@@ -147,17 +150,10 @@ mod tests {
 
     #[test]
     fn roundtrip_persist_then_load() {
-        let dir =
-            std::env::temp_dir().join(format!("hc-session-swarm-state-{}", wall_clock_ms()));
+        let dir = std::env::temp_dir().join(format!("hc-session-swarm-state-{}", wall_clock_ms()));
         let ns = WorkspaceNamespace::local_default();
         let session = "sess-test-1";
-        persist_session_swarm_active_task_binding(
-            &dir,
-            &ns,
-            session,
-            Some("task-alpha"),
-        )
-        .unwrap();
+        persist_session_swarm_active_task_binding(&dir, &ns, session, Some("task-alpha")).unwrap();
         let loaded = load_session_swarm_active_task_id(&dir, &ns, session).unwrap();
         assert_eq!(loaded.as_deref(), Some("task-alpha"));
         persist_session_swarm_active_task_binding(&dir, &ns, session, None).unwrap();

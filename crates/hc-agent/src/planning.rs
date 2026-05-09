@@ -1,6 +1,6 @@
 use hc_protocol::swarm::{
-    WorkItemLifecycleState, claim_capability_eligible_for_p0_assign_v1,
-    select_assign_winner_claim_index_v1,
+    WorkItemLifecycleCommandV1, WorkItemLifecycleState, apply_work_item_lifecycle_command_v1,
+    claim_capability_eligible_for_p0_assign_v1, select_assign_winner_claim_index_v1,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,8 +147,19 @@ impl TaskPlan {
             .filter(|item| item.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID)
             .count();
         if non_placeholder_work_items > 0 {
-            self.work_items.retain(|item| item.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID);
+            self.work_items
+                .retain(|item| item.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID);
         }
+    }
+
+    /// Next `work-item.{:04}` index excludes [`HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID`] rows so planner
+    /// items stay **`0001`…** even when HTTP chat seeded the implicit holder first.
+    fn next_numeric_work_item_index(&self) -> usize {
+        self.work_items
+            .iter()
+            .filter(|item| item.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID)
+            .count()
+            .saturating_add(1)
     }
 
     pub fn add_note(&mut self, note: impl Into<String>) {
@@ -174,7 +185,7 @@ impl TaskPlan {
         estimated_time_minutes: u32,
     ) -> String {
         self.status = TaskPlanStatus::Drafted;
-        let id = format!("work-item.{:04}", self.work_items.len() + 1);
+        let id = format!("work-item.{:04}", self.next_numeric_work_item_index());
         self.work_items.push(WorkItem {
             id: id.clone(),
             title: title.into(),
@@ -357,6 +368,35 @@ impl TaskPlan {
         })?;
         assignment.status = "executing".to_owned();
         Some(assignment.agent_instance_id.clone())
+    }
+
+    /// ADR P0: transition **`assigned` → `done`** (`MarkDone`). Closes matching **`assigned`/`executing`**
+    /// assignment row as **`completed`** when present so workload/snapshots stay coherent.
+    pub fn mark_assigned_work_item_done(&mut self, work_item_id: &str) -> bool {
+        let Some(work_item) = self
+            .work_items
+            .iter_mut()
+            .find(|item| item.id == work_item_id)
+        else {
+            return false;
+        };
+        let Ok(next) = apply_work_item_lifecycle_command_v1(
+            work_item.lifecycle,
+            WorkItemLifecycleCommandV1::MarkDone,
+        ) else {
+            return false;
+        };
+        work_item.lifecycle = next;
+        for assignment in &mut self.work_item_assignments {
+            if assignment.work_item_id != work_item_id {
+                continue;
+            }
+            if matches!(assignment.status.as_str(), "assigned" | "executing") {
+                assignment.status = "completed".to_owned();
+                break;
+            }
+        }
+        true
     }
 }
 

@@ -1874,6 +1874,7 @@ dependencies = [
  "hc-context",
  "hc-conversation",
  "hc-core",
+ "hc-llm",
  "hc-memory",
  "hc-persona",
  "hc-protocol",
@@ -1901,6 +1902,7 @@ dependencies = [
  "hc-scheduler",
  "hc-service",
  "hc-store",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
@@ -2076,6 +2078,7 @@ name = "hc-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "unicode-normalization",
 ]

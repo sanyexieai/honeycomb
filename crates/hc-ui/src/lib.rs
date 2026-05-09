@@ -2816,7 +2816,11 @@ fn refresh_persisted_task_artifacts(registry: &mut UiRegistry) -> Result<()> {
         registry.namespace.tenant_id.clone(),
         registry.namespace.user_id.clone(),
     );
-    persist_task_artifacts_with_in_memory_prune(hc_bootstrap::workspace_root(), &task, &mut registry.task_plan)?;
+    persist_task_artifacts_with_in_memory_prune(
+        hc_bootstrap::workspace_root(),
+        &task,
+        &mut registry.task_plan,
+    )?;
     registry.task_artifacts = query_task_artifacts(
         hc_bootstrap::workspace_root(),
         &namespace,
@@ -2865,7 +2869,10 @@ fn append_work_item_claims_journal_for_work_item(
     Ok(())
 }
 
-fn append_work_item_assignment_journal_for_id(registry: &UiRegistry, assignment_id: &str) -> Result<()> {
+fn append_work_item_assignment_journal_for_id(
+    registry: &UiRegistry,
+    assignment_id: &str,
+) -> Result<()> {
     let assignment = registry
         .task_plan
         .work_item_assignments
@@ -2881,7 +2888,10 @@ fn append_work_item_assignment_journal_for_id(registry: &UiRegistry, assignment_
     .map(|_| ())
 }
 
-fn append_journal_for_executing_assignment(registry: &UiRegistry, work_item_id: &str) -> Result<()> {
+fn append_journal_for_executing_assignment(
+    registry: &UiRegistry,
+    work_item_id: &str,
+) -> Result<()> {
     let assignment = registry
         .task_plan
         .work_item_assignments

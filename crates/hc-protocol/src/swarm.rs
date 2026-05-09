@@ -241,7 +241,9 @@ impl std::fmt::Display for WorkItemLifecycleTransitionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyTerminal => f.write_str("work item already in terminal state"),
-            Self::InvalidCommandForState => f.write_str("command is invalid for current lifecycle state"),
+            Self::InvalidCommandForState => {
+                f.write_str("command is invalid for current lifecycle state")
+            }
         }
     }
 }
@@ -497,6 +499,136 @@ impl ImplicitIntentDedupeRecord {
     }
 }
 
+// --- ADR-005 task-room artifacts (`artifact_schema_v1`) ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKindV1 {
+    PlanNote,
+    ExecutionResult,
+    ReviewNote,
+}
+
+impl ArtifactKindV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanNote => "plan_note",
+            Self::ExecutionResult => "execution_result",
+            Self::ReviewNote => "review_note",
+        }
+    }
+}
+
+/// Shared header fields for **`artifact_schema_v1`** (ADR-005).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactHeaderV1 {
+    pub id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    pub artifact_kind: ArtifactKindV1,
+    pub schema_version: String,
+    pub created_at_ms: u64,
+    /// Producer identity, e.g. `agent:<instance_id>` or `http_chat:agent:<instance_id>`.
+    pub producer: String,
+}
+
+/// P0 **`execution_result`** payload + header (single JSON document in task room).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionResultArtifactV1 {
+    #[serde(flatten)]
+    pub header: ArtifactHeaderV1,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+/// P0 **`plan_note`** payload + header (single JSON document in task room).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanNoteArtifactV1 {
+    #[serde(flatten)]
+    pub header: ArtifactHeaderV1,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactValidationError {
+    WrongSchemaVersion,
+    WrongArtifactKind,
+    MissingWorkItemId,
+}
+
+impl ExecutionResultArtifactV1 {
+    pub fn validate(&self) -> Result<(), ArtifactValidationError> {
+        if self.header.schema_version != ARTIFACT_SCHEMA_V1 {
+            return Err(ArtifactValidationError::WrongSchemaVersion);
+        }
+        if !matches!(self.header.artifact_kind, ArtifactKindV1::ExecutionResult) {
+            return Err(ArtifactValidationError::WrongArtifactKind);
+        }
+        if self
+            .header
+            .work_item_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            return Err(ArtifactValidationError::MissingWorkItemId);
+        }
+        Ok(())
+    }
+}
+
+impl PlanNoteArtifactV1 {
+    pub fn validate(&self) -> Result<(), ArtifactValidationError> {
+        if self.header.schema_version != ARTIFACT_SCHEMA_V1 {
+            return Err(ArtifactValidationError::WrongSchemaVersion);
+        }
+        if !matches!(self.header.artifact_kind, ArtifactKindV1::PlanNote) {
+            return Err(ArtifactValidationError::WrongArtifactKind);
+        }
+        Ok(())
+    }
+}
+
+/// P0 **`review_note`** payload + header (single JSON document in task room).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewNoteArtifactV1 {
+    #[serde(flatten)]
+    pub header: ArtifactHeaderV1,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+impl ReviewNoteArtifactV1 {
+    pub fn validate(&self) -> Result<(), ArtifactValidationError> {
+        if self.header.schema_version != ARTIFACT_SCHEMA_V1 {
+            return Err(ArtifactValidationError::WrongSchemaVersion);
+        }
+        if !matches!(self.header.artifact_kind, ArtifactKindV1::ReviewNote) {
+            return Err(ArtifactValidationError::WrongArtifactKind);
+        }
+        if self
+            .header
+            .work_item_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            return Err(ArtifactValidationError::MissingWorkItemId);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,10 +687,7 @@ mod tests {
             WorkItemLifecycleState::Claiming
         );
         assert_eq!(BlockedExitKind::ManualCancel.as_str(), "manual_cancel");
-        assert_eq!(
-            BlockedExitKind::TimeoutAbandon.as_str(),
-            "timeout_abandon"
-        );
+        assert_eq!(BlockedExitKind::TimeoutAbandon.as_str(), "timeout_abandon");
     }
 
     #[test]
@@ -628,7 +757,10 @@ mod tests {
 
     #[test]
     fn p0_assign_prefers_capability_score_then_workload_then_earlier_claim_index() {
-        assert_eq!(select_assign_winner_claim_index_v1(&[(5, 0.92, 1)]), Some(5));
+        assert_eq!(
+            select_assign_winner_claim_index_v1(&[(5, 0.92, 1)]),
+            Some(5)
+        );
         assert_eq!(
             select_assign_winner_claim_index_v1(&[(0, 0.50, 0), (1, 0.90, 0)]),
             Some(1)
@@ -659,5 +791,93 @@ mod tests {
                 .unwrap_err(),
             WorkItemLifecycleTransitionError::InvalidCommandForState
         );
+    }
+
+    #[test]
+    fn execution_result_artifact_v1_serializes_flat_header_fields() {
+        let artifact = ExecutionResultArtifactV1 {
+            header: ArtifactHeaderV1 {
+                id: "e1".into(),
+                task_id: "t1".into(),
+                work_item_id: Some("wi1".into()),
+                artifact_kind: ArtifactKindV1::ExecutionResult,
+                schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+                created_at_ms: 42,
+                producer: "producer".into(),
+            },
+            summary: "done".into(),
+            details: None,
+        };
+        artifact.validate().expect("fixture should validate");
+        let value = serde_json::to_value(&artifact).expect("serde");
+        assert_eq!(value["artifact_kind"], "execution_result");
+        assert_eq!(value["schema_version"], ARTIFACT_SCHEMA_V1);
+        assert_eq!(value["summary"], "done");
+        let back: ExecutionResultArtifactV1 = serde_json::from_value(value).expect("roundtrip");
+        assert_eq!(back, artifact);
+    }
+
+    #[test]
+    fn execution_result_artifact_v1_validate_requires_work_item_id() {
+        let artifact = ExecutionResultArtifactV1 {
+            header: ArtifactHeaderV1 {
+                id: "e1".into(),
+                task_id: "t1".into(),
+                work_item_id: None,
+                artifact_kind: ArtifactKindV1::ExecutionResult,
+                schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+                created_at_ms: 42,
+                producer: "producer".into(),
+            },
+            summary: "s".into(),
+            details: None,
+        };
+        assert_eq!(
+            artifact.validate(),
+            Err(ArtifactValidationError::MissingWorkItemId)
+        );
+    }
+
+    #[test]
+    fn review_note_artifact_v1_roundtrips() {
+        let artifact = ReviewNoteArtifactV1 {
+            header: ArtifactHeaderV1 {
+                id: "r1".into(),
+                task_id: "t1".into(),
+                work_item_id: Some("wi1".into()),
+                artifact_kind: ArtifactKindV1::ReviewNote,
+                schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+                created_at_ms: 7,
+                producer: "reviewer".into(),
+            },
+            summary: "lgtm with nits".into(),
+            verdict: Some("approve".into()),
+            details: None,
+        };
+        artifact.validate().unwrap();
+        let v = serde_json::to_value(&artifact).unwrap();
+        let back: ReviewNoteArtifactV1 = serde_json::from_value(v).unwrap();
+        assert_eq!(back, artifact);
+    }
+
+    #[test]
+    fn plan_note_artifact_v1_roundtrips_without_work_item_id() {
+        let artifact = PlanNoteArtifactV1 {
+            header: ArtifactHeaderV1 {
+                id: "p1".into(),
+                task_id: "t1".into(),
+                work_item_id: None,
+                artifact_kind: ArtifactKindV1::PlanNote,
+                schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+                created_at_ms: 9,
+                producer: "planner".into(),
+            },
+            summary: "plan updated".into(),
+            details: Some("split into two stages".into()),
+        };
+        artifact.validate().unwrap();
+        let v = serde_json::to_value(&artifact).unwrap();
+        let back: PlanNoteArtifactV1 = serde_json::from_value(v).unwrap();
+        assert_eq!(back, artifact);
     }
 }

@@ -240,3 +240,50 @@ fn prune_http_implicit_holder_drops_placeholder_when_other_work_items_exist() {
     assert_eq!(plan.work_items.len(), 1);
     assert_eq!(plan.work_items[0].id, real_id);
 }
+
+#[test]
+fn add_work_item_numbering_skips_implicit_http_placeholder_id() {
+    let task = TaskRequest::new("task.imp.wi-slot", "T", "g")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    plan.work_items.push(WorkItem {
+        id: HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID.to_owned(),
+        title: "holder".into(),
+        goal: "h".into(),
+        stage: "implicit".into(),
+        lifecycle: WorkItemLifecycleState::Planned,
+        estimated_token_cost: 0,
+        estimated_time_minutes: 0,
+    });
+
+    let first = plan.add_work_item("p", "Planner item one", "a");
+    assert_eq!(first.as_str(), "work-item.0001");
+
+    let second = plan.add_work_item("p", "Planner item two", "b");
+    assert_eq!(second.as_str(), "work-item.0002");
+}
+
+#[test]
+fn mark_assigned_work_item_done_closes_executing_assignment_row() {
+    let task = TaskRequest::new("task.mdone", "T", "g")
+        .with_namespace(TaskNamespace::new("tenant-a", "user-a"));
+    let mut plan = TaskPlan::awaiting_planner_input(&task);
+    let wi = plan.add_work_item("p", "w", "g");
+    plan.add_work_item_claim(&wi, "a1", "ag", 1.0, "r");
+    plan.resolve_work_item_assignment(&wi).expect("assign");
+    plan.start_work_item_execution(&wi)
+        .expect("start executing");
+    assert!(
+        plan.mark_assigned_work_item_done(&wi),
+        "MarkDone should apply from assigned lifecycle with active assignment closed to completed"
+    );
+
+    let wi_ref = plan.work_items.iter().find(|w| w.id == wi).expect("wi");
+    assert_eq!(wi_ref.lifecycle, WorkItemLifecycleState::Done);
+    let a = plan
+        .work_item_assignments
+        .iter()
+        .find(|row| row.work_item_id == wi)
+        .expect("assignment");
+    assert_eq!(a.status, "completed");
+}

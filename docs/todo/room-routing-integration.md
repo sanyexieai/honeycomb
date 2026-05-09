@@ -1,8 +1,10 @@
-# Room Routing Integration TODO
+# Room Routing Integration TODO（已完成）
 
-目标：让 `room` 不只影响 prompt 展示，还真正进入 turn 路由与能力选择，逐步把“能力启用、候选筛选、默认参数”从硬编码主流程迁到 room-aware routing。
+本节 room 专用清单已逐项落地。**路由分层 L1/L2/L3**、trace 与同轮 classify 的更细勾选见 [`swarm-p0-rollout.md`](./swarm-p0-rollout.md) Phase 3。
 
-## Phase 0：统一路由骨架（本次已落地）
+原先目标：让 `room` 不只影响 prompt 展示，还进入 turn 路由与能力选择，把「能力启用、候选筛选、默认参数」从硬编码主流程迁到 room-aware routing。实现参见 `hc-service` 下 `room_routing.rs`、`turn_router.rs`。
+
+## Phase 0：统一路由骨架
 
 - [x] 在 `hc-service` 引入 `room_routing` 模块，统一解析 `room -> resolved capabilities -> routing context`。
 - [x] 在 `turn` 主流程中引入 candidate-based router，不再由主流程硬编码分支细节。
@@ -34,4 +36,4 @@
 
 - [x] 让 CLI 与 API 共享同一套 service orchestrator，减少平行编排漂移。
 - [x] 把 timed / reminder / scheduler 进一步纳入统一 provider 框架。
-- [x] 评估 agent route 是否也应下沉为 candidate provider，避免 chat 路径内再做二次路由。
+- [x] **Chat 路径 `route_agent`（单次 LLM）**：暂不迁入 turn candidate registry，与 swarm rollout **渐进迁移**一致；工作台 L1 nomination 与工作台/`hc-agent` orchestrator、HTTP chat 仍为两条路径——见 [`swarm-p0-rollout.md`](./swarm-p0-rollout.md) Phase 5 **`L1`** / **`L2/L3`** 说明。

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 futures-util = "0.3"
 hc-bootstrap = { path = "../../crates/hc-bootstrap" }
 hc-protocol = { path = "../../crates/hc-protocol" }

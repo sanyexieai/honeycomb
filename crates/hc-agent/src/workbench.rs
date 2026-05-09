@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use hc_store::store::WorkspaceNamespace;
 
+use crate::persistence::{
+    MATERIALIZATION_NOTICE_SCHEMA_V1, MaterializationNoticeRecordV1,
+    append_materialization_notice_record,
+};
 use crate::{
     AgentPlan, ChannelConversation, ConversationParticipant, MaterializePlanOutcome,
     MaterializedAgent, TaskPlan, TaskRequest, bootstrap_planning_task, materialize_plan,
-};
-use crate::persistence::{
-    MaterializationNoticeRecordV1, MATERIALIZATION_NOTICE_SCHEMA_V1,
-    append_materialization_notice_record,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,13 +247,18 @@ pub fn bootstrap_task_workbench(
     })
 }
 
-fn persist_materialization_notices(plan: &AgentPlan, outcome: &MaterializePlanOutcome) -> Result<()> {
+fn persist_materialization_notices(
+    plan: &AgentPlan,
+    outcome: &MaterializePlanOutcome,
+) -> Result<()> {
     if outcome.notices.is_empty() {
         return Ok(());
     }
     let root = workspace_root();
-    let namespace =
-        WorkspaceNamespace::new(plan.namespace.tenant_id.clone(), plan.namespace.user_id.clone());
+    let namespace = WorkspaceNamespace::new(
+        plan.namespace.tenant_id.clone(),
+        plan.namespace.user_id.clone(),
+    );
     let record = MaterializationNoticeRecordV1 {
         schema: MATERIALIZATION_NOTICE_SCHEMA_V1.to_owned(),
         created_at_ms: wall_clock_ms(),

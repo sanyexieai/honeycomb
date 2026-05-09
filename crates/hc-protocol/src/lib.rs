@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod swarm;
+pub mod timed_run;
 
 pub const DEFAULT_TENANT_ID: &str = "local";
 pub const DEFAULT_USER_ID: &str = "default";
@@ -107,6 +108,12 @@ pub struct ChatRequest {
     pub active_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_task_id: Option<String>,
+    /// When set together with [`Self::active_task_id`], scopes HTTP L2/L3 degenerate
+    /// claim/assign/mark-done persistence to this planner **`work_items`** row (`work-item.*` id).
+    /// Disambiguates multi–work-item [`TaskPlan`] snapshots where the routed agent turn should not
+    /// infer terminal completion across sibling rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_work_item_id: Option<String>,
     #[serde(default)]
     pub memory: ApiMemoryQuery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +253,8 @@ pub struct AgentRouteRequest {
     pub active_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_work_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }

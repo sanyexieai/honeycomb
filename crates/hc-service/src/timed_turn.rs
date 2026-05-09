@@ -30,6 +30,8 @@ struct TimedRunSpec {
     draft_message: String,
     notes: String,
     payload: serde_json::Map<String, serde_json::Value>,
+    logical_task_id: String,
+    sequence_index: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -54,8 +56,12 @@ pub enum TimedTurnPlan {
 
 #[derive(Debug, Clone, Copy)]
 pub enum TimedDeliverMode {
-    /// CLI REPL: synchronous tick printing and optional reminder stdout when firing.
+    /// Interactive host persists follow-ups; the host must run periodic scheduler due dispatch
+    /// and stdout follow-up delivery (e.g. `hc-cli` REPL background ticker).
     Interactive,
+    /// After persist, spawn a dedicated thread that polls `dispatch_followups_until_fired`
+    /// until the enqueued ids fire (host without a periodic scheduler ticker).
+    InteractiveSelfContained,
     /// HTTP API: schedule repository writes only; no blocking tick loop or stderr printing.
     Headless,
 }
@@ -384,6 +390,15 @@ fn execute_reminder_turn(
         "source_turn".to_owned(),
         serde_json::Value::String(input.clone()),
     );
+    let logical_task_id = {
+        let room_key = request
+            .session_id
+            .as_deref()
+            .or(request.room_id.as_deref())
+            .unwrap_or("_");
+        format!("{agent_id}::{trigger}::{reminder_prefix}::{room_key}")
+    };
+
     let spec = TimedTaskSpec {
         agent_id,
         trigger,
@@ -394,11 +409,13 @@ fn execute_reminder_turn(
             draft_message: due_reply,
             notes: format!("Reminder due in {delay_seconds} seconds."),
             payload,
+            logical_task_id,
+            sequence_index: 0,
         }],
     };
     let followup_ids = persist_timed_task_runs(config, &namespace, spec)?;
 
-    if matches!(deliver, TimedDeliverMode::Interactive) {
+    if matches!(deliver, TimedDeliverMode::InteractiveSelfContained) {
         spawn_interactive_followup_delivery_worker(config, &namespace_api, followup_ids);
     }
 
@@ -459,6 +476,8 @@ fn persist_timed_task_runs(
                     draft_message: run.draft_message,
                     notes: run.notes,
                     payload: run.payload,
+                    logical_task_id: run.logical_task_id,
+                    sequence_index: run.sequence_index,
                 })
                 .collect(),
         },
@@ -539,6 +558,8 @@ fn execute_timed_sequence(
             draft_message: value.to_string(),
             notes: format!("Timed sequence tick {index}: {value}"),
             payload,
+            logical_task_id: sequence_id.clone(),
+            sequence_index: index as u32,
         });
     }
     let followup_ids = persist_timed_task_runs(
@@ -557,8 +578,8 @@ fn execute_timed_sequence(
         .clone()
         .unwrap_or_else(|| "scheduled timed sequence".to_owned());
 
-    if matches!(deliver, TimedDeliverMode::Interactive) {
-        deliver_followups_interactive(config, namespace, &followup_ids)?;
+    if matches!(deliver, TimedDeliverMode::InteractiveSelfContained) {
+        spawn_interactive_followup_delivery_worker(config, namespace, followup_ids);
     }
 
     Ok(Some(chat_response_simple(request, namespace, ack)))

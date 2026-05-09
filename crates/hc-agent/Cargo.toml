@@ -16,6 +16,7 @@ hc-capability = { path = "../hc-capability" }
 hc-claim = { path = "../hc-claim" }
 hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }
+hc-llm = { path = "../hc-llm" }
 hc-memory = { path = "../hc-memory" }
 hc-persona = { path = "../hc-persona" }
 hc-protocol = { path = "../hc-protocol" }

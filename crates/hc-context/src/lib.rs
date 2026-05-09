@@ -1219,8 +1219,7 @@ impl MemoryRetriever for WorkspaceMemoryRetriever {
             query,
         )?;
         trace_stats.room_candidate_count = room_candidates.len();
-        let task_room_allowlist =
-            task_scoped_room_allowlist_for_retrieval(query, &room_candidates);
+        let task_room_allowlist = task_scoped_room_allowlist_for_retrieval(query, &room_candidates);
         let room_candidate_boosts = room_candidates
             .iter()
             .map(|candidate| (candidate.room_id.clone(), candidate.score_milli))

@@ -233,8 +233,7 @@ pub fn handle_turn_stream_request(
         user_id: request.user_id.clone(),
         session_id: request.session_id.clone(),
     })?;
-    let decision =
-        classify_turn_route_decision(config, &request, room_routing, &request.messages)?;
+    let decision = classify_turn_route_decision(config, &request, room_routing, &request.messages)?;
 
     let selected = decision.selected;
     let provider_id = selected.provider_id;
@@ -336,8 +335,8 @@ mod turn_classify_tests {
 
     use crate::{
         room_routing::{
-            RoomRoutingContext, default_enabled_providers, PROVIDER_CHAT_FALLBACK,
-            PROVIDER_MCP_TOOL, PROVIDER_PENDING_CONFIRMATION, PROVIDER_TIMED,
+            PROVIDER_CHAT_FALLBACK, PROVIDER_MCP_TOOL, PROVIDER_PENDING_CONFIRMATION,
+            PROVIDER_TIMED, RoomRoutingContext, default_enabled_providers,
         },
         timed_turn::TimedTurnPlan,
         tool_turn::{
@@ -368,6 +367,7 @@ mod turn_classify_tests {
             domain_id: None,
             active_agent_id: None,
             active_task_id: None,
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace: ApiNamespace {
                     tenant_id: DEFAULT_TENANT_ID.to_owned(),
@@ -380,7 +380,10 @@ mod turn_classify_tests {
         }
     }
 
-    fn chat_request_fixture_with_session(session_id: impl Into<String>, content: impl Into<String>) -> ChatRequest {
+    fn chat_request_fixture_with_session(
+        session_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> ChatRequest {
         let mut r = chat_request_fixture(content);
         r.session_id = Some(session_id.into());
         r
@@ -488,8 +491,7 @@ routing_stop_terms: []
 
     #[test]
     fn shared_classifier_plain_message_chat_fallback_then_try_handle_aligned() {
-        let dir =
-            std::env::temp_dir().join(format!("hc-turn-shared-classify-{}", wall_clock_ms()));
+        let dir = std::env::temp_dir().join(format!("hc-turn-shared-classify-{}", wall_clock_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = ServiceConfig::new(dir);
         let req = chat_request_fixture("hello from turn shared classify regression");
@@ -503,9 +505,14 @@ routing_stop_terms: []
             TurnRoute::ChatFallback(_)
         ));
 
-        let outcome =
-            try_handle_service_turn(&config, &req, TimedDeliverMode::Headless, &req.messages, None)
-                .unwrap();
+        let outcome = try_handle_service_turn(
+            &config,
+            &req,
+            TimedDeliverMode::Headless,
+            &req.messages,
+            None,
+        )
+        .unwrap();
         assert!(matches!(outcome, ServiceTurnOutcome::ChatFallback { .. }));
 
         let _ = std::fs::remove_dir_all(&config.workspace_root);
@@ -513,29 +520,35 @@ routing_stop_terms: []
 
     #[test]
     fn classify_turn_cn_reminder_selects_timed_provider() {
-        let dir =
-            std::env::temp_dir().join(format!("hc-turn-timed-classify-{}", wall_clock_ms()));
+        let dir = std::env::temp_dir().join(format!("hc-turn-timed-classify-{}", wall_clock_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = ServiceConfig::new(dir);
         let req = chat_request_fixture("十分钟后提醒我喝水");
 
         let attachment = resolve_turn_fallback_room_attachment(&config, &req, None).unwrap();
         let room = attachment.as_ref();
-        let decision =
-            classify_turn_route_decision(&config, &req, room, &req.messages).unwrap();
+        let decision = classify_turn_route_decision(&config, &req, room, &req.messages).unwrap();
 
         assert_eq!(decision.selected.provider_id, PROVIDER_TIMED);
         match &decision.selected.route {
-            TurnRoute::Timed(TimedTurnPlan::Reminder { rule, delay_seconds }) => {
+            TurnRoute::Timed(TimedTurnPlan::Reminder {
+                rule,
+                delay_seconds,
+            }) => {
                 assert_eq!(rule.id, "builtin.reminder.cn");
                 assert!(*delay_seconds >= 60);
             }
             route => panic!("expected Timed reminder route, got {:?}", route),
         }
 
-        let outcome =
-            try_handle_service_turn(&config, &req, TimedDeliverMode::Headless, &req.messages, None)
-                .unwrap();
+        let outcome = try_handle_service_turn(
+            &config,
+            &req,
+            TimedDeliverMode::Headless,
+            &req.messages,
+            None,
+        )
+        .unwrap();
         match outcome {
             ServiceTurnOutcome::Timed(response) => {
                 assert!(response.message.content.contains("提醒您"));
@@ -580,10 +593,7 @@ routing_stop_terms: []
             Some(&room_ctx),
         )
         .unwrap();
-        assert!(matches!(
-            outcome,
-            ServiceTurnOutcome::ChatFallback { .. }
-        ));
+        assert!(matches!(outcome, ServiceTurnOutcome::ChatFallback { .. }));
 
         let _ = std::fs::remove_dir_all(&config.workspace_root);
     }
@@ -624,10 +634,7 @@ routing_stop_terms: []
         let decision =
             classify_turn_route_decision(&config, &req, Some(&room_ctx), &req.messages).unwrap();
 
-        assert_eq!(
-            decision.selected.provider_id,
-            PROVIDER_PENDING_CONFIRMATION
-        );
+        assert_eq!(decision.selected.provider_id, PROVIDER_PENDING_CONFIRMATION);
         assert!(matches!(
             decision.selected.route,
             TurnRoute::PendingConfirmation(_)
@@ -673,8 +680,7 @@ routing_stop_terms: []
             classify_turn_route_decision(&config, &req, Some(&room_ctx), &req.messages).unwrap();
 
         assert_eq!(
-            decision.selected.provider_id,
-            PROVIDER_CHAT_FALLBACK,
+            decision.selected.provider_id, PROVIDER_CHAT_FALLBACK,
             "pending_confirmation provider gated off despite persisted session pending state"
         );
         assert!(matches!(

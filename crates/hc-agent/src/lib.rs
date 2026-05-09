@@ -4,6 +4,8 @@ pub mod binding;
 pub mod bootstrap;
 pub mod conversation;
 pub mod domain;
+pub mod experience_lane;
+mod http_l2l3_planner_steering;
 pub mod incubation;
 pub mod orchestrator;
 pub mod persistence;
@@ -19,9 +21,8 @@ pub mod workbench;
 pub use binding::{AgentRuntimeBinding, BindingNamespace};
 pub use bootstrap::{
     AgentPlan, AgentSeed, MaterializePlanLimits, MaterializePlanOutcome, MaterializedAgent,
-    bootstrap_planning_task, bootstrap_task, bootstrap_task_preset_from_env,
+    TaskBootstrapPreset, bootstrap_planning_task, bootstrap_task, bootstrap_task_preset_from_env,
     bootstrap_task_with_preset, materialize_plan, materialize_plan_with_limits, materialize_seed,
-    TaskBootstrapPreset,
 };
 pub use conversation::{
     ChannelConversation, ConversationParticipant, ConversationParticipantKind,
@@ -29,6 +30,7 @@ pub use conversation::{
     ConversationStopPolicy, ConversationTurnPolicy, ConversationTurnState,
 };
 pub use domain::{DomainKind, DomainProfile, DomainProfileSummary, DomainRepository};
+pub use experience_lane::{task_learning_effective, tenant_learning_allowed_from_env};
 pub use hc_capability::{
     CapabilityInputType, CapabilityNamespace, CapabilityOutputType, CapabilityProfile,
     CapabilityRepository, CapabilityTier, CapabilityVisibility, ModelDependence,
@@ -47,23 +49,31 @@ pub use hc_trace::{
     ActivityItemView, DecisionTraceView, agent_code_from, behavior_mode_code_from, code_from,
     summarize_trace_body,
 };
+pub use http_l2l3_planner_steering::{
+    http_l2l3_planner_steering_enabled_from_env, maybe_apply_http_l2l3_planner_steering,
+};
 pub use incubation::{IncubationObservation, IncubationReport, PromotionDecision};
 pub use orchestrator::{AgentOrchestrator, NominationCycleOutcome, SwarmMessageClassification};
 pub use persistence::{
-    PersistedAgentAssets, PersistedIncubationArtifacts, PersistedTaskArtifacts,
-    ROUTING_BINDING_LOG_SCHEMA_V1, RoutingBindingLogLineV1, TaskArtifactDocument,
-    TaskArtifactKind, TaskArtifactQuery, TaskArtifactSummary,
-    WORK_ITEM_ASSIGNMENT_JOURNAL_SCHEMA_V1,
-    WORK_ITEM_CLAIM_JOURNAL_SCHEMA_V1, WorkItemAssignmentJournalLineV1,
-    WorkItemClaimJournalLineV1, append_implicit_intent_dedupe_record,
-    append_routing_binding_log_line, append_work_item_assignment_journal_line,
-    append_work_item_claim_journal_line, build_routing_binding_log_line_v1,
-    build_routing_binding_log_line_v1_headless,
-    build_routing_binding_log_line_v1_headless_from_snapshot,
-    ensure_http_implicit_task_plan_stub,
-    hydrate_task_plan_work_item_coordination_journals, load_implicit_intent_dedupe_keys,
-    persist_incubation_report, persist_materialized_agents, persist_task_artifacts,
-    persist_task_artifacts_with_in_memory_prune, query_task_artifacts, read_task_artifact, rebuild_task_artifact_index,
+    HTTP_L23_EXECUTION_DIGEST_HEADING, HTTP_L23_PLAN_DIGEST_HEADING,
+    HTTP_L23_REVIEW_DIGEST_HEADING, PersistedAgentAssets, PersistedIncubationArtifacts,
+    PersistedTaskArtifacts, ROUTING_BINDING_LOG_SCHEMA_V1, RoutingBindingLogLineV1,
+    TaskArtifactDocument, TaskArtifactKind, TaskArtifactQuery, TaskArtifactSummary,
+    WORK_ITEM_ASSIGNMENT_JOURNAL_SCHEMA_V1, WORK_ITEM_CLAIM_JOURNAL_SCHEMA_V1,
+    WorkItemAssignmentJournalLineV1, WorkItemClaimJournalLineV1,
+    append_implicit_intent_dedupe_record, append_routing_binding_log_line,
+    append_work_item_assignment_journal_line, append_work_item_claim_journal_line,
+    build_routing_binding_log_line_v1, build_routing_binding_log_line_v1_headless,
+    build_routing_binding_log_line_v1_headless_from_snapshot, ensure_http_implicit_task_plan_stub,
+    format_execution_results_digest_for_http_l23, format_plan_notes_digest_for_http_l23,
+    format_review_notes_digest_for_http_l23, hydrate_task_plan_work_item_coordination_journals,
+    load_implicit_intent_dedupe_keys, load_task_coordination_bundle_for_journal_updates,
+    load_task_execution_result_artifacts_v1, load_task_plan_note_artifacts_v1,
+    load_task_review_note_artifacts_v1, persist_execution_result_artifact_v1,
+    persist_http_chat_l23_degenerate_claim_assign, persist_incubation_report,
+    persist_materialized_agents, persist_plan_note_artifact_v1, persist_review_note_artifact_v1,
+    persist_task_artifacts, persist_task_artifacts_with_in_memory_prune, query_task_artifacts,
+    read_task_artifact, rebuild_task_artifact_index,
 };
 pub use planning::{
     AgentProposal, AgentRuntimeBudget, EvolutionIssue, HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID, TaskPlan,

@@ -309,9 +309,15 @@ hc-cli schedule resume --id <id> [--json]
 hc-cli schedule dispatch-queued [--now-unix <ts>] [--json]
 hc-cli schedule dispatch-due [--now-unix <ts>] [--json]
 hc-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]
+hc-cli schedule followups list [--due-only] [--status <pending|fired|cancelled|failed>] [--json]
+hc-cli schedule followups cancel --id <followup-id> [--json]
+hc-cli schedule followups replay-events [--since-created-unix <ts>] [--json] [--no-print]
+hc-cli schedule stats [--now-unix <ts>] [--json]
 ```
 
-`dispatch-due` is restart-friendly: it first creates any due run records, then dispatches queued runs. `watch` is a thin polling loop over the same behavior and is intentionally not business-aware.
+Follow-up rows live under `conversation/followups`; `followups cancel` also cancels the `timed.followup.{id}` mirror task when present and writes a `timed.followup.cancelled` event. `followups replay-events` lists persisted `timed.followup.fired` events and prints `assistant> …` (or `--json`); pass `--since-created-unix` after reconnect to replay only newer fires. `stats` calls `scheduler_operational_stats` (disk snapshot) for the current `HC_TENANT_ID` / `HC_USER_ID` namespace—follow-ups by lifecycle (`pending` / `pending_due` / `fired` / `cancelled` / `failed`), schedules by status (`active` / `paused` / `cancelled`, plus active timed-followup mirrors), and run lifecycle (`queued` / `running` / `succeeded` / `failed` / `cancelled`). Same **disk-backed** fields as **`GET /v1/schedules/operational-stats`**, except **hc-api** merges **process-local** `api_*` counters into that HTTP JSON/Prometheus (`api_followup_*`, `api_dispatch_*`, `api_scheduler_loop_tick_*`); CLI `stats` omits those or leaves them at **0**.
+
+`dispatch-due` is restart-friendly: it first creates any due run records, then dispatches queued runs. `watch` is a thin polling loop over the same behavior and is intentionally not business-aware. Dispatch path matches `hc-service::scheduler::dispatch_due_scheduled_runs` (same stack as `hc-api` `/v1/schedules/dispatch-due`). With `watch --json`, each tick emits `now_unix`, `queued_count` (due runs newly enqueued that tick), and `receipts`.
 
 `hc-api` can run the same loop in-process when explicitly enabled:
 
@@ -324,18 +330,40 @@ HC_USER_ID=default
 
 The API loop delegates to `hc-service::scheduler`; it does not contain domain-specific scheduling or routing rules.
 
-### Followup Delivery Mode
+Read-only parity with the CLI recovery helpers:
+
+```text
+GET /v1/schedules/followup-fired-events?tenant_id=local&user_id=default&since_created_at_unix=<ts>
+GET /v1/schedules/operational-stats?tenant_id=local&user_id=default&now_unix=<ts>
+GET /v1/schedules/metrics/prometheus?tenant_id=local&user_id=default&now_unix=<ts>
+```
+
+`followup-fired-events` returns `TimedFollowupFiredEventRow` JSON. **`operational-stats`** returns **`SchedulerOperationalStats`**. **`metrics/prometheus`** returns OpenMetrics gauges (`honeycomb_scheduler_*` with `tenant_id` / `user_id` labels) — same counters as operational-stats, for Prometheus scraping (`since_created_at_unix` N/A; omit `now_unix` to use wall-clock). Snapshot backlog depth includes pending follow-ups (`honeycomb_scheduler_followups_pending`, `honeycomb_scheduler_followups_pending_due`) and run queue depth (`honeycomb_scheduler_runs_queued`, `honeycomb_scheduler_runs_running`). You can approximate terminal outcome mix in PromQL from `runs_succeeded` vs `runs_failed` / `runs_cancelled`; these are **point-in-time row counts**, not request-rate counters or latency histograms.
+
+OpenMetrics exposes **`honeycomb_scheduler_api_followup_messages_delivered_total`** (preferred) and the legacy alias **`honeycomb_scheduler_api_followup_headless_messages_delivered_total`** with the **same value**. **`GET /v1/schedules/operational-stats`** JSON includes **`api_followup_messages_delivered_total`** (preferred) and **`api_followup_headless_messages_delivered_total`** (legacy); both are **omitted when zero** (`serde` `skip_serializing_if`). The count is a **process-local cumulative** of follow-up **messages** delivered by **this hc-api instance** via the scheduler loop (`HC_SCHEDULER_ENABLED=true`) and `POST /v1/schedules/dispatch-due` / `dispatch-queued` — for **`headless`** (event/store) and **`webhook`** (successful HTTP POST) — scoped by query `tenant_id` / `user_id`. Merged at **read time** only; **not** on disk; **resets on restart**. The standalone `hc_service::scheduler::scheduler_operational_stats` snapshot exposes `0` for both fields (typically omitted in JSON).
+
+Additional **hc-api process counters** are merged the same way (JSON fields `api_dispatch_due_completed_total`, `api_dispatch_due_failed_total`, `api_dispatch_queued_completed_total`, `api_dispatch_queued_failed_total`, `api_scheduler_loop_tick_completed_total`, `api_scheduler_loop_tick_failed_total`; OpenMetrics `honeycomb_scheduler_api_dispatch_*`, `honeycomb_scheduler_api_scheduler_loop_tick_*`): one increment on dispatch worker success versus failure (`Err` inner result or blocked-task join failure), per queried tenant/user. Not persisted across restarts.
+
+Last **successful** blocking-worker duration samples (milliseconds, wall time **inside** the `spawn_blocking` closure only) expose as JSON `api_dispatch_due_last_worker_wall_ms`, `api_dispatch_queued_last_worker_wall_ms`, `api_scheduler_loop_tick_last_worker_wall_ms`, and gauges `honeycomb_scheduler_*_last_worker_wall_ms`. Failed attempts keep the prior sample unchanged.
+
+Successful **`POST /v1/schedules/dispatch-due`** workers additionally accumulate **`api_dispatch_due_worker_wall_ms_histogram`** (JSON: `count`, `sum_ms`, cumulative `bucket_ms_le_*`; OpenMetrics: `TYPE histogram`, `honeycomb_scheduler_api_dispatch_due_worker_wall_ms_bucket{_sum,_count}`, buckets `le=10|50|100|500|+Inf`). Successful **`POST /v1/schedules/dispatch-queued`** workers populate **`api_dispatch_queued_worker_wall_ms_histogram`** / **`honeycomb_scheduler_api_dispatch_queued_worker_wall_ms_*`** with the same bucket layout. Successful **`HC_SCHEDULER_ENABLED`** scheduler loop ticks (`dispatch_due_scheduled_runs` + followup delivery in-process) populate **`api_scheduler_loop_tick_worker_wall_ms_histogram`** / **`honeycomb_scheduler_api_scheduler_loop_tick_worker_wall_ms_*`**. CLI-only callers omit these histograms (same as other **`api_*`** counters). Persisted/read merge behavior matches other **`api_*`** process counters (`0` when empty or from disk-only callers).
+
+**Scheduled-run dispatch slip** (milliseconds from `ScheduledRun.scheduled_for_unix` to when the run is marked **Running**) accumulates in **`scheduled_run_dispatch_slip_ms_histogram`** for **every code path** that calls `dispatch_scheduled_run` (CLI `schedule dispatch-due` / `watch`, **`hc-api`** `/dispatch-*` / scheduler loop, tests). Buckets (OpenMetrics `le`, ms): **1000 / 5000 / 30000 / 60000 / 300000 / 3600000 / +Inf**. Unix timestamps are second-resolution, so non-zero slip is usually a multiple of **1000 ms**. Same merge rules as other process-local histograms: merged at operational-stats / Prometheus read time; **not persisted**.
 
 `hc-api` exposes an explicit scheduler followup delivery strategy:
 
 ```text
-HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE=headless|off
+HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE=headless|off|webhook
+HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL=<https URL>   # required when mode=webhook
+HC_SCHEDULER_FOLLOWUP_WEBHOOK_BEARER_TOKEN=<secret>   # optional; sends Authorization: Bearer …
+HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS=30   # optional; per-request timeout, default 30, clamped 1–300
 ```
 
 Current modes:
 
-- `headless` (default): resolve fired followup messages via scheduler receipts without stdout side effects.
+- `headless` (default): resolve fired followup messages via scheduler receipts without stdout side effects (events / store as today).
 - `off`: skip followup message delivery pass (dispatch still runs; followup message extraction is disabled).
+- `webhook`: for each fired follow-up message, `POST` JSON to `HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL` with body `{"tenant_id","user_id","followup_id","message"}`. Requests send **`User-Agent: honeycomb-hc-api/<version>`**. If **`HC_SCHEDULER_FOLLOWUP_WEBHOOK_BEARER_TOKEN`** is set, requests include **`Authorization: Bearer <token>`**. Timeout is **`HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS`** (default **30**, clamped **1–300**) per request. Non-2xx or network error fails the dispatch worker. On startup, **hc-api** logs `followup_delivery_mode`, **`webhook_timeout_secs`**, and booleans **`webhook_url_configured`** / **`webhook_bearer_configured`** (no URLs or tokens); if the URL is missing, it also emits a **warn**.
 
 Behavior matrix:
 
@@ -343,15 +371,32 @@ Behavior matrix:
 | --- | --- | --- |
 | API scheduler loop (`HC_SCHEDULER_ENABLED=true`) | `headless` | enabled |
 | API scheduler loop (`HC_SCHEDULER_ENABLED=true`) | `off` | disabled |
+| API scheduler loop (`HC_SCHEDULER_ENABLED=true`) | `webhook` | enabled (HTTP POST) |
 | `POST /v1/schedules/dispatch-due` | `headless` | enabled |
 | `POST /v1/schedules/dispatch-due` | `off` | disabled |
+| `POST /v1/schedules/dispatch-due` | `webhook` | enabled (HTTP POST) |
 | `POST /v1/schedules/dispatch-queued` | `headless` | enabled |
 | `POST /v1/schedules/dispatch-queued` | `off` | disabled |
+| `POST /v1/schedules/dispatch-queued` | `webhook` | enabled (HTTP POST) |
 
 Notes:
 
 - `hc-cli schedule watch` remains interactive and prints `assistant> ...` for fired followup messages.
 - API logs include `delivered_followups` for scheduler loop and dispatch endpoints.
+- In the `hc-cli` REPL, a single background ticker runs **`dispatch_due_scheduled_runs`** on the chat namespace (`HC_CLI_CHAT_SCHEDULER_TICK_MS`, default **500**, min **50**), then **`dispatch_fired_followup_messages_from_receipts`** with stdout `assistant>` — same primitives as **`hc-cli schedule watch`**. Keep it on by default; set **`HC_CLI_CHAT_SCHEDULER_ENABLED`** to **`false`/`0`/`no`/`off`** when you run **`schedule watch`** for the same tenant/user to avoid double dispatch. **`TimedDeliverMode::Interactive`** only persists follow-ups (plus mirrored `timed.followup` tasks); **`InteractiveSelfContained`** still spawns a per-turn thread that polls `dispatch_followups_until_fired`, for tooling without this REPL ticker.
+
+### Timed follow-up mirror retries (`timed.followup.*`)
+
+Reminder / countdown rows persist a mirrored `ScheduledTask` (`target=timed.followup`). Dispatch failures increment `failure_count` on that task and, while `failure_count <= policy.max_retries`, re-activate the task with:
+
+`next_fire_at_unix = <dispatch finish time> + policy.retry_delay_seconds`.
+
+Optional environment overrides applied when persisting mirrors from `hc-service::scheduler::persist_scheduled_followup_task`:
+
+```text
+HC_TIMED_FOLLOWUP_SCHEDULE_MAX_RETRIES=<u32>
+HC_TIMED_FOLLOWUP_SCHEDULE_RETRY_DELAY_SECONDS=<u64 seconds, min 1 when set>
+```
 
 ## Design Rule
 

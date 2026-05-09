@@ -8,8 +8,11 @@ services:
     environment:
       HC_API_BIND: 0.0.0.0:8787
       HC_WORKSPACE_ROOT: /app/workspace
-      # Scheduler followup delivery mode: headless (default) | off
+      # Scheduler followup: headless (default) | off | webhook; set URL when webhook
       HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE: ${HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE:-headless}
+      HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL: ${HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL:-}
+      HC_SCHEDULER_FOLLOWUP_WEBHOOK_BEARER_TOKEN: ${HC_SCHEDULER_FOLLOWUP_WEBHOOK_BEARER_TOKEN:-}
+      HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS: ${HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS:-}
     ports:
       - "${HC_API_PORT:-8787}:8787"
     volumes:

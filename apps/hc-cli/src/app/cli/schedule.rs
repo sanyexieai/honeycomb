@@ -1,10 +1,13 @@
 //! `hc-cli schedule` 子命令。
 use anyhow::{Context, Result, bail};
-use hc_scheduler::{
-    ScheduleSpec, ScheduleStatus, ScheduledRun, ScheduledTarget, ScheduledTask, now_unix,
-};
+use hc_conversation::FollowUpStatus;
+use hc_protocol::ApiNamespace;
+use hc_scheduler::{ScheduleSpec, ScheduleStatus, ScheduledTarget, ScheduledTask, now_unix};
 use hc_service::ServiceConfig;
-use hc_service::scheduler::SchedulerDispatchReceipt;
+use hc_service::scheduler::{
+    SchedulerDispatchReceipt, SchedulerDispatchReport, dispatch_due_scheduled_runs,
+    dispatch_queued_scheduled_runs,
+};
 use std::time::Duration;
 
 pub(super) fn handle_schedule(args: &[String]) -> Result<()> {
@@ -22,11 +25,261 @@ pub(super) fn handle_schedule(args: &[String]) -> Result<()> {
         [cmd, rest @ ..] if cmd == "dispatch-due" => handle_schedule_dispatch_due(rest),
         [cmd, rest @ ..] if cmd == "dispatch-queued" => handle_schedule_dispatch_queued(rest),
         [cmd, rest @ ..] if cmd == "watch" => handle_schedule_watch(rest),
+        [cmd, rest @ ..] if cmd == "followups" => handle_schedule_followups(rest),
+        [cmd, rest @ ..] if cmd == "stats" => handle_schedule_stats(rest),
         [] => bail!(
-            "usage: hc-cli schedule <add|list|run-due|runs|pause|resume|dispatch-due|dispatch-queued|watch> ..."
+            "usage: hc-cli schedule <add|list|run-due|runs|pause|resume|dispatch-due|dispatch-queued|watch|followups|stats> ..."
         ),
         [other, ..] => bail!("unknown schedule command: {other}"),
     }
+}
+
+fn handle_schedule_followups(args: &[String]) -> Result<()> {
+    match args {
+        [sub, rest @ ..] if sub == "list" => handle_schedule_followups_list(rest),
+        [sub, rest @ ..] if sub == "cancel" => handle_schedule_followups_cancel(rest),
+        [sub, rest @ ..] if sub == "replay-events" => handle_schedule_followups_replay_events(rest),
+        [] => bail!("usage: hc-cli schedule followups <list|cancel|replay-events> ..."),
+        [other, ..] => bail!("unknown schedule followups command: {other}"),
+    }
+}
+
+fn handle_schedule_followups_replay_events(args: &[String]) -> Result<()> {
+    let mut since_created = 0u64;
+    let mut json = false;
+    let mut print_stdout = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--since-created-unix" => {
+                since_created = super::parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --since-created-unix")?,
+                    "--since-created-unix",
+                )?;
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--no-print" => {
+                print_stdout = false;
+                index += 1;
+            }
+            other => bail!("unexpected schedule followups replay-events argument: {other}"),
+        }
+    }
+
+    let config = ServiceConfig::from_env();
+    let rows = hc_service::scheduler::list_timed_followup_fired_events_since_created(
+        &config,
+        &super::runtime_namespace(),
+        since_created,
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "schedule> timed.followup.fired rows={} since_created_unix>={}",
+        rows.len(),
+        since_created
+    );
+    if print_stdout {
+        for row in &rows {
+            match row.draft_message.as_deref() {
+                Some(msg) if !msg.trim().is_empty() => println!("assistant> {}", msg.trim()),
+                _ => println!(
+                    "schedule> followup_id={} event={} created_at_unix={} (no draft_message)",
+                    row.followup_id, row.event_id, row.created_at_unix
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_schedule_followups_list(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut status_filter: Option<FollowUpStatus> = None;
+    let mut due_only = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--status" => {
+                let raw = args.get(index + 1).context("missing value for --status")?;
+                status_filter = Some(parse_followup_status_filter(raw)?);
+                index += 2;
+            }
+            "--due-only" => {
+                due_only = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule followups list argument: {other}"),
+        }
+    }
+
+    let config = ServiceConfig::from_env();
+    let items =
+        hc_service::scheduler::list_conversation_followups(&config, &super::runtime_namespace())?;
+    let now = now_unix();
+    let filtered: Vec<_> = items
+        .into_iter()
+        .filter(|f| {
+            if let Some(s) = status_filter {
+                if f.status != s {
+                    return false;
+                }
+            }
+            if due_only && !(f.status == FollowUpStatus::Pending && f.due_at_unix <= now) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
+        return Ok(());
+    }
+    if filtered.is_empty() {
+        println!("schedule> no follow-ups match");
+        return Ok(());
+    }
+    for f in filtered {
+        let idem = f
+            .payload
+            .get("timed_run_idempotency_key_v1")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        println!(
+            "{} | {:?} | due_at_unix={} | trigger={} | idem={}",
+            f.id, f.status, f.due_at_unix, f.trigger, idem
+        );
+    }
+    Ok(())
+}
+
+fn parse_followup_status_filter(raw: &str) -> Result<FollowUpStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "pending" => Ok(FollowUpStatus::Pending),
+        "fired" => Ok(FollowUpStatus::Fired),
+        "cancelled" => Ok(FollowUpStatus::Cancelled),
+        "failed" => Ok(FollowUpStatus::Failed),
+        other => bail!("unknown follow-up status filter: {other}"),
+    }
+}
+
+fn handle_schedule_followups_cancel(args: &[String]) -> Result<()> {
+    let mut id = None;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                id = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --id")?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => bail!("unexpected schedule followups cancel argument: {other}"),
+        }
+    }
+    let followup_id = id.context("missing --id")?;
+    let config = ServiceConfig::from_env();
+    let followup = hc_service::scheduler::cancel_followup_with_timed_mirror(
+        &config,
+        &super::runtime_namespace(),
+        &followup_id,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&followup)?);
+    } else {
+        println!(
+            "schedule> cancelled follow-up {} ({:?})",
+            followup.id, followup.status
+        );
+    }
+    Ok(())
+}
+
+fn handle_schedule_stats(args: &[String]) -> Result<()> {
+    let mut json = false;
+    let mut now = None::<u64>;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--now-unix" => {
+                now = Some(super::parse_u64_arg(
+                    args.get(index + 1)
+                        .context("missing value for --now-unix")?,
+                    "--now-unix",
+                )?);
+                index += 2;
+            }
+            other => bail!("unexpected schedule stats argument: {other}"),
+        }
+    }
+    let config = ServiceConfig::from_env();
+    let ns = super::runtime_namespace();
+    let stats = hc_service::scheduler::scheduler_operational_stats(&config, &ns, now)?;
+    let stats =
+        hc_service::scheduler::merge_scheduler_operational_stats_with_dispatch_slip_histogram(
+            stats,
+            &ns.tenant_id,
+            &ns.user_id,
+        );
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        println!("schedule> stats now_unix={}", stats.now_unix);
+        println!(
+            "  followups: total={} pending={} pending_due_now={} fired={} cancelled={} failed={}",
+            stats.followup_total,
+            stats.followup_pending,
+            stats.followup_pending_due,
+            stats.followup_fired,
+            stats.followup_cancelled,
+            stats.followup_failed
+        );
+        println!(
+            "  schedules: total={} active={} paused={} cancelled={} timed_mirror_active={}",
+            stats.schedule_total,
+            stats.schedule_active,
+            stats.schedule_paused,
+            stats.schedule_cancelled,
+            stats.schedule_timed_mirror_active
+        );
+        println!(
+            "  runs: queued={} running={} succeeded={} failed={} cancelled={}",
+            stats.run_queued,
+            stats.run_running,
+            stats.run_succeeded,
+            stats.run_failed,
+            stats.run_cancelled
+        );
+        println!(
+            "  note: hc-api-only api_* fields (e.g. api_followup_messages_delivered_total) are absent here; slip histogram scheduled_run_dispatch_slip_ms_histogram reflects this process after dispatch / watch."
+        );
+    }
+    Ok(())
 }
 
 fn handle_schedule_add(args: &[String]) -> Result<()> {
@@ -294,8 +547,8 @@ fn handle_schedule_dispatch_due(args: &[String]) -> Result<()> {
         }
     }
 
-    let receipts = dispatch_due_scheduled_runs(now)?;
-    print_schedule_dispatch_receipts(receipts, json)
+    let report = cli_dispatch_due(now)?;
+    print_schedule_dispatch_receipts(report.receipts, json)
 }
 
 fn handle_schedule_watch(args: &[String]) -> Result<()> {
@@ -335,23 +588,28 @@ fn handle_schedule_watch(args: &[String]) -> Result<()> {
     let mut ticks = 0u64;
     loop {
         let now = now_unix();
-        let receipts = dispatch_due_scheduled_runs(now)?;
+        let report = cli_dispatch_due(now)?;
         if json {
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "now_unix": now,
-                    "receipts": receipts,
+                    "now_unix": report.now_unix,
+                    "queued_count": report.queued_count,
+                    "receipts": report.receipts,
                 }))?
             );
-        } else if receipts.is_empty() {
-            println!("schedule> tick now={} no due runs", now);
+        } else if report.receipts.is_empty() {
+            println!("schedule> tick now={} no due runs", report.now_unix);
         } else {
-            println!("schedule> tick now={} dispatched={}", now, receipts.len());
-            for receipt in &receipts {
+            println!(
+                "schedule> tick now={} dispatched={}",
+                report.now_unix,
+                report.receipts.len()
+            );
+            for receipt in &report.receipts {
                 println!("dispatch> {} status={}", receipt.run_id, receipt.status);
             }
-            print_timed_followup_messages(&receipts)?;
+            print_timed_followup_messages(&report.receipts)?;
         }
         ticks += 1;
         if max_ticks.is_some_and(|limit| ticks >= limit) {
@@ -387,13 +645,10 @@ fn print_timed_followup_messages(receipts: &[SchedulerDispatchReceipt]) -> Resul
     Ok(())
 }
 
-fn dispatch_due_scheduled_runs(now: u64) -> Result<Vec<SchedulerDispatchReceipt>> {
-    let mut receipts = Vec::new();
-    super::schedule_repository().queue_due_runs(now)?;
-    for run in super::schedule_repository().queued_runs()? {
-        receipts.push(dispatch_scheduled_run(run, now)?);
-    }
-    Ok(receipts)
+fn cli_dispatch_due(now: u64) -> Result<SchedulerDispatchReport> {
+    let config = ServiceConfig::from_env();
+    let namespace: ApiNamespace = super::runtime_namespace().into();
+    dispatch_due_scheduled_runs(&config, namespace, Some(now))
 }
 
 fn handle_schedule_dispatch_queued(args: &[String]) -> Result<()> {
@@ -418,11 +673,14 @@ fn handle_schedule_dispatch_queued(args: &[String]) -> Result<()> {
         }
     }
 
-    let mut receipts = Vec::new();
-    for run in super::schedule_repository().queued_runs()? {
-        receipts.push(dispatch_scheduled_run(run, now)?);
-    }
-    print_schedule_dispatch_receipts(receipts, json)
+    let report = cli_dispatch_queued(now)?;
+    print_schedule_dispatch_receipts(report.receipts, json)
+}
+
+fn cli_dispatch_queued(now: u64) -> Result<SchedulerDispatchReport> {
+    let config = ServiceConfig::from_env();
+    let namespace: ApiNamespace = super::runtime_namespace().into();
+    dispatch_queued_scheduled_runs(&config, namespace, Some(now))
 }
 
 fn print_schedule_dispatch_receipts(
@@ -448,11 +706,4 @@ fn print_schedule_dispatch_receipts(
         }
     }
     Ok(())
-}
-
-fn dispatch_scheduled_run(run: ScheduledRun, now: u64) -> Result<SchedulerDispatchReceipt> {
-    let config = ServiceConfig::from_env();
-    let namespace = super::runtime_namespace();
-    let repository = super::schedule_repository();
-    hc_service::scheduler::dispatch_scheduled_run(&config, &namespace, &repository, run, now)
 }

@@ -198,6 +198,7 @@ pub fn draft_agent_turn_proposal(
             domain_id: None,
             active_agent_id: Some(proposal.agent_id.clone()),
             active_task_id: None,
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace,
                 scope: None,

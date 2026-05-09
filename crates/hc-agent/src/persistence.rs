@@ -10,22 +10,24 @@ use hc_core::MessageRecord;
 use hc_memory::{MemoryNamespace, MemoryRepository, MemoryVisibility};
 use hc_persona::PersonaRepository;
 use hc_store::{
+    store::{
+        MarkdownIndexEntry, MarkdownQuery, StoredMarkdown, WorkspaceNamespace, WorkspaceStore,
+    },
     task_coordination::{
         assignment_decision_markdown_relative, coordination_segment_slug,
         implicit_intent_journal_relative, materialization_notices_journal_relative,
         routing_binding_journal_relative, task_plan_markdown_relative,
         work_item_assignments_journal_relative, work_item_claims_journal_relative,
     },
-    store::{
-        MarkdownIndexEntry, MarkdownQuery, StoredMarkdown, WorkspaceNamespace, WorkspaceStore,
-    },
 };
 use serde::{Deserialize, Serialize};
 
 use hc_protocol::swarm::{
+    ARTIFACT_SCHEMA_V1, ArtifactHeaderV1, ArtifactKindV1, ExecutionResultArtifactV1,
     IMPLICIT_INTENT_RECORD_SCHEMA_V1, INTENT_HASH_VERSION_V1, ImplicitIntentDedupeKey,
-    ImplicitIntentDedupeRecord, RoutingDecisionRecord, SwarmRoutingBindingSnapshot,
-    TaskBindingDecisionRecord, WorkItemLifecycleState, intent_fingerprint_v1_hex,
+    ImplicitIntentDedupeRecord, PlanNoteArtifactV1, ReviewNoteArtifactV1, RoutingDecisionRecord,
+    RoutingTier, SwarmRoutingBindingSnapshot, TaskBindingDecisionRecord, WorkItemLifecycleState,
+    claim_capability_eligible_for_p0_assign_v1, intent_fingerprint_v1_hex,
 };
 
 use crate::{
@@ -36,7 +38,499 @@ use crate::{
         HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID, TaskPlanStatus, WorkItem, WorkItemAssignment,
         WorkItemClaim,
     },
+    task::{TaskBudget, TaskNamespace},
 };
+
+const HTTP_CHAT_L23_DEGENERATE_CLAIM_REASON: &str =
+    "HTTP L2/L3 degenerate execution (ADR-002 single_llm_route_agent)";
+
+/// Persists an ADR-005 **`execution_result`** as pretty JSON in the task room under
+/// **`task/execution/execution-result.<slug>.json`** (compressed room asset).
+pub fn persist_execution_result_artifact_v1(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task: &TaskRequest,
+    work_item_id: impl AsRef<str>,
+    summary: impl Into<String>,
+    details: Option<String>,
+    producer: impl Into<String>,
+) -> Result<PathBuf> {
+    let work_item_id = work_item_id.as_ref().trim();
+    if work_item_id.is_empty() {
+        anyhow::bail!("work_item_id required for execution_result artifact");
+    }
+    let ms = wall_clock_ms();
+    let id = format!(
+        "execution-result.http.{}.{}",
+        coordination_segment_slug(work_item_id),
+        ms
+    );
+    let artifact = ExecutionResultArtifactV1 {
+        header: ArtifactHeaderV1 {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            work_item_id: Some(work_item_id.to_owned()),
+            artifact_kind: ArtifactKindV1::ExecutionResult,
+            schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+            created_at_ms: ms,
+            producer: producer.into(),
+        },
+        summary: summary.into(),
+        details,
+    };
+    artifact
+        .validate()
+        .map_err(|e| anyhow::anyhow!("execution_result artifact invalid: {e:?}"))?;
+    let json = serde_json::to_string_pretty(&artifact)?;
+    let room_id = task_room_id(task);
+    let file_slug = coordination_segment_slug(&id);
+    persist_room_memory(
+        workspace_root.as_ref().to_path_buf(),
+        namespace.clone(),
+        &RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            hc_memory::MemoryLayer::Task,
+            format!("Execution result | {work_item_id}"),
+            json,
+            hc_memory::MemoryKind::WorkflowMemory,
+        )
+        .with_visibility(MemoryVisibility::Private)
+        .with_owner(hc_memory::MemoryOwnerRef::task(task.id.clone()))
+        .with_tag("task")
+        .with_tag("execution")
+        .with_tag("artifact_schema_v1")
+        .with_derived_from(id.clone())
+        .with_file_name(format!("task/execution/execution-result.{file_slug}.json"))
+        .with_asset_id(format!("asset.{room_id}.execution-result.{file_slug}")),
+    )
+}
+
+/// Persists an ADR-005 **`plan_note`** as pretty JSON under **`task/plan/plan-note.<slug>.json`**.
+pub fn persist_plan_note_artifact_v1(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task: &TaskRequest,
+    work_item_id: Option<&str>,
+    summary: impl Into<String>,
+    details: Option<String>,
+    producer: impl Into<String>,
+) -> Result<PathBuf> {
+    let maybe_work_item_id = work_item_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let id_scope = maybe_work_item_id.as_deref().unwrap_or(task.id.as_str());
+    let ms = wall_clock_ms();
+    let id = format!(
+        "plan-note.http.{}.{}",
+        coordination_segment_slug(id_scope),
+        ms
+    );
+    let artifact = PlanNoteArtifactV1 {
+        header: ArtifactHeaderV1 {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            work_item_id: maybe_work_item_id,
+            artifact_kind: ArtifactKindV1::PlanNote,
+            schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+            created_at_ms: ms,
+            producer: producer.into(),
+        },
+        summary: summary.into(),
+        details,
+    };
+    artifact
+        .validate()
+        .map_err(|e| anyhow::anyhow!("plan_note artifact invalid: {e:?}"))?;
+    let json = serde_json::to_string_pretty(&artifact)?;
+    let room_id = task_room_id(task);
+    let file_slug = coordination_segment_slug(&id);
+    persist_room_memory(
+        workspace_root.as_ref().to_path_buf(),
+        namespace.clone(),
+        &RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            hc_memory::MemoryLayer::Task,
+            format!("Plan note | {}", artifact.header.id),
+            json,
+            hc_memory::MemoryKind::Decision,
+        )
+        .with_visibility(MemoryVisibility::Private)
+        .with_owner(hc_memory::MemoryOwnerRef::task(task.id.clone()))
+        .with_tag("task")
+        .with_tag("plan")
+        .with_tag("artifact_schema_v1")
+        .with_derived_from(id.clone())
+        .with_file_name(format!("task/plan/plan-note.{file_slug}.json"))
+        .with_asset_id(format!("asset.{room_id}.plan-note.{file_slug}")),
+    )
+}
+
+/// Persists an ADR-005 **`review_note`** as pretty JSON under **`task/review/review-note.<slug>.json`**.
+pub fn persist_review_note_artifact_v1(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task: &TaskRequest,
+    work_item_id: impl AsRef<str>,
+    summary: impl Into<String>,
+    verdict: Option<String>,
+    details: Option<String>,
+    producer: impl Into<String>,
+) -> Result<PathBuf> {
+    let work_item_id = work_item_id.as_ref().trim();
+    if work_item_id.is_empty() {
+        anyhow::bail!("work_item_id required for review_note artifact");
+    }
+    let ms = wall_clock_ms();
+    let id = format!(
+        "review-note.http.{}.{}",
+        coordination_segment_slug(work_item_id),
+        ms
+    );
+    let artifact = ReviewNoteArtifactV1 {
+        header: ArtifactHeaderV1 {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            work_item_id: Some(work_item_id.to_owned()),
+            artifact_kind: ArtifactKindV1::ReviewNote,
+            schema_version: ARTIFACT_SCHEMA_V1.to_owned(),
+            created_at_ms: ms,
+            producer: producer.into(),
+        },
+        summary: summary.into(),
+        verdict,
+        details,
+    };
+    artifact
+        .validate()
+        .map_err(|e| anyhow::anyhow!("review_note artifact invalid: {e:?}"))?;
+    let json = serde_json::to_string_pretty(&artifact)?;
+    let room_id = task_room_id(task);
+    let file_slug = coordination_segment_slug(&id);
+    persist_room_memory(
+        workspace_root.as_ref().to_path_buf(),
+        namespace.clone(),
+        &RoomMemoryWriteRequest::new(
+            room_id.clone(),
+            hc_memory::MemoryLayer::Task,
+            format!("Review note | {work_item_id}"),
+            json,
+            hc_memory::MemoryKind::Decision,
+        )
+        .with_visibility(MemoryVisibility::Private)
+        .with_owner(hc_memory::MemoryOwnerRef::task(task.id.clone()))
+        .with_tag("task")
+        .with_tag("review")
+        .with_tag("artifact_schema_v1")
+        .with_derived_from(id.clone())
+        .with_file_name(format!("task/review/review-note.{file_slug}.json"))
+        .with_asset_id(format!("asset.{room_id}.review-note.{file_slug}")),
+    )
+}
+
+const HTTP_L23_EXECUTION_DIGEST_MAX_ITEMS: usize = 16;
+const HTTP_L23_EXECUTION_DIGEST_MAX_CHARS: usize = 8_000;
+const HTTP_L23_PLAN_DIGEST_MAX_ITEMS: usize = 16;
+const HTTP_L23_PLAN_DIGEST_MAX_CHARS: usize = 4_000;
+const HTTP_L23_REVIEW_DIGEST_MAX_ITEMS: usize = 16;
+const HTTP_L23_REVIEW_DIGEST_MAX_CHARS: usize = 4_000;
+pub const HTTP_L23_EXECUTION_DIGEST_HEADING: &str = "## Recent execution results (ADR-005)";
+const HTTP_L23_EXECUTION_DIGEST_INTRO: &str = "Read-only summaries from task room `task/execution/*.json`. Use for a coherent planner-facing reply.";
+pub const HTTP_L23_PLAN_DIGEST_HEADING: &str = "## Recent planning notes (ADR-005)";
+const HTTP_L23_PLAN_DIGEST_INTRO: &str = "Read-only summaries from task room `task/plan/*.json`.";
+pub const HTTP_L23_REVIEW_DIGEST_HEADING: &str = "## Recent review notes (ADR-005)";
+const HTTP_L23_REVIEW_DIGEST_INTRO: &str =
+    "Read-only summaries from task room `task/review/*.json`.";
+
+fn render_http_l23_digest(
+    heading: &str,
+    intro: &str,
+    chunks: impl IntoIterator<Item = String>,
+    max_chars: usize,
+    total_records: usize,
+    artifact_kind_label: &str,
+) -> String {
+    let mut parts: Vec<String> = vec![
+        String::new(),
+        "---".to_owned(),
+        heading.to_owned(),
+        intro.to_owned(),
+        String::new(),
+    ];
+    let mut total = parts.join("\n").len();
+    let mut added = 0usize;
+    let mut truncated = false;
+    for chunk in chunks {
+        if total + chunk.len() > max_chars {
+            parts.push(format!(
+                "\n[... truncated; {total_records} {artifact_kind_label} record(s) on disk ...]"
+            ));
+            truncated = true;
+            break;
+        }
+        let chunk_len = chunk.len();
+        parts.push(chunk);
+        total += chunk_len + 1;
+        added += 1;
+    }
+    if added == 0 && !truncated {
+        return String::new();
+    }
+    format!("{}\n", parts.join("\n"))
+}
+
+/// Loads validated **`plan_note`** JSON from `memory/.../compressed/task/plan/` (newest first).
+pub fn load_task_plan_note_artifacts_v1(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task_id: impl AsRef<str>,
+) -> Result<Vec<PlanNoteArtifactV1>> {
+    let tid = task_id.as_ref().trim();
+    if tid.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = WorkspaceStore::new(workspace_root.as_ref().to_path_buf());
+    let room = hc_memory::MemoryRoom::new(
+        format!("room.task.{tid}"),
+        hc_memory::MemoryLayer::Task,
+        "task",
+        "",
+    );
+    let rel_dir = hc_memory::MemoryRoomRepository::room_root_relative_path(&room)
+        .join("compressed/task/plan");
+    let abs = store.resolve_in_namespace(namespace, &rel_dir);
+    if !abs.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&abs).with_context(|| format!("read_dir {}", abs.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        match serde_json::from_str::<PlanNoteArtifactV1>(&raw) {
+            Ok(artifact) => {
+                if artifact.validate().is_ok() {
+                    out.push(artifact);
+                } else {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skip plan_note JSON: validate failed"
+                    );
+                }
+            }
+            Err(error) => tracing::debug!(
+                path = %path.display(),
+                ?error,
+                "skip file: not PlanNoteArtifactV1 JSON"
+            ),
+        }
+    }
+    out.sort_by_key(|artifact| std::cmp::Reverse(artifact.header.created_at_ms));
+    Ok(out)
+}
+
+/// Loads validated **`execution_result`** JSON files from the task room
+/// `memory/.../compressed/task/execution/` (newest [`ExecutionResultArtifactV1::header.created_at_ms`] first).
+pub fn load_task_execution_result_artifacts_v1(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task_id: impl AsRef<str>,
+) -> Result<Vec<ExecutionResultArtifactV1>> {
+    let tid = task_id.as_ref().trim();
+    if tid.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = WorkspaceStore::new(workspace_root.as_ref().to_path_buf());
+    let room = hc_memory::MemoryRoom::new(
+        format!("room.task.{tid}"),
+        hc_memory::MemoryLayer::Task,
+        "task",
+        "",
+    );
+    let rel_dir = hc_memory::MemoryRoomRepository::room_root_relative_path(&room)
+        .join("compressed/task/execution");
+    let abs = store.resolve_in_namespace(namespace, &rel_dir);
+    if !abs.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&abs).with_context(|| format!("read_dir {}", abs.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        match serde_json::from_str::<ExecutionResultArtifactV1>(&raw) {
+            Ok(artifact) => {
+                if artifact.validate().is_ok() {
+                    out.push(artifact);
+                } else {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skip execution_result JSON: validate failed"
+                    );
+                }
+            }
+            Err(error) => tracing::debug!(
+                path = %path.display(),
+                ?error,
+                "skip file: not ExecutionResultArtifactV1 JSON"
+            ),
+        }
+    }
+    out.sort_by_key(|artifact| std::cmp::Reverse(artifact.header.created_at_ms));
+    Ok(out)
+}
+
+/// Loads validated **`review_note`** JSON from `memory/.../compressed/task/review/` (newest first).
+pub fn load_task_review_note_artifacts_v1(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task_id: impl AsRef<str>,
+) -> Result<Vec<ReviewNoteArtifactV1>> {
+    let tid = task_id.as_ref().trim();
+    if tid.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = WorkspaceStore::new(workspace_root.as_ref().to_path_buf());
+    let room = hc_memory::MemoryRoom::new(
+        format!("room.task.{tid}"),
+        hc_memory::MemoryLayer::Task,
+        "task",
+        "",
+    );
+    let rel_dir = hc_memory::MemoryRoomRepository::room_root_relative_path(&room)
+        .join("compressed/task/review");
+    let abs = store.resolve_in_namespace(namespace, &rel_dir);
+    if !abs.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&abs).with_context(|| format!("read_dir {}", abs.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        match serde_json::from_str::<ReviewNoteArtifactV1>(&raw) {
+            Ok(artifact) => {
+                if artifact.validate().is_ok() {
+                    out.push(artifact);
+                } else {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skip review_note JSON: validate failed"
+                    );
+                }
+            }
+            Err(error) => tracing::debug!(
+                path = %path.display(),
+                ?error,
+                "skip file: not ReviewNoteArtifactV1 JSON"
+            ),
+        }
+    }
+    out.sort_by_key(|artifact| std::cmp::Reverse(artifact.header.created_at_ms));
+    Ok(out)
+}
+
+/// Markdown-ish digest for HTTP L2/L3 system prompt (ADR-005 outward speaker context).
+#[must_use]
+pub fn format_execution_results_digest_for_http_l23(
+    artifacts: &[ExecutionResultArtifactV1],
+) -> String {
+    if artifacts.is_empty() {
+        return String::new();
+    }
+    let chunks = artifacts
+        .iter()
+        .take(HTTP_L23_EXECUTION_DIGEST_MAX_ITEMS)
+        .map(|artifact| {
+            let wi = artifact.header.work_item_id.as_deref().unwrap_or("?");
+            format!(
+                "- `{}` | work_item `{}` | producer `{}`\n  {}",
+                artifact.header.id, wi, artifact.header.producer, artifact.summary
+            )
+        });
+    render_http_l23_digest(
+        HTTP_L23_EXECUTION_DIGEST_HEADING,
+        HTTP_L23_EXECUTION_DIGEST_INTRO,
+        chunks,
+        HTTP_L23_EXECUTION_DIGEST_MAX_CHARS,
+        artifacts.len(),
+        "execution_result",
+    )
+}
+
+/// Markdown digest for **`plan_note`** artifacts (`task/plan/*.json`).
+#[must_use]
+pub fn format_plan_notes_digest_for_http_l23(artifacts: &[PlanNoteArtifactV1]) -> String {
+    if artifacts.is_empty() {
+        return String::new();
+    }
+    let chunks = artifacts
+        .iter()
+        .take(HTTP_L23_PLAN_DIGEST_MAX_ITEMS)
+        .map(|artifact| {
+            let wi = artifact
+                .header
+                .work_item_id
+                .as_deref()
+                .map(|value| format!(" | work_item `{value}`"))
+                .unwrap_or_default();
+            format!(
+                "- `{}`{wi} | producer `{}`\n  {}",
+                artifact.header.id, artifact.header.producer, artifact.summary
+            )
+        });
+    render_http_l23_digest(
+        HTTP_L23_PLAN_DIGEST_HEADING,
+        HTTP_L23_PLAN_DIGEST_INTRO,
+        chunks,
+        HTTP_L23_PLAN_DIGEST_MAX_CHARS,
+        artifacts.len(),
+        "plan_note",
+    )
+}
+
+/// Markdown digest for **`review_note`** artifacts (`task/review/*.json`).
+#[must_use]
+pub fn format_review_notes_digest_for_http_l23(artifacts: &[ReviewNoteArtifactV1]) -> String {
+    if artifacts.is_empty() {
+        return String::new();
+    }
+    let chunks = artifacts
+        .iter()
+        .take(HTTP_L23_REVIEW_DIGEST_MAX_ITEMS)
+        .map(|artifact| {
+            let wi = artifact.header.work_item_id.as_deref().unwrap_or("?");
+            let verdict = artifact
+                .verdict
+                .as_deref()
+                .map(|v| format!(" | verdict `{v}`"))
+                .unwrap_or_default();
+            format!(
+                "- `{}` | work_item `{}` | producer `{}`{verdict}\n  {}",
+                artifact.header.id, wi, artifact.header.producer, artifact.summary
+            )
+        });
+    render_http_l23_digest(
+        HTTP_L23_REVIEW_DIGEST_HEADING,
+        HTTP_L23_REVIEW_DIGEST_INTRO,
+        chunks,
+        HTTP_L23_REVIEW_DIGEST_MAX_CHARS,
+        artifacts.len(),
+        "review_note",
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedAgentAssets {
@@ -411,7 +905,8 @@ fn read_work_item_assignments_journal_last_by_id(
     task_id: &str,
 ) -> Result<BTreeMap<String, WorkItemAssignment>> {
     let store = WorkspaceStore::new(workspace_root.as_ref().to_path_buf());
-    let path = store.resolve_in_namespace(namespace, work_item_assignments_journal_relative(task_id));
+    let path =
+        store.resolve_in_namespace(namespace, work_item_assignments_journal_relative(task_id));
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -446,16 +941,10 @@ pub fn hydrate_task_plan_work_item_coordination_journals(
     task_id: &str,
     plan: &mut TaskPlan,
 ) -> Result<()> {
-    let journal_claims = read_work_item_claims_journal_last_by_id(
-        workspace_root.as_ref(),
-        namespace,
-        task_id,
-    )?;
-    let journal_assignments = read_work_item_assignments_journal_last_by_id(
-        workspace_root.as_ref(),
-        namespace,
-        task_id,
-    )?;
+    let journal_claims =
+        read_work_item_claims_journal_last_by_id(workspace_root.as_ref(), namespace, task_id)?;
+    let journal_assignments =
+        read_work_item_assignments_journal_last_by_id(workspace_root.as_ref(), namespace, task_id)?;
 
     let mut merged_claims: BTreeMap<String, WorkItemClaim> = plan
         .work_item_claims
@@ -466,7 +955,8 @@ pub fn hydrate_task_plan_work_item_coordination_journals(
         merged_claims.insert(id, claim);
     }
     plan.work_item_claims = merged_claims.into_values().collect();
-    plan.work_item_claims.sort_by(|left, right| left.id.cmp(&right.id));
+    plan.work_item_claims
+        .sort_by(|left, right| left.id.cmp(&right.id));
 
     let mut merged_assignments: BTreeMap<String, WorkItemAssignment> = plan
         .work_item_assignments
@@ -477,9 +967,581 @@ pub fn hydrate_task_plan_work_item_coordination_journals(
         merged_assignments.insert(id, assignment);
     }
     plan.work_item_assignments = merged_assignments.into_values().collect();
-    plan.work_item_assignments.sort_by(|left, right| left.id.cmp(&right.id));
+    plan.work_item_assignments
+        .sort_by(|left, right| left.id.cmp(&right.id));
 
     Ok(())
+}
+
+fn strip_task_md_kv_line<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = line.trim();
+    let prefix = format!("- {key}: ");
+    line.strip_prefix(&prefix).map(str::trim)
+}
+
+fn first_task_md_kv<'a>(header: &'a str, key: &str) -> Option<&'a str> {
+    header
+        .lines()
+        .find_map(|line| strip_task_md_kv_line(line, key))
+}
+
+fn task_plan_md_section<'a>(body: &'a str, heading_no_hash: &'a str) -> Option<&'a str> {
+    let marker = format!("# {heading_no_hash}\n\n");
+    let start = body.find(&marker)? + marker.len();
+    let rest = &body[start..];
+    if let Some(ix) = rest.find("\n\n# ") {
+        Some(rest[..ix].trim_end_matches('\n'))
+    } else {
+        Some(rest.trim_end_matches('\n'))
+    }
+}
+
+fn parse_task_budget_parts(line: &str) -> Option<TaskBudget> {
+    let trimmed = strip_task_md_kv_line(line, "budget")?;
+
+    let (tokens_rest, after_tokens) = trimmed.split_once("tokens /")?;
+    let token_budget: u32 = tokens_rest.trim().parse().ok()?;
+
+    let (minutes_chunk, reserve_chunk) = if let Some(pair) = after_tokens.split_once("minutes /") {
+        (pair.0.trim(), pair.1.trim())
+    } else {
+        (after_tokens.trim(), "0")
+    };
+
+    let time_budget_minutes: u32 = minutes_chunk
+        .strip_suffix("minutes")
+        .unwrap_or(minutes_chunk)
+        .trim()
+        .parse()
+        .ok()?;
+
+    let reserve_raw = reserve_chunk
+        .strip_suffix("evolution reserve")
+        .unwrap_or(reserve_chunk)
+        .trim();
+    let evolution_reserve_tokens: u32 = reserve_raw.parse().unwrap_or(0);
+
+    Some(TaskBudget {
+        token_budget,
+        time_budget_minutes,
+        evolution_reserve_tokens,
+    })
+}
+
+fn parse_planning_notes_block(section: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in section.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("- ") else {
+            continue;
+        };
+        if rest == "none" {
+            continue;
+        }
+        out.push(rest.to_owned());
+    }
+    out
+}
+
+fn parse_work_item_header_line_first(line_trim: &str) -> Option<WorkItemHeaderParts<'_>> {
+    let item_line = line_trim.strip_prefix('-')?.trim_start();
+    let parts: Vec<&str> = item_line.split(" | ").collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let id = parts[0].trim();
+    let stage = parts[1].strip_prefix("stage=")?.trim();
+    let lifecycle = parts[2].strip_prefix("lifecycle=")?.trim();
+    let title = parts[3].trim();
+    let tokens = parts[4]
+        .strip_suffix("tokens")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let minutes = parts[5]
+        .strip_suffix("minutes")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    Some(WorkItemHeaderParts {
+        id,
+        stage,
+        lifecycle,
+        title,
+        estimated_token_cost: tokens,
+        estimated_time_minutes: minutes,
+    })
+}
+
+struct WorkItemHeaderParts<'a> {
+    id: &'a str,
+    stage: &'a str,
+    lifecycle: &'a str,
+    title: &'a str,
+    estimated_token_cost: u32,
+    estimated_time_minutes: u32,
+}
+
+fn lifecycle_state_from_coordination_token(raw: &str) -> Option<WorkItemLifecycleState> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "planned" => Some(WorkItemLifecycleState::Planned),
+        "claiming" => Some(WorkItemLifecycleState::Claiming),
+        "assigned" => Some(WorkItemLifecycleState::Assigned),
+        "blocked" => Some(WorkItemLifecycleState::Blocked),
+        "done" => Some(WorkItemLifecycleState::Done),
+        "cancelled" => Some(WorkItemLifecycleState::Cancelled),
+        _ => None,
+    }
+}
+
+fn parse_work_items_coordination_block(section: &str) -> Result<Vec<WorkItem>> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = section.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line_trim = lines[i].trim();
+        if line_trim.is_empty() || line_trim == "- none" {
+            i += 1;
+            continue;
+        }
+        let Some(hdr) = parse_work_item_header_line_first(line_trim) else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        let mut goal = String::new();
+        if i < lines.len() {
+            let gl = lines[i].trim();
+            if let Some(g) = gl.strip_prefix("goal:") {
+                goal = g.trim().to_owned();
+                i += 1;
+            }
+        }
+        let lifecycle =
+            lifecycle_state_from_coordination_token(hdr.lifecycle).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown work item lifecycle in task_plan.md: {:?}",
+                    hdr.lifecycle
+                )
+            })?;
+
+        out.push(WorkItem {
+            id: hdr.id.to_owned(),
+            title: hdr.title.to_owned(),
+            goal,
+            stage: hdr.stage.to_owned(),
+            lifecycle,
+            estimated_token_cost: hdr.estimated_token_cost,
+            estimated_time_minutes: hdr.estimated_time_minutes,
+        });
+    }
+
+    Ok(out)
+}
+
+fn task_plan_status_from_frontmatter(raw: &str) -> TaskPlanStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "approved" => TaskPlanStatus::Approved,
+        "drafted" => TaskPlanStatus::Drafted,
+        _ => TaskPlanStatus::AwaitingPlannerInput,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTaskPlanBodySkeleton {
+    task_id_in_body: String,
+    title: String,
+    goal: String,
+    budget: TaskBudget,
+    planning_notes: Vec<String>,
+    work_items: Vec<WorkItem>,
+}
+
+fn parse_coordination_skeleton_from_task_plan_body(
+    raw: &str,
+) -> Result<ParsedTaskPlanBodySkeleton> {
+    let body = raw.trim_start().replace("\r\n", "\n").replace('\r', "\n");
+    let header =
+        task_plan_md_section(body.as_str(), "Task").with_context(|| "missing # Task header")?;
+
+    let task_id_in_body = first_task_md_kv(header, "id")
+        .map(|value| value.to_owned())
+        .unwrap_or_default();
+    let title = first_task_md_kv(header, "title")
+        .map(|value| value.to_owned())
+        .unwrap_or_default();
+    let goal = first_task_md_kv(header, "goal")
+        .map(|value| value.to_owned())
+        .unwrap_or_default();
+
+    let mut budget_line: Option<TaskBudget> = None;
+    for line in header.lines() {
+        let t = line.trim();
+        if t.starts_with("- budget:") {
+            budget_line = parse_task_budget_parts(t);
+            break;
+        }
+    }
+
+    let planning_notes_block = task_plan_md_section(body.as_str(), "Planning Notes")
+        .unwrap_or("")
+        .to_owned();
+    let planning_notes = parse_planning_notes_block(if planning_notes_block.is_empty() {
+        "- none\n"
+    } else {
+        &planning_notes_block
+    });
+
+    let work_section = task_plan_md_section(body.as_str(), "Work Items")
+        .with_context(|| "missing # Work Items header")?;
+    let work_items = parse_work_items_coordination_block(work_section)?;
+
+    Ok(ParsedTaskPlanBodySkeleton {
+        task_id_in_body,
+        title,
+        goal,
+        budget: budget_line.unwrap_or_default(),
+        planning_notes,
+        work_items,
+    })
+}
+
+fn first_planner_work_item_id_for_http_degenerate(plan: &TaskPlan) -> Option<String> {
+    plan.work_items.iter().find_map(|wi| {
+        if wi.id == HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID || wi.lifecycle.is_terminal() {
+            return None;
+        }
+        Some(wi.id.clone())
+    })
+}
+
+fn count_open_planner_work_items_for_http_excerpt(plan: &TaskPlan) -> usize {
+    plan.work_items
+        .iter()
+        .filter(|wi| wi.id != HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID && !wi.lifecycle.is_terminal())
+        .count()
+}
+
+fn append_claim_journals_for_work_item(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task_id: &str,
+    plan: &TaskPlan,
+    work_item_id: &str,
+) -> Result<()> {
+    let root = workspace_root.as_ref();
+    for claim in plan
+        .work_item_claims
+        .iter()
+        .filter(|row| row.work_item_id == work_item_id)
+    {
+        append_work_item_claim_journal_line(root, namespace, task_id, claim)?;
+    }
+    Ok(())
+}
+
+/// Hydrates **`TaskPlan` / `TaskRequest`** from persisted **`coordination/*/task_plan.md`** body slices
+/// created by [`render_task_plan_body`], then overlays claim / assignment replay journals.
+///
+/// Returns [`None`] when the artifact is unreadable / not `task_plan` / body parse fails /
+/// **`task_id` disagrees with the document body id**.
+#[must_use]
+pub fn load_task_coordination_bundle_for_journal_updates(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    task_id: &str,
+) -> Result<Option<(TaskRequest, TaskPlan)>> {
+    let workspace_root_path = workspace_root.as_ref().to_path_buf();
+    let store = WorkspaceStore::new(workspace_root_path.clone());
+    let rel = task_plan_markdown_relative(task_id);
+    let stored: StoredMarkdown<TaskArtifactFrontmatter> =
+        match store.read_markdown_in_namespace(namespace, &rel) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+    let Some(TaskArtifactKind::TaskPlan) =
+        TaskArtifactKind::from_doc_type(&stored.frontmatter.doc_type)
+    else {
+        return Ok(None);
+    };
+
+    let skeleton = match parse_coordination_skeleton_from_task_plan_body(&stored.body) {
+        Ok(s) => s,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                task_id = %task_id,
+                "parse task_plan.md skeleton for coordination reload"
+            );
+            return Ok(None);
+        }
+    };
+    if skeleton.task_id_in_body.trim() != task_id.trim() {
+        tracing::warn!(
+            persisted_id = %skeleton.task_id_in_body.trim(),
+            expected_id = %task_id.trim(),
+            "skip task_coordination reload: persisted task_plan body id mismatches coordination key"
+        );
+        return Ok(None);
+    }
+
+    let task_ns = TaskNamespace::new(
+        stored.frontmatter.tenant_id.trim(),
+        stored.frontmatter.user_id.trim(),
+    );
+    let mut task = TaskRequest::new(
+        skeleton.task_id_in_body.trim(),
+        skeleton.title,
+        skeleton.goal,
+    )
+    .with_namespace(task_ns)
+    .with_budget(skeleton.budget.clone());
+
+    if task.namespace.tenant_id.is_empty()
+        || task.namespace.user_id.is_empty()
+        || task.namespace.tenant_id.trim() != namespace.tenant_id
+        || task.namespace.user_id.trim() != namespace.user_id
+    {
+        task.namespace.tenant_id = namespace.tenant_id.clone();
+        task.namespace.user_id = namespace.user_id.clone();
+    }
+
+    let mut base = TaskPlan::awaiting_planner_input(&task);
+    base.status = task_plan_status_from_frontmatter(&stored.frontmatter.status);
+    base.planning_notes = skeleton.planning_notes;
+    base.work_items = skeleton.work_items;
+    hydrate_task_plan_work_item_coordination_journals(
+        &workspace_root_path,
+        namespace,
+        task_id,
+        &mut base,
+    )?;
+
+    Ok(Some((task, base)))
+}
+
+/// Persist claim → deterministic assign; when **exactly one** non-terminal planner work item exists
+/// (excluding the HTTP implicit holder), or when **`active_work_item_hint`** names a valid open row,
+/// also **synthetic executing + [`TaskPlan::mark_assigned_work_item_done`]** in the same HTTP round
+/// (ADR-003 `single_llm_route_agent` degeneracy).
+///
+/// No-op (`Ok(false)`) unless routing tier is L2/L3, the target work item exists (skips
+/// [`HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID`]), and the selected agent id is non-empty.
+/// An unknown or terminal **hint** id also yields `Ok(false)` (see `tracing::debug`).
+///
+/// Failures are returned as [`Err`]; HTTP callers should **warn** and continue.
+pub fn persist_http_chat_l23_degenerate_claim_assign(
+    workspace_root: impl AsRef<Path>,
+    namespace: &WorkspaceNamespace,
+    routing_tier: RoutingTier,
+    task_id: &str,
+    selected_agent_instance_id: &str,
+    selected_agent_display_name: &str,
+    active_work_item_hint: Option<&str>,
+) -> Result<bool> {
+    if !matches!(routing_tier, RoutingTier::L2 | RoutingTier::L3) {
+        return Ok(false);
+    }
+    if selected_agent_instance_id.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let Some((task, mut plan)) =
+        load_task_coordination_bundle_for_journal_updates(&workspace_root, namespace, task_id)?
+    else {
+        return Ok(false);
+    };
+
+    let trimmed_hint = active_work_item_hint
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    let (target_wi, explicit_work_item_scope) = if let Some(hint_id) = trimmed_hint {
+        let Some(wi) = plan.work_items.iter().find(|w| w.id == hint_id) else {
+            tracing::debug!(
+                hint_id = %hint_id,
+                task_id = %task.id,
+                "HTTP degenerate: active_work_item_hint not found on hydrated task plan"
+            );
+            return Ok(false);
+        };
+        if wi.id == HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID || wi.lifecycle.is_terminal() {
+            tracing::debug!(
+                hint_id = %hint_id,
+                lifecycle = %wi.lifecycle,
+                "HTTP degenerate: hinted work item is holder or terminal"
+            );
+            return Ok(false);
+        }
+        (wi.id.clone(), true)
+    } else {
+        let Some(first) = first_planner_work_item_id_for_http_degenerate(&plan) else {
+            return Ok(false);
+        };
+        (first, false)
+    };
+
+    let open_non_terminal_planner_items = count_open_planner_work_items_for_http_excerpt(&plan);
+    debug_assert!(
+        open_non_terminal_planner_items >= 1,
+        "target planner WI implies at least one open planner item"
+    );
+    let lone_open_planner_item = explicit_work_item_scope || open_non_terminal_planner_items <= 1;
+
+    let has_active_assignment = plan.work_item_assignments.iter().any(|assignment| {
+        assignment.work_item_id == target_wi
+            && matches!(assignment.status.as_str(), "assigned" | "executing")
+    });
+    if has_active_assignment {
+        return Ok(false);
+    }
+
+    let has_eligible_submitted = plan.work_item_claims.iter().any(|claim| {
+        claim.work_item_id == target_wi
+            && claim.status == "submitted"
+            && claim_capability_eligible_for_p0_assign_v1(claim.score)
+    });
+
+    if !has_eligible_submitted {
+        let display = if selected_agent_display_name.trim().is_empty() {
+            selected_agent_instance_id.to_owned()
+        } else {
+            selected_agent_display_name.to_owned()
+        };
+        let claim_id = plan.add_work_item_claim(
+            target_wi.clone(),
+            selected_agent_instance_id.trim().to_owned(),
+            display.trim().to_owned(),
+            1.0,
+            HTTP_CHAT_L23_DEGENERATE_CLAIM_REASON.to_owned(),
+        );
+
+        append_work_item_claim_journal_line(
+            workspace_root.as_ref(),
+            namespace,
+            &task.id,
+            plan.work_item_claims
+                .iter()
+                .find(|c| c.id == claim_id)
+                .context("persisted degenerate HTTP claim journal row lookup")?,
+        )?;
+    }
+
+    let assignment_id = match plan.resolve_work_item_assignment(&target_wi) {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+
+    append_claim_journals_for_work_item(&workspace_root, namespace, &task.id, &plan, &target_wi)?;
+
+    append_work_item_assignment_journal_line(
+        workspace_root.as_ref(),
+        namespace,
+        &task.id,
+        plan.work_item_assignments
+            .iter()
+            .find(|row| row.id == assignment_id)
+            .context("assignment row lookup after resolve")?,
+    )?;
+
+    if !lone_open_planner_item {
+        tracing::debug!(
+            task_id = %task.id,
+            work_item_id = %target_wi,
+            open_planner_work_items = open_non_terminal_planner_items,
+            "HTTP chat L2/L3: ambiguous multi-open work items; persisted assign-only (no synthetic MarkDone)"
+        );
+        persist_task_artifacts(workspace_root.as_ref(), &task, &plan)?;
+        return Ok(true);
+    }
+
+    plan.start_work_item_execution(&target_wi)
+        .with_context(|| {
+            format!("http L2/L3 degenerate: start executing after assignment {assignment_id}")
+        })?;
+    append_work_item_assignment_journal_line(
+        workspace_root.as_ref(),
+        namespace,
+        &task.id,
+        plan.work_item_assignments
+            .iter()
+            .find(|row| row.id == assignment_id)
+            .context("assignment journal after synthetic execution start")?,
+    )?;
+
+    if !plan.mark_assigned_work_item_done(&target_wi) {
+        return Err(anyhow::anyhow!(
+            "http L2/L3 degenerate: MarkDone failed for assigned work item {target_wi} after synthetic execution"
+        ));
+    }
+
+    append_work_item_assignment_journal_line(
+        workspace_root.as_ref(),
+        namespace,
+        &task.id,
+        plan.work_item_assignments
+            .iter()
+            .find(|row| row.id == assignment_id)
+            .context("assignment journal after MarkDone (completed)")?,
+    )?;
+
+    if let Err(error) = persist_execution_result_artifact_v1(
+        workspace_root.as_ref(),
+        namespace,
+        &task,
+        &target_wi,
+        format!(
+            "HTTP L2/L3 degenerate path: work item completed after synthetic assign/execute (agent {}).",
+            selected_agent_display_name.trim()
+        ),
+        Some(format!(
+            "assignment_id={assignment_id}; degenerate_claim_reason={}; selected_agent_instance_id={}",
+            HTTP_CHAT_L23_DEGENERATE_CLAIM_REASON,
+            selected_agent_instance_id.trim()
+        )),
+        format!("http_chat:agent:{}", selected_agent_instance_id.trim()),
+    ) {
+        tracing::warn!(
+            ?error,
+            task_id = %task.id,
+            work_item_id = %target_wi,
+            "persist ADR-005 execution_result artifact (non-fatal)"
+        );
+    }
+    if let Err(error) = persist_review_note_artifact_v1(
+        workspace_root.as_ref(),
+        namespace,
+        &task,
+        &target_wi,
+        format!(
+            "HTTP L2/L3 degenerate path: synthetic completion recorded for reviewer trace (agent {}).",
+            selected_agent_display_name.trim()
+        ),
+        Some("synthetic_complete".to_owned()),
+        Some(format!(
+            "assignment_id={assignment_id}; degenerate_claim_reason={}; selected_agent_instance_id={}",
+            HTTP_CHAT_L23_DEGENERATE_CLAIM_REASON,
+            selected_agent_instance_id.trim()
+        )),
+        format!("http_chat:agent:{}", selected_agent_instance_id.trim()),
+    ) {
+        tracing::warn!(
+            ?error,
+            task_id = %task.id,
+            work_item_id = %target_wi,
+            "persist ADR-005 review_note artifact (non-fatal)"
+        );
+    }
+
+    persist_task_artifacts(workspace_root.as_ref(), &task, &plan)?;
+
+    tracing::debug!(
+        task_id = %task.id,
+        work_item_id = %target_wi,
+        assignment_id = %assignment_id,
+        "HTTP chat L2/L3: persisted degenerate claim→execute→done replay"
+    );
+
+    Ok(true)
 }
 
 pub fn persist_materialized_agents(
@@ -767,8 +1829,7 @@ pub fn query_task_artifacts(
         .into_iter()
         .filter(|entry| {
             let p = entry.relative_path.as_str();
-            p.starts_with("decisions/")
-                || (p.starts_with("coordination/") && p.ends_with(".md"))
+            p.starts_with("decisions/") || (p.starts_with("coordination/") && p.ends_with(".md"))
         })
         .filter_map(task_artifact_summary_from_index_entry)
         .collect())

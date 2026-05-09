@@ -3,8 +3,12 @@ use hc_agent::{
     AgentKind, AgentProfile, AgentRepository, DomainKind, DomainProfile, DomainRepository,
     append_implicit_intent_dedupe_record, append_routing_binding_log_line,
     build_routing_binding_log_line_v1_headless_from_snapshot, ensure_http_implicit_task_plan_stub,
-    load_implicit_intent_dedupe_keys, read_task_artifact,
-    swarm_routing,
+    format_execution_results_digest_for_http_l23, format_plan_notes_digest_for_http_l23,
+    format_review_notes_digest_for_http_l23, http_l2l3_planner_steering_enabled_from_env,
+    load_implicit_intent_dedupe_keys, load_task_execution_result_artifacts_v1,
+    load_task_plan_note_artifacts_v1, load_task_review_note_artifacts_v1,
+    maybe_apply_http_l2l3_planner_steering, persist_http_chat_l23_degenerate_claim_assign,
+    read_task_artifact, swarm_routing,
 };
 use hc_bootstrap::wall_clock_ms;
 use hc_context::{
@@ -23,14 +27,11 @@ use hc_protocol::{
     AgentRouteRequest, ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest,
     ChatResponse, MemoryRef,
     swarm::{
-        ImplicitIntentDedupeKey, ImplicitIntentDedupeRecord, RoutingTier, SwarmRoutingBindingSnapshot,
-        TaskBindingAction,
+        ImplicitIntentDedupeKey, ImplicitIntentDedupeRecord, RoutingTier,
+        SwarmRoutingBindingSnapshot, TaskBindingAction,
     },
 };
-use hc_store::{
-    store::WorkspaceNamespace,
-    task_coordination::task_plan_markdown_relative,
-};
+use hc_store::{store::WorkspaceNamespace, task_coordination::task_plan_markdown_relative};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -134,6 +135,17 @@ fn execute_handle_chat_generate(
     let response =
         generate_with_context(&registry, &retriever, &composer, &prepared.context_request)?;
 
+    if let Err(error) = maybe_persist_http_chat_l23_degenerate_claim_assign(
+        config,
+        &prepared,
+        room_routing_cache.as_ref(),
+    ) {
+        tracing::warn!(
+            ?error,
+            "HTTP chat: optional L2/L3 degenerate claim→assign coordination persist"
+        );
+    }
+
     Ok(chat_response_from_context_response(
         response,
         &prepared.request,
@@ -171,6 +183,7 @@ pub fn resolve_chat_agent_selection(
             domain_id: request.domain_id.clone(),
             active_agent_id: request.active_agent_id.clone(),
             active_task_id: request.active_task_id.clone(),
+            active_work_item_id: request.active_work_item_id.clone(),
             limit: Some(1),
         },
     )?;
@@ -291,6 +304,17 @@ fn execute_handle_chat_stream(
         prepared.agent_context.as_ref(),
         prepared.binding_active_task_id.clone(),
     );
+    if let Err(error) = maybe_persist_http_chat_l23_degenerate_claim_assign(
+        config,
+        &prepared,
+        room_routing_cache.as_ref(),
+    ) {
+        tracing::warn!(
+            ?error,
+            "HTTP chat stream: optional L2/L3 degenerate claim→assign coordination persist"
+        );
+    }
+
     on_event(ChatStreamEvent::Completed {
         response: response.clone(),
     })?;
@@ -304,6 +328,59 @@ pub(crate) struct PreparedChatRequest {
     agent_context: Option<ResolvedAgentContext>,
     context_request: ContextRequest,
     binding_active_task_id: Option<String>,
+}
+
+fn maybe_persist_http_chat_l23_degenerate_claim_assign(
+    config: &ServiceConfig,
+    prepared: &PreparedChatRequest,
+    room_routing_cache: Option<&RoomRoutingContext>,
+) -> Result<()> {
+    let Ok(user_text) = routing_input(&prepared.request) else {
+        return Ok(());
+    };
+    let fall_back =
+        swarm_task_room_fallback_for_chat(config, &prepared.request, room_routing_cache);
+    let persisted_hint = persisted_conversation_active_task_hint(
+        &config.workspace_root,
+        &prepared.workspace_namespace,
+        &prepared.request,
+    );
+    let conversation_active_for_swarm = prepared
+        .binding_active_task_id
+        .clone()
+        .or_else(|| prepared.request.active_task_id.clone())
+        .or(persisted_hint);
+    let snapshot = swarm_routing::classify_swarm_snapshot_for_chat_input(
+        user_text.as_str(),
+        conversation_active_for_swarm.as_deref(),
+        fall_back.as_deref(),
+    );
+    let tier = snapshot.routing.routing_tier;
+    let Some(task_id) = prepared.binding_active_task_id.as_deref() else {
+        return Ok(());
+    };
+    if task_id.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(agent) = prepared.agent_context.as_ref() else {
+        return Ok(());
+    };
+    let name = agent.agent.name.trim();
+    let display_name = if name.is_empty() {
+        agent.agent.id.as_str()
+    } else {
+        name
+    };
+    persist_http_chat_l23_degenerate_claim_assign(
+        &config.workspace_root,
+        &prepared.workspace_namespace,
+        tier,
+        task_id,
+        agent.agent.id.as_str(),
+        display_name,
+        prepared.request.active_work_item_id.as_deref(),
+    )?;
+    Ok(())
 }
 
 fn prepare_chat_request(
@@ -352,8 +429,11 @@ pub(crate) fn prepare_chat_request_with_swarm_clock(
     let messages = request_messages(&request)?;
     let user_text = routing_input(&request)?;
     let fall_back = swarm_task_room_fallback_for_chat(config, &request, room_routing);
-    let persisted_hint =
-        persisted_conversation_active_task_hint(&config.workspace_root, &workspace_namespace, &request);
+    let persisted_hint = persisted_conversation_active_task_hint(
+        &config.workspace_root,
+        &workspace_namespace,
+        &request,
+    );
     let conversation_active_for_swarm = request.active_task_id.clone().or(persisted_hint);
     let snapshot = swarm_routing::classify_swarm_snapshot_for_chat_input(
         &user_text,
@@ -373,6 +453,34 @@ pub(crate) fn prepare_chat_request_with_swarm_clock(
             .map(|resolved| resolved.agent.id.as_str()),
         swarm_created_at_ms,
     )?;
+
+    if http_l2l3_planner_steering_enabled_from_env()
+        && matches!(
+            snapshot.routing.routing_tier,
+            RoutingTier::L2 | RoutingTier::L3
+        )
+    {
+        let task_anchor = http_implicit_allocated
+            .as_deref()
+            .or(snapshot.task_binding.active_task_id.as_deref())
+            .or(request.active_task_id.as_deref())
+            .or(fall_back.as_deref());
+        if let Some(tid) = task_anchor.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Err(error) = maybe_apply_http_l2l3_planner_steering(
+                config.workspace_root.as_path(),
+                &workspace_namespace,
+                tid,
+                user_text.as_str(),
+            ) {
+                tracing::warn!(
+                    ?error,
+                    task_id = %tid,
+                    "HTTP L2/L3 planner steering failed; continuing with pre-steering task plan"
+                );
+            }
+        }
+    }
+
     let mut generation = GenerateRequest::new(model, messages);
     generation.temperature = request.temperature;
     generation.max_output_tokens = request.max_output_tokens;
@@ -426,6 +534,78 @@ pub(crate) fn prepare_chat_request_with_swarm_clock(
                     "HTTP chat L2/L3: appended persisted task_plan excerpt to system prompt"
                 );
                 system_prompt.push_str(&block);
+            }
+
+            match load_task_execution_result_artifacts_v1(
+                config.workspace_root.as_path(),
+                &workspace_namespace,
+                task_id,
+            ) {
+                Ok(artifacts) if !artifacts.is_empty() => {
+                    let digest = format_execution_results_digest_for_http_l23(&artifacts);
+                    if !digest.is_empty() {
+                        tracing::debug!(
+                            task_id = %task_id,
+                            count = artifacts.len(),
+                            "HTTP chat L2/L3: appended execution_result digest to system prompt"
+                        );
+                        system_prompt.push_str(&digest);
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    ?error,
+                    task_id = %task_id,
+                    "load task execution_result artifacts for L2/L3 prompt"
+                ),
+                _ => {}
+            }
+
+            match load_task_plan_note_artifacts_v1(
+                config.workspace_root.as_path(),
+                &workspace_namespace,
+                task_id,
+            ) {
+                Ok(artifacts) if !artifacts.is_empty() => {
+                    let digest = format_plan_notes_digest_for_http_l23(&artifacts);
+                    if !digest.is_empty() {
+                        tracing::debug!(
+                            task_id = %task_id,
+                            count = artifacts.len(),
+                            "HTTP chat L2/L3: appended plan_note digest to system prompt"
+                        );
+                        system_prompt.push_str(&digest);
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    ?error,
+                    task_id = %task_id,
+                    "load task plan_note artifacts for L2/L3 prompt"
+                ),
+                _ => {}
+            }
+
+            match load_task_review_note_artifacts_v1(
+                config.workspace_root.as_path(),
+                &workspace_namespace,
+                task_id,
+            ) {
+                Ok(artifacts) if !artifacts.is_empty() => {
+                    let digest = format_review_notes_digest_for_http_l23(&artifacts);
+                    if !digest.is_empty() {
+                        tracing::debug!(
+                            task_id = %task_id,
+                            count = artifacts.len(),
+                            "HTTP chat L2/L3: appended review_note digest to system prompt"
+                        );
+                        system_prompt.push_str(&digest);
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    ?error,
+                    task_id = %task_id,
+                    "load task review_note artifacts for L2/L3 prompt"
+                ),
+                _ => {}
             }
         }
 
@@ -492,8 +672,11 @@ pub fn emit_swarm_observability_for_chat_like_request(
         return;
     };
     let fall_back = swarm_task_room_fallback_for_chat(config, request, pre_resolved_room_routing);
-    let persisted_hint =
-        persisted_conversation_active_task_hint(&config.workspace_root, workspace_namespace, request);
+    let persisted_hint = persisted_conversation_active_task_hint(
+        &config.workspace_root,
+        workspace_namespace,
+        request,
+    );
     let conversation_active_for_swarm = request.active_task_id.clone().or(persisted_hint);
     let snapshot = swarm_routing::classify_swarm_snapshot_for_chat_input(
         &user_text,
@@ -555,11 +738,11 @@ fn emit_swarm_observability_from_classified(
     let l23_implicit = matches!(
         snapshot.routing.routing_tier,
         RoutingTier::L2 | RoutingTier::L3
-    ) && snapshot.task_binding.task_binding_action == TaskBindingAction::CreateImplicitTask;
+    ) && snapshot.task_binding.task_binding_action
+        == TaskBindingAction::CreateImplicitTask;
     let http_implicit_task_id: Option<String> = if l23_implicit {
         let provisional = format!("task.http.implicit.{created_at_ms}");
-        let dedupe_key =
-            ImplicitIntentDedupeKey::from_trigger(&session_id, &message_id, user_text);
+        let dedupe_key = ImplicitIntentDedupeKey::from_trigger(&session_id, &message_id, user_text);
         let existing = load_implicit_intent_dedupe_keys(
             &config.workspace_root,
             workspace_namespace,
@@ -646,10 +829,7 @@ fn emit_swarm_observability_from_classified(
     );
     if let Some(task_id) = coordination_task_id {
         let coord_snap = if http_implicit_task_id.is_some() {
-            SwarmRoutingBindingSnapshot::new(
-                snapshot.routing.clone(),
-                binding_for_emit.clone(),
-            )
+            SwarmRoutingBindingSnapshot::new(snapshot.routing.clone(), binding_for_emit.clone())
         } else {
             snapshot.clone()
         };
@@ -750,6 +930,7 @@ fn normalize_chat_request(mut request: ChatRequest) -> ChatRequest {
             &request.memory.namespace.user_id,
         ))
     });
+    request.active_work_item_id = normalized_optional_string(request.active_work_item_id.take());
     request
 }
 
@@ -1138,11 +1319,13 @@ mod memory_query_swarm_tests {
 #[cfg(test)]
 mod prepare_chat_l23_task_plan_excerpt_tests {
     use super::*;
-    use hc_protocol::ApiNamespace;
-    use hc_store::{
-        store::WorkspaceStore,
-        task_coordination::implicit_intent_journal_relative,
+    use hc_agent::{
+        HTTP_L23_EXECUTION_DIGEST_HEADING, HTTP_L23_PLAN_DIGEST_HEADING,
+        HTTP_L23_REVIEW_DIGEST_HEADING,
     };
+    use hc_agent::{TaskNamespace, TaskRequest};
+    use hc_protocol::ApiNamespace;
+    use hc_store::{store::WorkspaceStore, task_coordination::implicit_intent_journal_relative};
     use serde::Serialize;
 
     #[derive(Serialize)]
@@ -1183,19 +1366,72 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             .expect("write task_plan.md fixture");
     }
 
+    fn build_l23_chat_request(
+        tenant: &str,
+        user: &str,
+        session_id: &str,
+        input: &str,
+        task_id: &str,
+    ) -> ChatRequest {
+        ChatRequest {
+            tenant_id: None,
+            user_id: None,
+            session_id: Some(session_id.to_owned()),
+            room_id: None,
+            behavior_pattern: None,
+            thinking_depth: None,
+            input: Some(input.to_owned()),
+            messages: Vec::new(),
+            provider: None,
+            model: None,
+            system_prompt: None,
+            agent_id: None,
+            domain_id: None,
+            active_agent_id: None,
+            active_task_id: Some(task_id.to_owned()),
+            active_work_item_id: None,
+            memory: ApiMemoryQuery {
+                namespace: ApiNamespace::from_tenant_user(tenant, user),
+                ..Default::default()
+            },
+            temperature: None,
+            max_output_tokens: None,
+        }
+    }
+
+    fn create_l23_test_config(prefix: &str) -> ServiceConfig {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", wall_clock_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ServiceConfig::new(dir)
+    }
+
+    fn l23_workspace_ns(tenant: &str, user: &str) -> WorkspaceNamespace {
+        WorkspaceNamespace::new(tenant.to_owned(), user.to_owned())
+    }
+
+    fn prepare_l23_fixture(
+        prefix: &str,
+        tenant: &str,
+        user: &str,
+        task_id: &str,
+        body: &str,
+    ) -> (ServiceConfig, WorkspaceNamespace, TaskRequest) {
+        let config = create_l23_test_config(prefix);
+        let workspace_ns = l23_workspace_ns(tenant, user);
+        write_minimal_task_plan_fixture(&config.workspace_root, &workspace_ns, task_id, body);
+        let task = TaskRequest::new(task_id, "fixture", "goal")
+            .with_namespace(TaskNamespace::new(tenant, user));
+        (config, workspace_ns, task)
+    }
+
     #[test]
     fn l23_reuse_active_task_appends_task_plan_excerpt_and_speaker_appendix() {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-prepare-l23-task-plan-{}",
-            wall_clock_ms()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = ServiceConfig::new(dir.clone());
+        let config = create_l23_test_config("hc-prepare-l23-task-plan");
 
         let tenant = "tenant_l23_excerpt";
         let user = "user_l23_excerpt";
         let task_id = "task.l23.excerpt.fixture";
-        let workspace_ns = WorkspaceNamespace::new(tenant.to_owned(), user.to_owned());
+        let workspace_ns = l23_workspace_ns(tenant, user);
         const PROBE: &str = "### EXCERPT_PROBE_PREPARE_CHAT_L23";
         write_minimal_task_plan_fixture(
             &config.workspace_root,
@@ -1220,6 +1456,7 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             domain_id: None,
             active_agent_id: None,
             active_task_id: Some(task_id.to_owned()),
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace: ApiNamespace::from_tenant_user(tenant, user),
                 ..Default::default()
@@ -1255,6 +1492,363 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
         let _ = std::fs::remove_dir_all(&config.workspace_root);
     }
 
+    #[test]
+    fn l23_appends_review_note_digest_when_task_review_json_present() {
+        use hc_agent::persist_review_note_artifact_v1;
+
+        let tenant = "tenant_l23_review_digest";
+        let user = "user_l23_review_digest";
+        let task_id = "task.l23.review.digest.fixture";
+        const PROBE: &str = "### EXCERPT_PROBE_REVIEW_DIGEST_L23";
+        let (config, workspace_ns, task) = prepare_l23_fixture(
+            "hc-prepare-l23-review-digest",
+            tenant,
+            user,
+            task_id,
+            &format!("{PROBE}\n\nPlanned work for HTTP review digest path."),
+        );
+        persist_review_note_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            "wi-review-probe",
+            "Summary unique REVIEW_DIGEST_HTTP_L23_XY9",
+            Some("needs_revision".into()),
+            None,
+            "reviewer:fixture",
+        )
+        .expect("persist review note");
+
+        let req = build_l23_chat_request(
+            tenant,
+            user,
+            "sess-l23-review-digest",
+            "refactor the legacy checkout module for clarity",
+            task_id,
+        );
+
+        let prepared = prepare_chat_request(&config, req, None, "test.prepare.prefix").unwrap();
+        let prompt = prepared
+            .context_request
+            .system_prompt
+            .as_deref()
+            .expect("system prompt");
+
+        assert!(
+            prompt.contains(HTTP_L23_REVIEW_DIGEST_HEADING),
+            "expected review_note digest header in system prompt"
+        );
+        assert!(
+            prompt.contains("REVIEW_DIGEST_HTTP_L23_XY9"),
+            "expected persisted review summary in digest"
+        );
+        assert!(
+            prompt.contains("`needs_revision`"),
+            "expected verdict in digest line"
+        );
+
+        let _ = std::fs::remove_dir_all(&config.workspace_root);
+    }
+
+    #[test]
+    fn l23_execution_digest_keeps_truncated_marker_for_oversized_summary() {
+        use hc_agent::persist_execution_result_artifact_v1;
+
+        let tenant = "tenant_l23_exec_trunc";
+        let user = "user_l23_exec_trunc";
+        let task_id = "task.l23.exec.trunc.fixture";
+        let (config, workspace_ns, task) = prepare_l23_fixture(
+            "hc-prepare-l23-exec-trunc",
+            tenant,
+            user,
+            task_id,
+            "### EXCERPT_PROBE_EXEC_TRUNC_L23",
+        );
+        let huge = "x".repeat(12_000);
+        persist_execution_result_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            "wi-exec-trunc",
+            huge,
+            None,
+            "worker:fixture",
+        )
+        .expect("persist oversized execution result");
+
+        let req = build_l23_chat_request(
+            tenant,
+            user,
+            "sess-l23-exec-trunc",
+            "refactor the legacy checkout module for clarity",
+            task_id,
+        );
+
+        let prepared = prepare_chat_request(&config, req, None, "test.prepare.prefix").unwrap();
+        let prompt = prepared
+            .context_request
+            .system_prompt
+            .as_deref()
+            .expect("system prompt");
+        assert!(
+            prompt.contains("truncated; 1 execution_result record(s) on disk"),
+            "oversized first execution result should still leave truncation marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&config.workspace_root);
+    }
+
+    #[test]
+    fn l23_appends_plan_note_digest_when_task_plan_json_present() {
+        use hc_agent::persist_plan_note_artifact_v1;
+
+        let tenant = "tenant_l23_plan_digest";
+        let user = "user_l23_plan_digest";
+        let task_id = "task.l23.plan.digest.fixture";
+        const PROBE: &str = "### EXCERPT_PROBE_PLAN_DIGEST_L23";
+        let (config, workspace_ns, task) = prepare_l23_fixture(
+            "hc-prepare-l23-plan-digest",
+            tenant,
+            user,
+            task_id,
+            &format!("{PROBE}\n\nPlanned work for HTTP plan digest path."),
+        );
+        persist_plan_note_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            None,
+            "Summary unique PLAN_DIGEST_HTTP_L23_QK7",
+            Some("planner split the rollout into two phases".into()),
+            "planner:fixture",
+        )
+        .expect("persist plan note");
+
+        let req = build_l23_chat_request(
+            tenant,
+            user,
+            "sess-l23-plan-digest",
+            "refactor the legacy checkout module for clarity",
+            task_id,
+        );
+
+        let prepared = prepare_chat_request(&config, req, None, "test.prepare.prefix").unwrap();
+        let prompt = prepared
+            .context_request
+            .system_prompt
+            .as_deref()
+            .expect("system prompt");
+
+        assert!(
+            prompt.contains(HTTP_L23_PLAN_DIGEST_HEADING),
+            "expected plan_note digest header in system prompt"
+        );
+        assert!(
+            prompt.contains("PLAN_DIGEST_HTTP_L23_QK7"),
+            "expected persisted plan summary in digest"
+        );
+
+        let _ = std::fs::remove_dir_all(&config.workspace_root);
+    }
+
+    #[test]
+    fn l23_review_note_digest_keeps_truncated_marker_for_oversized_summary() {
+        use hc_agent::persist_review_note_artifact_v1;
+
+        let tenant = "tenant_l23_review_trunc";
+        let user = "user_l23_review_trunc";
+        let task_id = "task.l23.review.trunc.fixture";
+        let (config, workspace_ns, task) = prepare_l23_fixture(
+            "hc-prepare-l23-review-trunc",
+            tenant,
+            user,
+            task_id,
+            "### EXCERPT_PROBE_REVIEW_TRUNC_L23",
+        );
+        let huge = "x".repeat(12_000);
+        persist_review_note_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            "wi-review-trunc",
+            huge,
+            Some("needs_revision".into()),
+            None,
+            "reviewer:fixture",
+        )
+        .expect("persist oversized review note");
+
+        let req = build_l23_chat_request(
+            tenant,
+            user,
+            "sess-l23-review-trunc",
+            "refactor the legacy checkout module for clarity",
+            task_id,
+        );
+
+        let prepared = prepare_chat_request(&config, req, None, "test.prepare.prefix").unwrap();
+        let prompt = prepared
+            .context_request
+            .system_prompt
+            .as_deref()
+            .expect("system prompt");
+        assert!(
+            prompt.contains("truncated; 1 review_note record(s) on disk"),
+            "oversized first review note should still leave truncation marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&config.workspace_root);
+    }
+
+    #[test]
+    fn l23_plan_note_digest_keeps_truncated_marker_for_oversized_summary() {
+        use hc_agent::persist_plan_note_artifact_v1;
+
+        let tenant = "tenant_l23_plan_trunc";
+        let user = "user_l23_plan_trunc";
+        let task_id = "task.l23.plan.trunc.fixture";
+        let (config, workspace_ns, task) = prepare_l23_fixture(
+            "hc-prepare-l23-plan-trunc",
+            tenant,
+            user,
+            task_id,
+            "### EXCERPT_PROBE_PLAN_TRUNC_L23",
+        );
+        let huge = "x".repeat(12_000);
+        persist_plan_note_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            None,
+            huge,
+            None,
+            "planner:fixture",
+        )
+        .expect("persist oversized plan note");
+
+        let req = build_l23_chat_request(
+            tenant,
+            user,
+            "sess-l23-plan-trunc",
+            "refactor the legacy checkout module for clarity",
+            task_id,
+        );
+
+        let prepared = prepare_chat_request(&config, req, None, "test.prepare.prefix").unwrap();
+        let prompt = prepared
+            .context_request
+            .system_prompt
+            .as_deref()
+            .expect("system prompt");
+        assert!(
+            prompt.contains("truncated; 1 plan_note record(s) on disk"),
+            "oversized first plan note should still leave truncation marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&config.workspace_root);
+    }
+
+    #[test]
+    fn l23_appends_all_artifact_digests_in_stable_order() {
+        use hc_agent::{
+            TaskNamespace, TaskRequest, persist_execution_result_artifact_v1,
+            persist_plan_note_artifact_v1, persist_review_note_artifact_v1,
+        };
+
+        let config = create_l23_test_config("hc-prepare-l23-all-digests");
+
+        let tenant = "tenant_l23_all_digests";
+        let user = "user_l23_all_digests";
+        let task_id = "task.l23.all.digests.fixture";
+        let workspace_ns = l23_workspace_ns(tenant, user);
+        write_minimal_task_plan_fixture(
+            &config.workspace_root,
+            &workspace_ns,
+            task_id,
+            "### EXCERPT_PROBE_ALL_DIGESTS",
+        );
+        let task = TaskRequest::new(task_id, "fixture", "goal")
+            .with_namespace(TaskNamespace::new(tenant, user));
+        persist_execution_result_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            "wi-all",
+            "EXEC_ALL_DIGESTS_UNIQUE",
+            None,
+            "worker:fixture",
+        )
+        .expect("persist execution");
+        persist_plan_note_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            None,
+            "PLAN_ALL_DIGESTS_UNIQUE",
+            None,
+            "planner:fixture",
+        )
+        .expect("persist plan");
+        persist_review_note_artifact_v1(
+            &config.workspace_root,
+            &workspace_ns,
+            &task,
+            "wi-all",
+            "REVIEW_ALL_DIGESTS_UNIQUE",
+            Some("approve".into()),
+            None,
+            "reviewer:fixture",
+        )
+        .expect("persist review");
+
+        let req = ChatRequest {
+            tenant_id: None,
+            user_id: None,
+            session_id: Some("sess-l23-all-digests".into()),
+            room_id: None,
+            behavior_pattern: None,
+            thinking_depth: None,
+            input: Some("refactor for rollout safety".into()),
+            messages: Vec::new(),
+            provider: None,
+            model: None,
+            system_prompt: None,
+            agent_id: None,
+            domain_id: None,
+            active_agent_id: None,
+            active_task_id: Some(task_id.to_owned()),
+            active_work_item_id: None,
+            memory: ApiMemoryQuery {
+                namespace: ApiNamespace::from_tenant_user(tenant, user),
+                ..Default::default()
+            },
+            temperature: None,
+            max_output_tokens: None,
+        };
+
+        let prepared = prepare_chat_request(&config, req, None, "test.prepare.prefix").unwrap();
+        let prompt = prepared
+            .context_request
+            .system_prompt
+            .as_deref()
+            .expect("system prompt");
+        let execution_idx = prompt
+            .find(HTTP_L23_EXECUTION_DIGEST_HEADING)
+            .expect("execution digest header");
+        let plan_idx = prompt
+            .find(HTTP_L23_PLAN_DIGEST_HEADING)
+            .expect("plan digest header");
+        let review_idx = prompt
+            .find(HTTP_L23_REVIEW_DIGEST_HEADING)
+            .expect("review digest header");
+        assert!(execution_idx < plan_idx && plan_idx < review_idx);
+        assert!(prompt.contains("EXEC_ALL_DIGESTS_UNIQUE"));
+        assert!(prompt.contains("PLAN_ALL_DIGESTS_UNIQUE"));
+        assert!(prompt.contains("REVIEW_ALL_DIGESTS_UNIQUE"));
+
+        let _ = std::fs::remove_dir_all(&config.workspace_root);
+    }
+
     /// **`CreateImplicitTask`** uses **`task.http.implicit.{created_at_ms}`**; [`prepare_chat_request_with_swarm_clock`]
     /// pins **`swarm_created_at_ms`** so the same slug can **`task_plan.md`** preseed before prepare.
     #[test]
@@ -1262,10 +1856,8 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
         const FIXED_MS: u64 = 9_424_242;
         let implicit_id = format!("task.http.implicit.{FIXED_MS}");
 
-        let dir = std::env::temp_dir().join(format!(
-            "hc-prepare-l23-implicit-tp-{}",
-            wall_clock_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hc-prepare-l23-implicit-tp-{}", wall_clock_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = ServiceConfig::new(dir.clone());
 
@@ -1297,6 +1889,7 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             domain_id: None,
             active_agent_id: None,
             active_task_id: None,
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace: ApiNamespace::from_tenant_user(tenant, user),
                 ..Default::default()
@@ -1305,14 +1898,9 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             max_output_tokens: None,
         };
 
-        let prepared = prepare_chat_request_with_swarm_clock(
-            &config,
-            req,
-            None,
-            "chat.api",
-            FIXED_MS,
-        )
-        .unwrap();
+        let prepared =
+            prepare_chat_request_with_swarm_clock(&config, req, None, "chat.api", FIXED_MS)
+                .unwrap();
 
         assert_eq!(
             prepared.binding_active_task_id.as_deref(),
@@ -1359,10 +1947,8 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
         let implicit_id = format!("task.http.implicit.{FIXED_MS}");
         let user_goal = "refactor the payment adapters layer for rollout safety";
 
-        let dir = std::env::temp_dir().join(format!(
-            "hc-prepare-l23-implicit-stub-{}",
-            wall_clock_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hc-prepare-l23-implicit-stub-{}", wall_clock_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = ServiceConfig::new(dir.clone());
 
@@ -1386,6 +1972,7 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             domain_id: None,
             active_agent_id: None,
             active_task_id: None,
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace: ApiNamespace::from_tenant_user(tenant, user),
                 ..Default::default()
@@ -1394,19 +1981,18 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             max_output_tokens: None,
         };
 
-        let prepared = prepare_chat_request_with_swarm_clock(
-            &config,
-            req,
-            None,
-            "chat.api",
-            FIXED_MS,
-        )
-        .unwrap();
+        let prepared =
+            prepare_chat_request_with_swarm_clock(&config, req, None, "chat.api", FIXED_MS)
+                .unwrap();
 
-        assert_eq!(prepared.binding_active_task_id.as_deref(), Some(implicit_id.as_str()));
+        assert_eq!(
+            prepared.binding_active_task_id.as_deref(),
+            Some(implicit_id.as_str())
+        );
 
         let plan_rel = task_plan_markdown_relative(&implicit_id);
-        let persisted = read_task_artifact(&config.workspace_root, &workspace_ns, &plan_rel).unwrap();
+        let persisted =
+            read_task_artifact(&config.workspace_root, &workspace_ns, &plan_rel).unwrap();
         assert!(
             persisted.body.contains("- goal:"),
             "stub render_task_plan body should expose goal field"
@@ -1432,7 +2018,9 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             "planning_notes should embed swarm routing_message_id for same-turn trace join"
         );
         assert!(
-            persisted.body.contains("session_id=sess-l23-http-implicit-stub"),
+            persisted
+                .body
+                .contains("session_id=sess-l23-http-implicit-stub"),
             "planning_notes should embed conversation session_id"
         );
 
@@ -1455,10 +2043,8 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
 
     #[test]
     fn l1_with_task_on_disk_does_not_append_task_plan_excerpt() {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-prepare-l1-no-excerpt-{}",
-            wall_clock_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hc-prepare-l1-no-excerpt-{}", wall_clock_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = ServiceConfig::new(dir.clone());
 
@@ -1467,12 +2053,7 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
         let task_id = "task.l1.no_excerpt.fixture";
         let workspace_ns = WorkspaceNamespace::new(tenant.to_owned(), user.to_owned());
         const PROBE: &str = "### SHOULD_NOT_APPEAR_IN_SYSTEM_PROMPT_L1";
-        write_minimal_task_plan_fixture(
-            &config.workspace_root,
-            &workspace_ns,
-            task_id,
-            PROBE,
-        );
+        write_minimal_task_plan_fixture(&config.workspace_root, &workspace_ns, task_id, PROBE);
 
         let req = ChatRequest {
             tenant_id: None,
@@ -1490,6 +2071,7 @@ mod prepare_chat_l23_task_plan_excerpt_tests {
             domain_id: None,
             active_agent_id: None,
             active_task_id: Some(task_id.to_owned()),
+            active_work_item_id: None,
             memory: ApiMemoryQuery {
                 namespace: ApiNamespace::from_tenant_user(tenant, user),
                 ..Default::default()

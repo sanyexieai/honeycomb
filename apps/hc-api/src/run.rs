@@ -1,13 +1,21 @@
-use std::{collections::BTreeSet, convert::Infallible, env, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    convert::Infallible,
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
         Extension, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -29,8 +37,9 @@ use hc_memory::{
     ResolvedRoomCapabilities, RoomCapabilityResolver, RoomConfig, ScheduleRef, SkillRef, ToolRef,
 };
 use hc_protocol::{
-    AgentListResponse, AgentRouteRequest, AgentRouteResponse, ApiNamespace, ChatRequest,
-    ChatResponse, DomainListResponse, ErrorResponse, HealthResponse, McpServerListResponse,
+    AgentListResponse, AgentRouteRequest, AgentRouteResponse, ApiChatMessage, ApiMemoryQuery,
+    ApiNamespace, ChatRequest, ChatResponse, DomainListResponse, ErrorResponse, HealthResponse,
+    McpServerListResponse,
 };
 use hc_responder::HumanInboxItem;
 use hc_service::{
@@ -48,10 +57,14 @@ use hc_service::{
         resolve_room_routing_explain,
     },
     scheduler::{
-        ScheduleRequest, ScheduleStatusRequest, SchedulerRunRequest, dispatch_due_scheduled_runs,
-        dispatch_fired_followup_messages_headless, dispatch_queued_scheduled_runs,
-        list_scheduled_runs, list_schedules, queue_due_scheduled_runs, set_schedule_status,
-        write_schedule,
+        ApiDispatchDueWorkerWallMillisecondsHistogram, ScheduleRequest, ScheduleStatusRequest,
+        SchedulerOperationalStats, SchedulerRunRequest, TimedFollowupFiredEventRow,
+        dispatch_due_scheduled_runs, dispatch_fired_followup_messages_headless,
+        dispatch_queued_scheduled_runs, fired_followup_messages_from_receipts, list_scheduled_runs,
+        list_schedules, list_timed_followup_fired_events_since_created,
+        merge_scheduler_operational_stats_with_dispatch_slip_histogram, queue_due_scheduled_runs,
+        scheduler_operational_stats, scheduler_operational_stats_openmetrics_text,
+        set_schedule_status, write_schedule,
     },
     tool::{
         McpToolCallRequest, McpToolCallResponse, McpToolListRequest, McpToolListResponse,
@@ -68,19 +81,48 @@ use tokio_stream::{
 };
 use tracing::{error, info, warn};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub service: ServiceConfig,
+    /// Per `tenant_id` + `user_id`: count of headless follow-up messages delivered inside this hc-api process
+    /// (`dispatch_*` paths + scheduler loop when headless delivery is enabled).
+    pub followup_headless_delivered_messages_total: Arc<Mutex<HashMap<(String, String), u64>>>,
+    /// Per-namespace dispatch path outcomes (API `dispatch-*` + optional scheduler loop).
+    pub api_scheduler_dispatch_totals:
+        Arc<Mutex<HashMap<(String, String), ApiSchedulerDispatchTotals>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ApiSchedulerDispatchTotals {
+    dispatch_due_completed: u64,
+    dispatch_due_failed: u64,
+    dispatch_queued_completed: u64,
+    dispatch_queued_failed: u64,
+    scheduler_loop_tick_completed: u64,
+    scheduler_loop_tick_failed: u64,
+    last_dispatch_due_worker_wall_ms: u64,
+    last_dispatch_queued_worker_wall_ms: u64,
+    last_scheduler_tick_worker_wall_ms: u64,
+    dispatch_due_worker_wall_ms_histogram: ApiDispatchDueWorkerWallMillisecondsHistogram,
+    dispatch_queued_worker_wall_ms_histogram: ApiDispatchDueWorkerWallMillisecondsHistogram,
+    scheduler_loop_tick_worker_wall_ms_histogram: ApiDispatchDueWorkerWallMillisecondsHistogram,
+}
+
+fn scheduler_worker_wall_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 const DEFAULT_API_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_SCHEDULER_TICK_SECONDS: u64 = 30;
 const DEFAULT_SWAGGER_UI_DIST_BASE_URL: &str = "https://unpkg.com/swagger-ui-dist@5";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchedulerFollowupDeliveryMode {
     Headless,
     Off,
+    /// POST JSON payloads to `HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL` (see `followup_webhook_url_from_env`);
+    /// per-request timeout from `HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS` (default 30, clamped 1–300).
+    Webhook,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +150,42 @@ impl ApiRuntimeConfig {
                 .unwrap_or_else(|_| DEFAULT_SWAGGER_UI_DIST_BASE_URL.to_owned()),
         })
     }
+
+    /// Logs **`HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE`**, webhook URL / bearer presence (no secrets),
+    /// and resolved **`webhook_timeout_secs`** from **`HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS`**.
+    pub fn log_scheduler_followup_delivery(&self) {
+        match self.scheduler_followup_delivery_mode {
+            SchedulerFollowupDeliveryMode::Headless => {
+                info!(
+                    followup_delivery_mode = "headless",
+                    "hc-api timed follow-up delivery"
+                );
+            }
+            SchedulerFollowupDeliveryMode::Off => {
+                info!(
+                    followup_delivery_mode = "off",
+                    "hc-api timed follow-up delivery"
+                );
+            }
+            SchedulerFollowupDeliveryMode::Webhook => {
+                let url_ok = followup_webhook_url_from_env().is_some();
+                let bearer_ok = followup_webhook_bearer_token_from_env().is_some();
+                let webhook_timeout_secs = followup_webhook_timeout_secs();
+                info!(
+                    followup_delivery_mode = "webhook",
+                    webhook_url_configured = url_ok,
+                    webhook_bearer_configured = bearer_ok,
+                    webhook_timeout_secs,
+                    "hc-api timed follow-up delivery"
+                );
+                if !url_ok {
+                    warn!(
+                        "HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL is unset or empty: webhook delivery will error when fired follow-ups need delivery"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +196,22 @@ struct NamespaceQuery {
     user_id: String,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScheduleFollowupFiredEventsQuery {
+    #[serde(flatten)]
+    namespace: NamespaceQuery,
+    #[serde(default)]
+    since_created_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScheduleOperationalStatsQuery {
+    #[serde(flatten)]
+    namespace: NamespaceQuery,
+    #[serde(default)]
+    now_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,7 +264,7 @@ struct ProposalActionRequest {
     proposal_id: String,
 }
 
-/// Minimal `{ "text": "..." }` body for lightweight clients (legacy `/v1/messages` compatibility).
+/// Lightweight body for **`POST /v1/messages`** and **`POST /v1/messages/stream`** (vs full [`ChatRequest`] on `/v1/chat`).
 #[derive(Debug, Clone, Deserialize)]
 struct UserMessageRequest {
     text: String,
@@ -181,44 +275,94 @@ struct UserMessageRequest {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    room_id: Option<String>,
+    #[serde(default)]
+    behavior_pattern: Option<String>,
+    #[serde(default)]
+    thinking_depth: Option<u8>,
+    #[serde(default)]
     agent_id: Option<String>,
     #[serde(default)]
     domain_id: Option<String>,
+    #[serde(default)]
+    active_agent_id: Option<String>,
+    #[serde(default)]
+    active_task_id: Option<String>,
+    #[serde(default)]
+    active_work_item_id: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    messages: Vec<ApiChatMessage>,
+    #[serde(default)]
+    memory: Option<ApiMemoryQuery>,
 }
 
-#[allow(dead_code)]
 fn chat_request_from_user_message(request: UserMessageRequest) -> ChatRequest {
     let namespace = normalized_request_namespace(
         ApiNamespace::default(),
         request.tenant_id.clone(),
         request.user_id.clone(),
     );
+    let mut memory = ApiMemoryQuery {
+        namespace,
+        scope: None,
+        kind: None,
+        tag: None,
+        text: None,
+        limit: None,
+    };
+    if let Some(overlay) = &request.memory {
+        if overlay.scope.is_some() {
+            memory.scope = overlay.scope.clone();
+        }
+        if overlay.kind.is_some() {
+            memory.kind = overlay.kind.clone();
+        }
+        if overlay.tag.is_some() {
+            memory.tag = overlay.tag.clone();
+        }
+        if overlay.text.is_some() {
+            memory.text = overlay.text.clone();
+        }
+        if overlay.limit.is_some() {
+            memory.limit = overlay.limit;
+        }
+        let defaults = ApiNamespace::default();
+        if overlay.namespace.tenant_id != defaults.tenant_id
+            || overlay.namespace.user_id != defaults.user_id
+        {
+            memory.namespace = normalized_request_namespace(overlay.namespace.clone(), None, None);
+        }
+    }
     ChatRequest {
-        tenant_id: Some(namespace.tenant_id.clone()),
-        user_id: Some(namespace.user_id.clone()),
+        tenant_id: Some(memory.namespace.tenant_id.clone()),
+        user_id: Some(memory.namespace.user_id.clone()),
         session_id: normalized_optional_string(request.session_id),
-        room_id: None,
-        behavior_pattern: None,
-        thinking_depth: None,
+        room_id: normalized_optional_string(request.room_id),
+        behavior_pattern: normalized_optional_string(request.behavior_pattern),
+        thinking_depth: request.thinking_depth,
         input: Some(request.text),
-        messages: Vec::new(),
-        provider: None,
-        model: None,
-        system_prompt: None,
+        messages: request.messages,
+        provider: normalized_optional_string(request.provider),
+        model: normalized_optional_string(request.model),
+        system_prompt: normalized_optional_string(request.system_prompt),
         agent_id: normalized_optional_string(request.agent_id),
         domain_id: normalized_optional_string(request.domain_id),
-        active_agent_id: None,
-        active_task_id: None,
-        memory: hc_protocol::ApiMemoryQuery {
-            namespace,
-            scope: None,
-            kind: None,
-            tag: None,
-            text: None,
-            limit: None,
-        },
-        temperature: None,
-        max_output_tokens: None,
+        active_agent_id: normalized_optional_string(request.active_agent_id),
+        active_task_id: normalized_optional_string(request.active_task_id),
+        active_work_item_id: normalized_optional_string(request.active_work_item_id),
+        memory,
+        temperature: request.temperature,
+        max_output_tokens: request.max_output_tokens,
     }
 }
 
@@ -390,6 +534,18 @@ pub fn build_router(state: AppState, swagger_ui_dist_base_url: String) -> Router
             "/v1/schedules/dispatch-queued",
             post(schedule_dispatch_queued),
         )
+        .route(
+            "/v1/schedules/followup-fired-events",
+            get(schedule_followup_fired_events),
+        )
+        .route(
+            "/v1/schedules/operational-stats",
+            get(schedule_operational_stats),
+        )
+        .route(
+            "/v1/schedules/metrics/prometheus",
+            get(schedule_metrics_prometheus),
+        )
         .route("/v1/conversation/inbox", get(conversation_inbox))
         .route("/v1/conversation/stream", get(conversation_stream))
         .route("/v1/conversation/events", post(conversation_event))
@@ -411,6 +567,8 @@ pub fn build_router(state: AppState, swagger_ui_dist_base_url: String) -> Router
         .route("/v1/agents/route", post(agent_route))
         .route("/v1/chat", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/stream", post(messages_stream))
         .route("/v1/chat/ws", get(chat_ws))
         .route(
             "/v1/memory/rooms",
@@ -458,11 +616,19 @@ pub async fn serve() -> Result<()> {
     load_local_env_file()?;
     init_console_tracing();
     let runtime_config = ApiRuntimeConfig::from_env()?;
+    runtime_config.log_scheduler_followup_delivery();
+    let followup_headless_delivered_messages_total = Arc::new(Mutex::new(HashMap::new()));
+    let api_scheduler_dispatch_totals = Arc::new(Mutex::new(HashMap::new()));
     let state = AppState {
         service: ServiceConfig::from_env(),
+        followup_headless_delivered_messages_total: followup_headless_delivered_messages_total
+            .clone(),
+        api_scheduler_dispatch_totals: api_scheduler_dispatch_totals.clone(),
     };
     start_scheduler_loop_if_enabled(
         state.service.clone(),
+        followup_headless_delivered_messages_total,
+        api_scheduler_dispatch_totals,
         runtime_config.scheduler_tick_seconds,
         runtime_config.scheduler_followup_delivery_mode,
     );
@@ -700,6 +866,8 @@ async fn conversation_proposal_dismiss(
 
 fn start_scheduler_loop_if_enabled(
     service: ServiceConfig,
+    followup_headless_counters: Arc<Mutex<HashMap<(String, String), u64>>>,
+    api_dispatch_totals: Arc<Mutex<HashMap<(String, String), ApiSchedulerDispatchTotals>>>,
     tick_seconds: u64,
     delivery_mode: SchedulerFollowupDeliveryMode,
 ) {
@@ -721,16 +889,32 @@ fn start_scheduler_loop_if_enabled(
         loop {
             interval.tick().await;
             let service = service.clone();
-            let namespace = namespace.clone();
+            let ns_for_counters = namespace.clone();
+            let headless = followup_headless_counters.clone();
+            let dispatch_totals_in_block = api_dispatch_totals.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let report = dispatch_due_scheduled_runs(&service, namespace.clone(), None)?;
-                let delivered_followups = deliver_scheduler_followup_messages(
+                let start = Instant::now();
+                let report = dispatch_due_scheduled_runs(&service, ns_for_counters.clone(), None)?;
+                let delivered = deliver_scheduler_followup_messages(
                     &service,
-                    namespace,
+                    ns_for_counters.clone(),
                     &report.receipts,
                     delivery_mode,
                 )?;
-                Ok::<_, anyhow::Error>((report, delivered_followups.len()))
+                let delivered_followups = delivered.len();
+                record_followup_headless_delivered(
+                    &headless,
+                    &ns_for_counters,
+                    delivered_followups,
+                );
+                let wall_ms = scheduler_worker_wall_ms(start);
+                record_api_dispatch_totals(&dispatch_totals_in_block, &ns_for_counters, |t| {
+                    t.scheduler_loop_tick_completed += 1;
+                    t.last_scheduler_tick_worker_wall_ms = wall_ms;
+                    t.scheduler_loop_tick_worker_wall_ms_histogram
+                        .observe(wall_ms);
+                });
+                Ok::<_, anyhow::Error>((report, delivered_followups))
             })
             .await;
             match result {
@@ -744,8 +928,18 @@ fn start_scheduler_loop_if_enabled(
                         );
                     }
                 }
-                Ok(Err(error)) => warn!(%error, "scheduler tick failed"),
-                Err(error) => warn!(%error, "scheduler worker failed"),
+                Ok(Err(error)) => {
+                    record_api_dispatch_totals(&api_dispatch_totals, &namespace, |t| {
+                        t.scheduler_loop_tick_failed += 1;
+                    });
+                    warn!(%error, "scheduler tick failed");
+                }
+                Err(error) => {
+                    record_api_dispatch_totals(&api_dispatch_totals, &namespace, |t| {
+                        t.scheduler_loop_tick_failed += 1;
+                    });
+                    warn!(%error, "scheduler worker failed");
+                }
             }
         }
     });
@@ -941,6 +1135,15 @@ async fn chat(
     Ok(Json(response))
 }
 
+/// Same JSON body as **`POST /v1/chat`**, accepting [`UserMessageRequest`] (OpenAPI **`UserMessageBody`**).
+async fn messages(
+    State(state): State<AppState>,
+    Json(body): Json<UserMessageRequest>,
+) -> Result<Json<ChatResponse>, ApiError> {
+    let request = chat_request_from_user_message(body);
+    chat(State(state), Json(request)).await
+}
+
 async fn chat_stream(
     State(state): State<AppState>,
     Json(request): Json<ChatRequest>,
@@ -1042,6 +1245,15 @@ async fn chat_stream(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+/// Same SSE payload as **`/v1/chat/stream`**, with a minimal JSON body (OpenAPI schema **`UserMessageBody`**).
+async fn messages_stream(
+    State(state): State<AppState>,
+    Json(body): Json<UserMessageRequest>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let request = chat_request_from_user_message(body);
+    chat_stream(State(state), Json(request)).await
 }
 
 fn chat_stream_event_name(event: &ChatStreamEvent) -> &'static str {
@@ -1273,29 +1485,58 @@ async fn schedule_dispatch_due(
 ) -> Result<Json<hc_service::scheduler::SchedulerDispatchReport>, ApiError> {
     let namespace =
         normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let ns_counters = namespace.clone();
     let service = state.service.clone();
+    let counters = state.followup_headless_delivered_messages_total.clone();
+    let dispatch_totals = state.api_scheduler_dispatch_totals.clone();
     let delivery_mode = scheduler_followup_delivery_mode_from_env();
-    let response = tokio::task::spawn_blocking(move || {
+    let join = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
         let report = dispatch_due_scheduled_runs(&service, namespace.clone(), request.now_unix)?;
         let delivered_followups = deliver_scheduler_followup_messages(
             &service,
-            namespace,
+            namespace.clone(),
             &report.receipts,
             delivery_mode,
-        )?
-        .len();
+        )?;
+        let delivered_count = delivered_followups.len();
+        record_followup_headless_delivered(&counters, &namespace, delivered_count);
         tracing::debug!(
             dispatched = report.receipts.len(),
             queued = report.queued_count,
-            delivered_followups,
+            delivered_followups = delivered_count,
             "api schedule dispatch-due completed"
         );
-        Ok::<_, anyhow::Error>(report)
+        let wall_ms = scheduler_worker_wall_ms(start);
+        Ok::<_, anyhow::Error>((report, wall_ms))
     })
-    .await
-    .map_err(|error| ApiError(anyhow!("schedule dispatch-due worker failed: {error}")))?
-    .map_err(ApiError::from)?;
-    Ok(Json(response))
+    .await;
+
+    let report = match join {
+        Ok(Ok((report, wall_ms))) => {
+            record_api_dispatch_totals(&dispatch_totals, &ns_counters, |t| {
+                t.dispatch_due_completed += 1;
+                t.last_dispatch_due_worker_wall_ms = wall_ms;
+                t.dispatch_due_worker_wall_ms_histogram.observe(wall_ms);
+            });
+            report
+        }
+        Ok(Err(e)) => {
+            record_api_dispatch_totals(&dispatch_totals, &ns_counters, |t| {
+                t.dispatch_due_failed += 1;
+            });
+            return Err(ApiError(e));
+        }
+        Err(e) => {
+            record_api_dispatch_totals(&dispatch_totals, &ns_counters, |t| {
+                t.dispatch_due_failed += 1;
+            });
+            return Err(ApiError(anyhow!(
+                "schedule dispatch-due worker failed: {e}"
+            )));
+        }
+    };
+    Ok(Json(report))
 }
 
 async fn schedule_dispatch_queued(
@@ -1304,39 +1545,279 @@ async fn schedule_dispatch_queued(
 ) -> Result<Json<hc_service::scheduler::SchedulerDispatchReport>, ApiError> {
     let namespace =
         normalized_request_namespace(request.namespace, request.tenant_id, request.user_id);
+    let ns_counters = namespace.clone();
     let service = state.service.clone();
+    let counters = state.followup_headless_delivered_messages_total.clone();
+    let dispatch_totals = state.api_scheduler_dispatch_totals.clone();
     let delivery_mode = scheduler_followup_delivery_mode_from_env();
-    let response = tokio::task::spawn_blocking(move || {
+    let join = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
         let report = dispatch_queued_scheduled_runs(&service, namespace.clone(), request.now_unix)?;
         let delivered_followups = deliver_scheduler_followup_messages(
             &service,
-            namespace,
+            namespace.clone(),
             &report.receipts,
             delivery_mode,
-        )?
-        .len();
+        )?;
+        let delivered_count = delivered_followups.len();
+        record_followup_headless_delivered(&counters, &namespace, delivered_count);
         tracing::debug!(
             dispatched = report.receipts.len(),
             queued = report.queued_count,
-            delivered_followups,
+            delivered_followups = delivered_count,
             "api schedule dispatch-queued completed"
         );
-        Ok::<_, anyhow::Error>(report)
+        let wall_ms = scheduler_worker_wall_ms(start);
+        Ok::<_, anyhow::Error>((report, wall_ms))
+    })
+    .await;
+
+    let report = match join {
+        Ok(Ok((report, wall_ms))) => {
+            record_api_dispatch_totals(&dispatch_totals, &ns_counters, |t| {
+                t.dispatch_queued_completed += 1;
+                t.last_dispatch_queued_worker_wall_ms = wall_ms;
+                t.dispatch_queued_worker_wall_ms_histogram.observe(wall_ms);
+            });
+            report
+        }
+        Ok(Err(e)) => {
+            record_api_dispatch_totals(&dispatch_totals, &ns_counters, |t| {
+                t.dispatch_queued_failed += 1;
+            });
+            return Err(ApiError(e));
+        }
+        Err(e) => {
+            record_api_dispatch_totals(&dispatch_totals, &ns_counters, |t| {
+                t.dispatch_queued_failed += 1;
+            });
+            return Err(ApiError(anyhow!(
+                "schedule dispatch-queued worker failed: {e}"
+            )));
+        }
+    };
+    Ok(Json(report))
+}
+
+async fn schedule_followup_fired_events(
+    State(state): State<AppState>,
+    Query(query): Query<ScheduleFollowupFiredEventsQuery>,
+) -> Result<Json<Vec<TimedFollowupFiredEventRow>>, ApiError> {
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.namespace.tenant_id.clone()),
+        Some(query.namespace.user_id.clone()),
+    );
+    let workspace_ns = hc_store::store::WorkspaceNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    );
+    let since_created_at_unix = query.since_created_at_unix.unwrap_or(0);
+    let service = state.service.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        list_timed_followup_fired_events_since_created(
+            &service,
+            &workspace_ns,
+            since_created_at_unix,
+        )
     })
     .await
-    .map_err(|error| ApiError(anyhow!("schedule dispatch-queued worker failed: {error}")))?
+    .map_err(|error| {
+        ApiError(anyhow!(
+            "schedule followup-fired-events blocking worker failed: {error}"
+        ))
+    })?
     .map_err(ApiError::from)?;
-    Ok(Json(response))
+    Ok(Json(rows))
+}
+
+async fn schedule_operational_stats(
+    State(state): State<AppState>,
+    Query(query): Query<ScheduleOperationalStatsQuery>,
+) -> Result<Json<SchedulerOperationalStats>, ApiError> {
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.namespace.tenant_id.clone()),
+        Some(query.namespace.user_id.clone()),
+    );
+    let workspace_ns = hc_store::store::WorkspaceNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    );
+    let service = state.service.clone();
+    let stats = tokio::task::spawn_blocking(move || {
+        scheduler_operational_stats(&service, &workspace_ns, query.now_unix)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(anyhow!(
+            "schedule operational-stats blocking worker failed: {error}"
+        ))
+    })?
+    .map_err(ApiError::from)?;
+    let stats = merge_scheduler_operational_stats_with_api_counters(
+        stats,
+        &state.followup_headless_delivered_messages_total,
+        &state.api_scheduler_dispatch_totals,
+        &namespace.tenant_id,
+        &namespace.user_id,
+    );
+    let stats = merge_scheduler_operational_stats_with_dispatch_slip_histogram(
+        stats,
+        &namespace.tenant_id,
+        &namespace.user_id,
+    );
+    Ok(Json(stats))
+}
+
+async fn schedule_metrics_prometheus(
+    State(state): State<AppState>,
+    Query(query): Query<ScheduleOperationalStatsQuery>,
+) -> Result<Response, ApiError> {
+    let namespace = normalized_request_namespace(
+        ApiNamespace::default(),
+        Some(query.namespace.tenant_id.clone()),
+        Some(query.namespace.user_id.clone()),
+    );
+    let tenant_label = namespace.tenant_id.clone();
+    let user_label = namespace.user_id.clone();
+    let workspace_ns = hc_store::store::WorkspaceNamespace::new(
+        namespace.tenant_id.clone(),
+        namespace.user_id.clone(),
+    );
+    let service = state.service.clone();
+    let stats = tokio::task::spawn_blocking(move || {
+        scheduler_operational_stats(&service, &workspace_ns, query.now_unix)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(anyhow!(
+            "schedule metrics prometheus blocking worker failed: {error}"
+        ))
+    })?
+    .map_err(ApiError::from)?;
+    let stats = merge_scheduler_operational_stats_with_api_counters(
+        stats,
+        &state.followup_headless_delivered_messages_total,
+        &state.api_scheduler_dispatch_totals,
+        &namespace.tenant_id,
+        &namespace.user_id,
+    );
+    let stats = merge_scheduler_operational_stats_with_dispatch_slip_histogram(
+        stats,
+        &namespace.tenant_id,
+        &namespace.user_id,
+    );
+    let text = scheduler_operational_stats_openmetrics_text(&stats, &tenant_label, &user_label);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )
+        .body(Body::from(text))
+        .map_err(|e| ApiError(anyhow!("metrics response build failed: {e}")))
 }
 
 fn scheduler_followup_delivery_mode_from_env() -> SchedulerFollowupDeliveryMode {
     let raw = env::var("HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE")
         .unwrap_or_else(|_| "headless".to_owned())
         .to_ascii_lowercase();
-    match raw.as_str() {
+    scheduler_followup_delivery_mode_parse(&raw)
+}
+
+fn scheduler_followup_delivery_mode_parse(raw: &str) -> SchedulerFollowupDeliveryMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "off" => SchedulerFollowupDeliveryMode::Off,
+        "webhook" => SchedulerFollowupDeliveryMode::Webhook,
         _ => SchedulerFollowupDeliveryMode::Headless,
     }
+}
+
+fn followup_webhook_url_from_env() -> Option<String> {
+    env::var("HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn followup_webhook_bearer_token_from_env() -> Option<String> {
+    env::var("HC_SCHEDULER_FOLLOWUP_WEBHOOK_BEARER_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_followup_webhook_timeout_secs(raw: Option<&str>) -> u64 {
+    const DEFAULT_SECS: u64 = 30;
+    const MIN_SECS: u64 = 1;
+    const MAX_SECS: u64 = 300;
+    let secs = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    secs.clamp(MIN_SECS, MAX_SECS)
+}
+
+fn followup_webhook_timeout_secs() -> u64 {
+    parse_followup_webhook_timeout_secs(
+        env::var("HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn deliver_followup_webhook(
+    service: &ServiceConfig,
+    namespace: ApiNamespace,
+    receipts: &[hc_service::scheduler::SchedulerDispatchReceipt],
+) -> Result<Vec<String>> {
+    let url = followup_webhook_url_from_env().context(
+        "HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL is required when HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE=webhook",
+    )?;
+    let tenant_id = namespace.tenant_id.clone();
+    let user_id = namespace.user_id.clone();
+    let messages = fired_followup_messages_from_receipts(service, namespace, receipts)?;
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let timeout = Duration::from_secs(followup_webhook_timeout_secs());
+    let user_agent = concat!("honeycomb-hc-api/", env!("CARGO_PKG_VERSION"));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("build reqwest client for follow-up webhook")?;
+    let bearer = followup_webhook_bearer_token_from_env();
+    let mut delivered = Vec::with_capacity(messages.len());
+    for m in &messages {
+        let body = json!({
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "followup_id": m.followup_id,
+            "message": m.message,
+        });
+        let mut req = client
+            .post(&url)
+            .header(reqwest::header::USER_AGENT, user_agent)
+            .json(&body);
+        if let Some(ref tok) = bearer {
+            req = req.bearer_auth(tok);
+        }
+        let response = req
+            .send()
+            .with_context(|| format!("webhook POST for follow-up {}", m.followup_id))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_body = response.text().unwrap_or_default();
+            bail!(
+                "follow-up webhook returned {status} for follow-up {}: {}",
+                m.followup_id,
+                err_body.trim()
+            );
+        }
+        delivered.push(m.followup_id.clone());
+    }
+    Ok(delivered)
 }
 
 fn deliver_scheduler_followup_messages(
@@ -1350,6 +1831,264 @@ fn deliver_scheduler_followup_messages(
             dispatch_fired_followup_messages_headless(service, namespace, receipts)
         }
         SchedulerFollowupDeliveryMode::Off => Ok(Vec::new()),
+        SchedulerFollowupDeliveryMode::Webhook => {
+            deliver_followup_webhook(service, namespace, receipts)
+        }
+    }
+}
+
+fn record_followup_headless_delivered(
+    map: &Arc<Mutex<HashMap<(String, String), u64>>>,
+    namespace: &ApiNamespace,
+    delivered_message_count: usize,
+) {
+    if delivered_message_count == 0 {
+        return;
+    }
+    let key = (namespace.tenant_id.clone(), namespace.user_id.clone());
+    if let Ok(mut guard) = map.lock() {
+        *guard.entry(key).or_insert(0) += delivered_message_count as u64;
+    }
+}
+
+fn record_api_dispatch_totals(
+    map: &Arc<Mutex<HashMap<(String, String), ApiSchedulerDispatchTotals>>>,
+    namespace: &ApiNamespace,
+    mutate: impl FnOnce(&mut ApiSchedulerDispatchTotals),
+) {
+    let key = (namespace.tenant_id.clone(), namespace.user_id.clone());
+    if let Ok(mut guard) = map.lock() {
+        mutate(guard.entry(key).or_default());
+    }
+}
+
+fn read_api_dispatch_totals(
+    map: &Arc<Mutex<HashMap<(String, String), ApiSchedulerDispatchTotals>>>,
+    tenant_id: &str,
+    user_id: &str,
+) -> ApiSchedulerDispatchTotals {
+    let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get(&(tenant_id.to_owned(), user_id.to_owned()))
+        .copied()
+        .unwrap_or_default()
+}
+
+fn read_followup_headless_delivered_total(
+    map: &Arc<Mutex<HashMap<(String, String), u64>>>,
+    tenant_id: &str,
+    user_id: &str,
+) -> u64 {
+    let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    *guard
+        .get(&(tenant_id.to_owned(), user_id.to_owned()))
+        .unwrap_or(&0)
+}
+
+#[cfg(test)]
+mod followup_webhook_timeout_parse_tests {
+    use super::parse_followup_webhook_timeout_secs;
+
+    #[test]
+    fn clamps_and_defaults_webhook_timeout_secs() {
+        assert_eq!(parse_followup_webhook_timeout_secs(None), 30);
+        assert_eq!(parse_followup_webhook_timeout_secs(Some("")), 30);
+        assert_eq!(parse_followup_webhook_timeout_secs(Some("15")), 15);
+        assert_eq!(parse_followup_webhook_timeout_secs(Some("0")), 1);
+        assert_eq!(parse_followup_webhook_timeout_secs(Some("9999")), 300);
+        assert_eq!(
+            parse_followup_webhook_timeout_secs(Some("not-a-number")),
+            30
+        );
+    }
+}
+
+#[cfg(test)]
+mod scheduler_followup_delivery_mode_tests {
+    use super::SchedulerFollowupDeliveryMode;
+    use super::scheduler_followup_delivery_mode_parse;
+
+    #[test]
+    fn parses_delivery_mode_strings() {
+        assert_eq!(
+            scheduler_followup_delivery_mode_parse("headless"),
+            SchedulerFollowupDeliveryMode::Headless
+        );
+        assert_eq!(
+            scheduler_followup_delivery_mode_parse("off"),
+            SchedulerFollowupDeliveryMode::Off
+        );
+        assert_eq!(
+            scheduler_followup_delivery_mode_parse("webhook"),
+            SchedulerFollowupDeliveryMode::Webhook
+        );
+        assert_eq!(
+            scheduler_followup_delivery_mode_parse("WEBHOOK"),
+            SchedulerFollowupDeliveryMode::Webhook
+        );
+    }
+}
+
+fn merge_scheduler_operational_stats_with_api_counters(
+    mut stats: SchedulerOperationalStats,
+    headless_messages: &Arc<Mutex<HashMap<(String, String), u64>>>,
+    dispatch_totals: &Arc<Mutex<HashMap<(String, String), ApiSchedulerDispatchTotals>>>,
+    tenant_id: &str,
+    user_id: &str,
+) -> SchedulerOperationalStats {
+    let followup_delivered =
+        read_followup_headless_delivered_total(headless_messages, tenant_id, user_id);
+    stats.api_followup_messages_delivered_total = followup_delivered;
+    stats.api_followup_headless_messages_delivered_total = followup_delivered;
+    let d = read_api_dispatch_totals(dispatch_totals, tenant_id, user_id);
+    stats.api_dispatch_due_completed_total = d.dispatch_due_completed;
+    stats.api_dispatch_due_failed_total = d.dispatch_due_failed;
+    stats.api_dispatch_queued_completed_total = d.dispatch_queued_completed;
+    stats.api_dispatch_queued_failed_total = d.dispatch_queued_failed;
+    stats.api_scheduler_loop_tick_completed_total = d.scheduler_loop_tick_completed;
+    stats.api_scheduler_loop_tick_failed_total = d.scheduler_loop_tick_failed;
+    stats.api_dispatch_due_last_worker_wall_ms = d.last_dispatch_due_worker_wall_ms;
+    stats.api_dispatch_queued_last_worker_wall_ms = d.last_dispatch_queued_worker_wall_ms;
+    stats.api_scheduler_loop_tick_last_worker_wall_ms = d.last_scheduler_tick_worker_wall_ms;
+    stats.api_dispatch_due_worker_wall_ms_histogram = d.dispatch_due_worker_wall_ms_histogram;
+    stats.api_dispatch_queued_worker_wall_ms_histogram = d.dispatch_queued_worker_wall_ms_histogram;
+    stats.api_scheduler_loop_tick_worker_wall_ms_histogram =
+        d.scheduler_loop_tick_worker_wall_ms_histogram;
+    stats
+}
+
+#[cfg(test)]
+mod api_process_counter_merge_tests {
+    use super::*;
+    use hc_service::scheduler::ScheduledRunDispatchSlipMillisecondsHistogram;
+
+    #[test]
+    fn merge_overwrites_placeholder_api_counters_from_maps() {
+        let stats = SchedulerOperationalStats {
+            now_unix: 9,
+            followup_total: 1,
+            followup_pending: 0,
+            followup_pending_due: 0,
+            followup_fired: 0,
+            followup_cancelled: 0,
+            followup_failed: 0,
+            schedule_total: 0,
+            schedule_active: 0,
+            schedule_paused: 0,
+            schedule_cancelled: 0,
+            schedule_timed_mirror_active: 0,
+            run_queued: 0,
+            run_running: 0,
+            run_succeeded: 0,
+            run_failed: 0,
+            run_cancelled: 0,
+            api_followup_messages_delivered_total: 999,
+            api_followup_headless_messages_delivered_total: 999,
+            api_dispatch_due_completed_total: 999,
+            api_dispatch_due_failed_total: 999,
+            api_dispatch_queued_completed_total: 999,
+            api_dispatch_queued_failed_total: 999,
+            api_scheduler_loop_tick_completed_total: 999,
+            api_scheduler_loop_tick_failed_total: 999,
+            api_dispatch_due_last_worker_wall_ms: 999,
+            api_dispatch_queued_last_worker_wall_ms: 999,
+            api_scheduler_loop_tick_last_worker_wall_ms: 999,
+            api_dispatch_due_worker_wall_ms_histogram:
+                ApiDispatchDueWorkerWallMillisecondsHistogram {
+                    count: 777,
+                    sum_ms: 777,
+                    bucket_le_ms_10: 1,
+                    bucket_le_ms_50: 2,
+                    bucket_le_ms_100: 3,
+                    bucket_le_ms_500: 4,
+                },
+            api_dispatch_queued_worker_wall_ms_histogram:
+                ApiDispatchDueWorkerWallMillisecondsHistogram {
+                    count: 888,
+                    sum_ms: 888,
+                    bucket_le_ms_10: 8,
+                    bucket_le_ms_50: 8,
+                    bucket_le_ms_100: 8,
+                    bucket_le_ms_500: 8,
+                },
+            api_scheduler_loop_tick_worker_wall_ms_histogram:
+                ApiDispatchDueWorkerWallMillisecondsHistogram {
+                    count: 666,
+                    sum_ms: 666,
+                    bucket_le_ms_10: 6,
+                    bucket_le_ms_50: 6,
+                    bucket_le_ms_100: 6,
+                    bucket_le_ms_500: 6,
+                },
+            scheduled_run_dispatch_slip_ms_histogram:
+                ScheduledRunDispatchSlipMillisecondsHistogram {
+                    count: 888,
+                    sum_ms: 8,
+                    bucket_le_ms_1000: 8,
+                    bucket_le_ms_5000: 8,
+                    bucket_le_ms_30000: 8,
+                    bucket_le_ms_60000: 8,
+                    bucket_le_ms_300000: 8,
+                    bucket_le_ms_3600000: 8,
+                },
+        };
+
+        let headless = Arc::new(Mutex::new(HashMap::new()));
+        let dispatch = Arc::new(Mutex::new(HashMap::new()));
+
+        let ns = ApiNamespace {
+            tenant_id: "tenant-a".into(),
+            user_id: "user-b".into(),
+        };
+
+        record_followup_headless_delivered(&headless, &ns, 4);
+        record_api_dispatch_totals(&dispatch, &ns, |t| {
+            t.dispatch_due_completed = 5;
+            t.dispatch_due_failed = 1;
+            t.dispatch_queued_completed = 2;
+            t.scheduler_loop_tick_failed = 7;
+            t.last_dispatch_due_worker_wall_ms = 42;
+            t.last_dispatch_queued_worker_wall_ms = 43;
+            t.last_scheduler_tick_worker_wall_ms = 44;
+            t.dispatch_due_worker_wall_ms_histogram.observe(10);
+            t.dispatch_due_worker_wall_ms_histogram.observe(350);
+            t.dispatch_queued_worker_wall_ms_histogram.observe(25);
+            t.scheduler_loop_tick_worker_wall_ms_histogram.observe(40);
+        });
+
+        let merged = merge_scheduler_operational_stats_with_api_counters(
+            stats, &headless, &dispatch, "tenant-a", "user-b",
+        );
+
+        assert_eq!(merged.now_unix, 9);
+        assert_eq!(merged.followup_total, 1);
+        assert_eq!(merged.api_followup_messages_delivered_total, 4);
+        assert_eq!(merged.api_followup_headless_messages_delivered_total, 4);
+        assert_eq!(merged.api_dispatch_due_completed_total, 5);
+        assert_eq!(merged.api_dispatch_due_failed_total, 1);
+        assert_eq!(merged.api_dispatch_queued_completed_total, 2);
+        assert_eq!(merged.api_dispatch_queued_failed_total, 0);
+        assert_eq!(merged.api_scheduler_loop_tick_completed_total, 0);
+        assert_eq!(merged.api_scheduler_loop_tick_failed_total, 7);
+        assert_eq!(merged.api_dispatch_due_last_worker_wall_ms, 42);
+        assert_eq!(merged.api_dispatch_queued_last_worker_wall_ms, 43);
+        assert_eq!(merged.api_scheduler_loop_tick_last_worker_wall_ms, 44);
+        let ph = merged.api_dispatch_due_worker_wall_ms_histogram;
+        assert_eq!(ph.count, 2);
+        assert_eq!(ph.sum_ms, 360);
+        assert_eq!(ph.bucket_le_ms_10, 1);
+        assert_eq!(ph.bucket_le_ms_50, 1);
+        assert_eq!(ph.bucket_le_ms_100, 1);
+        assert_eq!(ph.bucket_le_ms_500, 2);
+        let qh = merged.api_dispatch_queued_worker_wall_ms_histogram;
+        assert_eq!(qh.count, 1);
+        assert_eq!(qh.sum_ms, 25);
+        assert_eq!(qh.bucket_le_ms_50, 1);
+        let th = merged.api_scheduler_loop_tick_worker_wall_ms_histogram;
+        assert_eq!(th.count, 1);
+        assert_eq!(th.sum_ms, 40);
+        assert_eq!(th.bucket_le_ms_50, 1);
+        assert_eq!(merged.scheduled_run_dispatch_slip_ms_histogram.count, 888);
     }
 }
 
@@ -1437,6 +2176,34 @@ fn openapi_document() -> Value {
                     }
                 }
             },
+            "/v1/messages": {
+                "post": {
+                    "summary": "Generate a chat response from a minimal user-message body",
+                    "operationId": "postMessages",
+                    "description": "Same JSON response as `POST /v1/chat` after mapping `UserMessageBody` into a full `ChatRequest`. Prefer this for lightweight clients; use `POST /v1/messages/stream` for SSE.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/UserMessageBody" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Generated chat response",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ChatResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/BadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
             "/v1/chat/stream": {
                 "post": {
                     "summary": "Generate a chat response over Server-Sent Events",
@@ -1447,6 +2214,31 @@ fn openapi_document() -> Value {
                         "content": {
                             "application/json": {
                                 "schema": { "$ref": "#/components/schemas/ChatRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "SSE stream of chat lifecycle events",
+                            "content": {
+                                "text/event-stream": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/messages/stream": {
+                "post": {
+                    "summary": "Stream chat from a minimal user-message body",
+                    "operationId": "streamMessages",
+                    "description": "Same SSE `event` / `data` sequence as `POST /v1/chat/stream` after mapping this body into a full `ChatRequest`. Supports optional `messages`, `memory`, `room_id`, behavior knobs, and LLM fields. Use `/v1/chat/stream` only when you need request fields not mirrored here.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/UserMessageBody" }
                             }
                         }
                     },
@@ -1727,6 +2519,54 @@ fn openapi_document() -> Value {
                     }
                 }
             },
+            "/v1/schedules/followup-fired-events": {
+                "get": {
+                    "summary": "List timed follow-up fire events for replay recovery",
+                    "operationId": "listFollowupFiredEvents",
+                    "parameters": [
+                        { "name": "tenant_id", "in": "query", "required": false, "schema": { "type": "string", "default": "local" } },
+                        { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string", "default": "default" } },
+                        { "name": "since_created_at_unix", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Fired replay rows", "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object" } } } } },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
+            "/v1/schedules/operational-stats": {
+                "get": {
+                    "summary": "Operational snapshot for schedules and follow-ups",
+                    "operationId": "schedulesOperationalStats",
+                    "parameters": [
+                        { "name": "tenant_id", "in": "query", "required": false, "schema": { "type": "string", "default": "local" } },
+                        { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string", "default": "default" } },
+                        { "name": "now_unix", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Scheduler operational snapshot (JSON). Disk-backed counters are always present. hc-api process fields (api_dispatch_*, api_followup_messages_delivered_total, legacy api_followup_headless_messages_delivered_total same value, histograms, etc.) are omitted when zero. CLI `hc-cli schedule stats` omits api_* entirely. Webhook follow-up delivery is configured with HC_SCHEDULER_FOLLOWUP_DELIVERY_MODE=webhook, HC_SCHEDULER_FOLLOWUP_WEBHOOK_URL, optional HC_SCHEDULER_FOLLOWUP_WEBHOOK_BEARER_TOKEN, optional HC_SCHEDULER_FOLLOWUP_WEBHOOK_TIMEOUT_SECS (default 30, clamped 1–300); see docs/scheduled-tasks.md.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
+            "/v1/schedules/metrics/prometheus": {
+                "get": {
+                    "summary": "Operational stats as Prometheus / OpenMetrics text (gauges, tenant scoped)",
+                    "operationId": "schedulesOperationalStatsPrometheus",
+                    "parameters": [
+                        { "name": "tenant_id", "in": "query", "required": false, "schema": { "type": "string", "default": "local" } },
+                        { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string", "default": "default" } },
+                        { "name": "now_unix", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "OpenMetrics exposition", "content": { "text/plain": { "schema": { "type": "string" } } } },
+                        "500": { "$ref": "#/components/responses/InternalError" }
+                    }
+                }
+            },
             "/v1/human-inbox": {
                 "get": {
                     "summary": "List pending human responder inbox items",
@@ -1974,6 +2814,16 @@ fn openapi_document() -> Value {
                             "type": "string",
                             "description": "Optional memory room id. When provided, the chat will use room-specific capabilities and context."
                         },
+                        "behavior_pattern": {
+                            "type": "string",
+                            "description": "Optional behavior pattern name; see `GET /v1/behavior/patterns`."
+                        },
+                        "thinking_depth": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 255,
+                            "description": "Optional thinking-depth hint for the behavior engine."
+                        },
                         "input": {
                             "type": "string",
                             "description": "Convenience single-turn user message. Appended after messages when both are present."
@@ -2001,6 +2851,10 @@ fn openapi_document() -> Value {
                             "type": "string",
                             "description": "Active task id used by future task-aware routing."
                         },
+                        "active_work_item_id": {
+                            "type": "string",
+                            "description": "Optional `work-item.*` id; scopes HTTP L2/L3 degenerate coordination when multiple planner work items are open."
+                        },
                         "memory": { "$ref": "#/components/schemas/ApiMemoryQuery" },
                         "temperature": {
                             "type": "number",
@@ -2011,6 +2865,98 @@ fn openapi_document() -> Value {
                             "minimum": 1
                         }
                     }
+                },
+                "UserMessageBody": {
+                    "type": "object",
+                    "description": "Request body for `POST /v1/messages` (JSON) and `POST /v1/messages/stream` (SSE); maps to `ChatRequest` server-side.",
+                    "required": ["text"],
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "User message for this turn (`ChatRequest.input`)."
+                        },
+                        "messages": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/ApiChatMessage" },
+                            "description": "Optional preceding turns (`ChatRequest.messages`). Combined with `input` per the same rules as full `ChatRequest`."
+                        },
+                        "memory": {
+                            "$ref": "#/components/schemas/ApiMemoryQuery"
+                        },
+                        "tenant_id": {
+                            "type": "string",
+                            "description": "Optional tenant id."
+                        },
+                        "user_id": {
+                            "type": "string",
+                            "description": "Optional user id."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional session / conversation id (`ChatRequest.session_id`)."
+                        },
+                        "room_id": {
+                            "type": "string",
+                            "description": "Optional memory room id; same semantics as `ChatRequest.room_id` (capabilities, routing context, leading `chat.room_capabilities` SSE when configured)."
+                        },
+                        "behavior_pattern": {
+                            "type": "string",
+                            "description": "Optional behavior pattern name (`ChatRequest.behavior_pattern`); see `GET /v1/behavior/patterns`."
+                        },
+                        "thinking_depth": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 255,
+                            "description": "Optional thinking-depth override (`ChatRequest.thinking_depth`)."
+                        },
+                        "agent_id": {
+                            "type": "string",
+                            "description": "Explicit agent profile id when routing should skip discovery."
+                        },
+                        "domain_id": {
+                            "type": "string",
+                            "description": "Optional domain routing hint."
+                        },
+                        "active_agent_id": {
+                            "type": "string",
+                            "description": "Agent instance id from active task/session context (`ChatRequest.active_agent_id`; distinct from routing `agent_id`)."
+                        },
+                        "active_task_id": {
+                            "type": "string",
+                            "description": "Optional active task id for swarm / task-scoped memory defaults."
+                        },
+                        "active_work_item_id": {
+                            "type": "string",
+                            "description": "Optional `work-item.*` id; scopes HTTP L2/L3 degenerate coordination when multiple planner work items are open."
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "LLM provider id (`ChatRequest.provider`)."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model name (`ChatRequest.model`)."
+                        },
+                        "system_prompt": {
+                            "type": "string",
+                            "description": "Overrides default system prompt for this turn (`ChatRequest.system_prompt`)."
+                        },
+                        "temperature": {
+                            "type": "number",
+                            "format": "float",
+                            "description": "Sampling temperature (`ChatRequest.temperature`)."
+                        },
+                        "max_output_tokens": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum completion tokens (`ChatRequest.max_output_tokens`)."
+                        }
+                    }
+                },
+                "UserMessageStreamBody": {
+                    "deprecated": true,
+                    "description": "Alias of `#/components/schemas/UserMessageBody` for backwards-compatible OpenAPI `$ref` tooling; prefer `UserMessageBody`.",
+                    "allOf": [{ "$ref": "#/components/schemas/UserMessageBody" }]
                 },
                 "MemoryRef": {
                     "type": "object",
@@ -2276,6 +3222,10 @@ fn openapi_document() -> Value {
                         "domain_id": { "type": "string" },
                         "active_agent_id": { "type": "string" },
                         "active_task_id": { "type": "string" },
+                        "active_work_item_id": {
+                            "type": "string",
+                            "description": "Optional `work-item.*` id; symmetry with ChatRequest / future task-aware routing signals."
+                        },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
@@ -3211,6 +4161,7 @@ fn room_lookup_request(room_id: &str, namespace: &ApiNamespace) -> ChatRequest {
         domain_id: None,
         active_agent_id: None,
         active_task_id: None,
+        active_work_item_id: None,
         memory: hc_protocol::ApiMemoryQuery {
             namespace: namespace.clone(),
             scope: None,
@@ -3547,4 +4498,114 @@ fn concise_error(error: &anyhow::Error) -> String {
         .next()
         .map(|cause| cause.to_string())
         .unwrap_or_else(|| anyhow!("unknown error").to_string())
+}
+
+#[cfg(test)]
+mod user_message_to_chat_request_tests {
+    use super::{UserMessageRequest, chat_request_from_user_message};
+    use hc_protocol::{ApiMessageRole, ChatRequest};
+
+    fn chat_from_json(value: serde_json::Value) -> ChatRequest {
+        let req: UserMessageRequest =
+            serde_json::from_value(value).expect("UserMessageBody JSON -> UserMessageRequest");
+        chat_request_from_user_message(req)
+    }
+
+    #[test]
+    fn minimal_body_maps_text_default_memory_namespace() {
+        let chat = chat_from_json(serde_json::json!({
+            "text": "你好",
+        }));
+        assert_eq!(chat.input.as_deref(), Some("你好"));
+        assert!(chat.messages.is_empty());
+        assert_eq!(chat.memory.namespace.tenant_id, "local");
+        assert_eq!(chat.memory.namespace.user_id, "default");
+    }
+
+    #[test]
+    fn top_level_tenant_user_merge_into_chat_and_memory_namespace() {
+        let chat = chat_from_json(serde_json::json!({
+            "text": "hello",
+            "tenant_id": "acme",
+            "user_id": "alice",
+        }));
+        assert_eq!(chat.memory.namespace.tenant_id, "acme");
+        assert_eq!(chat.memory.namespace.user_id, "alice");
+        assert_eq!(chat.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(chat.user_id.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn memory_overlay_preserves_explicit_memory_fields() {
+        let chat = chat_from_json(serde_json::json!({
+            "text": "x",
+            "memory": {
+                "scope": "session",
+                "limit": 4,
+                "text": "refine",
+                "kind": "knowledge",
+                "tag": "t1",
+            }
+        }));
+        assert_eq!(chat.memory.scope.as_deref(), Some("session"));
+        assert_eq!(chat.memory.limit, Some(4));
+        assert_eq!(chat.memory.text.as_deref(), Some("refine"));
+        assert_eq!(chat.memory.kind.as_deref(), Some("knowledge"));
+        assert_eq!(chat.memory.tag.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn memory_namespace_when_non_defaults_overrides_identity() {
+        let chat = chat_from_json(serde_json::json!({
+            "text": "x",
+            "tenant_id": "zzz",
+            "memory": {
+                "namespace": { "tenant_id": "corp", "user_id": "u9" },
+            }
+        }));
+        assert_eq!(chat.memory.namespace.tenant_id, "corp");
+        assert_eq!(chat.memory.namespace.user_id, "u9");
+        assert_eq!(chat.tenant_id.as_deref(), Some("corp"));
+    }
+
+    #[test]
+    fn swarm_and_llm_hints_round_trip() {
+        let chat = chat_from_json(serde_json::json!({
+            "text": "t",
+            "active_task_id": "task.coord.x",
+            "active_work_item_id": "work-item.0003",
+            "provider": "p",
+            "model": "m",
+            "temperature": 0.2,
+            "max_output_tokens": 999,
+            "thinking_depth": 2,
+            "behavior_pattern": "stable",
+            "system_prompt": "Be brief.",
+        }));
+        assert_eq!(chat.active_task_id.as_deref(), Some("task.coord.x"));
+        assert_eq!(chat.active_work_item_id.as_deref(), Some("work-item.0003"));
+        assert_eq!(chat.provider.as_deref(), Some("p"));
+        assert_eq!(chat.model.as_deref(), Some("m"));
+        assert_eq!(chat.temperature, Some(0.2));
+        assert_eq!(chat.max_output_tokens, Some(999));
+        assert_eq!(chat.thinking_depth, Some(2u8));
+        assert_eq!(chat.behavior_pattern.as_deref(), Some("stable"));
+        assert_eq!(chat.system_prompt.as_deref(), Some("Be brief."));
+    }
+
+    #[test]
+    fn optional_messages_carry_over() {
+        let chat = chat_from_json(serde_json::json!({
+            "text": "last",
+            "messages": [
+                { "role": "user", "content": "first" },
+                { "role": "assistant", "content": "second" }
+            ]
+        }));
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[0].role, ApiMessageRole::User);
+        assert_eq!(chat.messages[0].content, "first");
+        assert_eq!(chat.messages[1].role, ApiMessageRole::Assistant);
+        assert_eq!(chat.messages[1].content, "second");
+    }
 }

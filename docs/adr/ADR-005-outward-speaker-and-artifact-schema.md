@@ -105,3 +105,6 @@ Costs:
 - this ADR does not require a full migration framework yet
 - review-trigger policy remains controlled elsewhere; this ADR only defines how
   review output is surfaced once it exists
+- current HTTP `L2/L3` implementation appends read-only task-room digests to
+  system prompt in stable order: `execution_result` -> `plan_note` ->
+  `review_note`

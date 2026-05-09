@@ -373,10 +373,7 @@ fn workspace_retriever_task_room_anchor_filters_parallel_task_assets() {
     let id_a = "room.task.parallel.alpha.demo";
     let id_b = "room.task.parallel.beta.demo";
 
-    for (id, title) in [
-        (id_a, "Alpha task room"),
-        (id_b, "Beta task room"),
-    ] {
+    for (id, title) in [(id_a, "Alpha task room"), (id_b, "Beta task room")] {
         let room = MemoryRoom::new(
             id,
             MemoryLayer::Task,

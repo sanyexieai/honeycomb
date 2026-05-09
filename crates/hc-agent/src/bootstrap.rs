@@ -107,10 +107,7 @@ fn parse_env_positive_usize(key: &str) -> Option<usize> {
     if trimmed.is_empty() {
         return None;
     }
-    trimmed
-        .parse::<usize>()
-        .ok()
-        .filter(|value| *value > 0)
+    trimmed.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
 /// Result of [`materialize_plan`] with optional cap observability (`notices`).
@@ -247,8 +244,7 @@ pub fn materialize_plan_with_limits(
     if cap < planned_seeds {
         let msg = format!(
             "materialization capped: planned {planned_seeds} agent seed(s), materializing first {cap} only (max_agents_per_task={:?}, max_new_agents_per_round={:?}); extra seeds skipped to prevent silent agent inflation",
-            limits.max_agents_per_task,
-            limits.max_new_agents_per_round
+            limits.max_agents_per_task, limits.max_new_agents_per_round
         );
         tracing::warn!(
             task_id = %plan.task_id,
@@ -387,13 +383,7 @@ mod bootstrap_preset_parse_tests {
 
     #[test]
     fn planner_only_aliases() {
-        for raw in [
-            "",
-            "   ",
-            "PLANNER_ONLY",
-            "planner-only",
-            "Planning-Only",
-        ] {
+        for raw in ["", "   ", "PLANNER_ONLY", "planner-only", "Planning-Only"] {
             assert_eq!(
                 task_bootstrap_preset_from_str(raw),
                 TaskBootstrapPreset::PlannerOnly

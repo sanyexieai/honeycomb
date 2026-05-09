@@ -3,7 +3,11 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -39,6 +43,10 @@ use hc_service::{
     conversation::{conversation_inbox_snapshot, process_conversation_inbox},
     human_inbox::{complete_human_inbox_item, list_human_inbox_pending},
     room_routing::{RoomRoutingContext, resolve_room_routing_context},
+    scheduler::{
+        FiredFollowUpMessage, FollowUpMessageSink, dispatch_due_scheduled_runs,
+        dispatch_fired_followup_messages_from_receipts,
+    },
     timed_turn::TimedDeliverMode,
     tool_execution::{execute_tool_invocation, mcp_invocation_plan, mcp_result_observations},
     tool_turn::{
@@ -157,6 +165,8 @@ struct TurnFrame {
     workspace_namespace: WorkspaceNamespace,
     /// When set (e.g. via `HC_ACTIVE_TASK_ID`), matches API `active_task_id` for swarm coordination logs.
     active_task_id: Option<String>,
+    /// When set (e.g. via `HC_ACTIVE_WORK_ITEM_ID`), matches API `active_work_item_id` for HTTP L2/L3 degenerate hinting.
+    active_work_item_id: Option<String>,
     session_id: Option<String>,
     turn_index: usize,
     selection_input: String,
@@ -213,6 +223,7 @@ impl TurnFrame {
         recalled_memories: Vec<RetrievedMemory>,
         intent_resolution: IntentResolution,
         active_task_id_cli: Option<String>,
+        active_work_item_id_cli: Option<String>,
     ) -> Self {
         let user_turn = user_turn.into();
         let runtime = runtime_variables_for_namespace(&namespace, session_id.as_deref());
@@ -226,12 +237,24 @@ impl TurnFrame {
                     (!trimmed.is_empty()).then_some(trimmed)
                 })
             });
+        let active_work_item_id = active_work_item_id_cli
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_owned())
+            .or_else(|| {
+                std::env::var("HC_ACTIVE_WORK_ITEM_ID")
+                    .ok()
+                    .and_then(|value| {
+                        let trimmed = value.trim().to_owned();
+                        (!trimmed.is_empty()).then_some(trimmed)
+                    })
+            });
         Self {
             user_turn,
             runtime,
             namespace,
             workspace_namespace,
             active_task_id,
+            active_work_item_id,
             session_id,
             turn_index,
             selection_input,
@@ -483,6 +506,8 @@ fn configure_console_encoding() {
 
 static CLI_RUNTIME_CONTEXT: OnceLock<CliRuntimeContext> = OnceLock::new();
 static TAG_SYSTEM_MANAGER: OnceLock<TagSystemManager> = OnceLock::new();
+static CLI_LAST_OUTPUT_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+const CLI_PROMPT_QUIET_WINDOW_MS: u64 = 1_200;
 
 fn parse_cli_runtime_context(args: Vec<String>) -> Result<(CliRuntimeContext, Vec<String>)> {
     let mut context = CliRuntimeContext::default();
@@ -560,6 +585,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
     let mut show_memory = false;
     let mut output_options = ChatOutputOptions::from_env();
     let mut active_task_id_cli: Option<String> = None;
+    let mut active_work_item_id_cli: Option<String> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -621,6 +647,14 @@ fn handle_chat(args: &[String]) -> Result<()> {
                     args.get(index + 1)
                         .cloned()
                         .context("missing value for --active-task-id")?,
+                );
+                index += 2;
+            }
+            "--active-work-item-id" => {
+                active_work_item_id_cli = normalized_optional_cli_value(
+                    args.get(index + 1)
+                        .cloned()
+                        .context("missing value for --active-work-item-id")?,
                 );
                 index += 2;
             }
@@ -706,6 +740,8 @@ fn handle_chat(args: &[String]) -> Result<()> {
         &capture_options,
     )?;
 
+    let repl_scheduler_tick = cli_repl_scheduler_enabled_from_env();
+
     println!("hc-cli chat");
     println!("provider={provider} model={model}");
     println!(
@@ -717,6 +753,11 @@ fn handle_chat(args: &[String]) -> Result<()> {
         memory_options.limit
     );
     println!("Type /help for commands, /quit to exit.");
+    if !repl_scheduler_tick {
+        println!(
+            "note> REPL scheduler ticker disabled (`HC_CLI_CHAT_SCHEDULER_ENABLED`). Use `hc-cli schedule watch`, or unset for default in-chat ticking."
+        );
+    }
     println!(
         "output=phased:{} delay_ms={}",
         if output_options.phased_output {
@@ -742,11 +783,29 @@ fn handle_chat(args: &[String]) -> Result<()> {
             "active_task_id={t} (swarm routing JSONL; --active-task-id overrides HC_ACTIVE_TASK_ID)"
         );
     }
+    let effective_active_work_item = active_work_item_id_cli
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            env::var("HC_ACTIVE_WORK_ITEM_ID")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(w) = effective_active_work_item {
+        println!(
+            "active_work_item_id={w} (HTTP L2/L3 hint; --active-work-item-id overrides HC_ACTIVE_WORK_ITEM_ID)"
+        );
+    }
 
     // 检查API配置
     validate_llm_configuration(&provider, &model)?;
 
     let service_config = ServiceConfig::from_env();
+    let _repl_scheduler_shutdown = repl_scheduler_tick
+        .then(|| ReplSchedulerShutdown::spawn_ticker(cli_api_namespace(&memory_options.namespace)));
 
     let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
     let mut history = vec![ChatMessage::new(MessageRole::System, tool_prompt)];
@@ -804,6 +863,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
             recalled_memories,
             intent_resolution,
             active_task_id_cli.clone(),
+            active_work_item_id_cli.clone(),
         );
         if env_flag("HC_CHAT_DEBUG_INTENT") {
             tracing::info!(
@@ -870,7 +930,9 @@ fn handle_chat(args: &[String]) -> Result<()> {
         if node_reply.stop_pipeline {
             continue;
         }
-        print!("assistant> ");
+        // Keep assistant output on a fresh line even when the readline prompt
+        // echo is captured without a trailing newline in some terminals.
+        print!("\nassistant> ");
         io::stdout().flush().context("failed to flush stdout")?;
         match run_normal_chat_node(
             &service_config,
@@ -1600,6 +1662,9 @@ fn run_explicit_command_node(
         "/quit" | "/exit" => Ok(Some(ExplicitCommandNodeResult::Exit)),
         "/help" => {
             println!("/help");
+            println!(
+                "env timed follow-ups: HC_CLI_CHAT_SCHEDULER_ENABLED=false (or off/0/no) disables REPL ticker if you run `hc-cli schedule watch` aside; HC_CLI_CHAT_SCHEDULER_TICK_MS (default 500, min 50)"
+            );
             println!("/clear");
             println!("/tools");
             println!("/plan <goal>");
@@ -1608,7 +1673,7 @@ fn run_explicit_command_node(
             );
             println!("/mcp add|list|tools|call ...");
             println!(
-                "chat options: --tenant-id <id> --user-id <id> --session-id <id> --active-task-id <task> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
+                "chat options: --tenant-id <id> --user-id <id> --session-id <id> --active-task-id <task> --active-work-item-id <work-item.*> --no-memory --memory-limit <n> --scope <scope> --memory-kind <kind> --tag <tag> --show-memory"
             );
             println!("/quit");
             Ok(Some(ExplicitCommandNodeResult::Continue))
@@ -1787,6 +1852,7 @@ fn chat_request_from_turn_frame(frame: &TurnFrame, history: &[ChatMessage]) -> C
         domain_id: frame.selected_domain_id.clone(),
         active_agent_id: frame.selected_agent_id.clone(),
         active_task_id: frame.active_task_id.clone(),
+        active_work_item_id: frame.active_work_item_id.clone(),
         memory: ApiMemoryQuery {
             namespace: (&frame.namespace).into(),
             scope: None,
@@ -2023,7 +2089,8 @@ fn emit_turn_node_reply(
         return Ok(false);
     };
     if !reply.trim().is_empty() {
-        println!("assistant> {reply}");
+        mark_cli_output_activity();
+        println!("\nassistant> {reply}");
     }
     history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
     if !reply.trim().is_empty() {
@@ -2054,6 +2121,7 @@ fn emit_normal_chat_assistant_reply(
         for path in artifact_paths {
             println!("saved> {}", path.display());
         }
+        mark_cli_output_activity();
     }
     history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
     persist_assistant_reply(frame, content, history, room)
@@ -2206,6 +2274,99 @@ fn load_runtime_variables(identity: RuntimeIdentity) -> RuntimeVariables {
 
 fn cli_api_namespace(namespace: &MemoryNamespace) -> ApiNamespace {
     namespace.into()
+}
+
+/// When unset — or blank / any value other than `0`/`false`/`no`/`off` (case-insensitive) — interactive chat
+/// enables a lightweight scheduler tick (`dispatch_due_scheduled_runs` + stdout follow-ups). Disable when
+/// you run **`hc-cli schedule watch`** separately for the same tenant/user namespace.
+fn cli_repl_scheduler_enabled_from_env() -> bool {
+    !matches!(
+        env::var("HC_CLI_CHAT_SCHEDULER_ENABLED")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Background `dispatch_due_scheduled_runs` for the chat REPL (follow-up stdout aligns with timed turns).
+///
+/// Drops when `_ReplSchedulerShutdown` drops; tick interval defaults to **500 ms**, override via
+/// `HC_CLI_CHAT_SCHEDULER_TICK_MS` (minimum 50 ms). Suppress startup entirely via
+/// `HC_CLI_CHAT_SCHEDULER_ENABLED=false` (etc.).
+fn spawn_cli_repl_scheduler_ticker(stop: Arc<AtomicBool>, namespace: ApiNamespace) {
+    let tick_ms: u64 = env::var("HC_CLI_CHAT_SCHEDULER_TICK_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(500)
+        .max(50);
+
+    thread::spawn(move || {
+        let mut delay = Duration::ZERO;
+        while !stop.load(Ordering::SeqCst) {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            delay = Duration::from_millis(tick_ms);
+
+            let config = ServiceConfig::from_env();
+            let Ok(report) = dispatch_due_scheduled_runs(&config, namespace.clone(), None) else {
+                continue;
+            };
+            let mut sink = ReplFollowupStdoutSink;
+            let _ = dispatch_fired_followup_messages_from_receipts(
+                &config,
+                namespace.clone(),
+                &report.receipts,
+                &mut sink,
+            );
+        }
+    });
+}
+
+struct ReplSchedulerShutdown(Arc<AtomicBool>);
+
+impl ReplSchedulerShutdown {
+    fn spawn_ticker(namespace: ApiNamespace) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_cli_repl_scheduler_ticker(stop.clone(), namespace);
+        Self(stop)
+    }
+}
+
+impl Drop for ReplSchedulerShutdown {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct ReplFollowupStdoutSink;
+impl FollowUpMessageSink for ReplFollowupStdoutSink {
+    fn on_fired_followup_message(&mut self, message: &FiredFollowUpMessage) {
+        mark_cli_output_activity();
+        println!("\nassistant> {}", message.message);
+    }
+}
+
+fn mark_cli_output_activity() {
+    CLI_LAST_OUTPUT_ACTIVITY_MS.store(wall_clock_ms(), Ordering::SeqCst);
+}
+
+fn wait_for_cli_output_quiet_window_if_needed() {
+    if !cli_repl_scheduler_enabled_from_env() {
+        return;
+    }
+    loop {
+        let last = CLI_LAST_OUTPUT_ACTIVITY_MS.load(Ordering::SeqCst);
+        if last == 0 {
+            return;
+        }
+        let now = wall_clock_ms();
+        if now.saturating_sub(last) >= CLI_PROMPT_QUIET_WINDOW_MS {
+            return;
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
 }
 
 fn cli_session_id(namespace: &MemoryNamespace, session_id: Option<&str>) -> String {
@@ -4220,6 +4381,12 @@ fn render_turn_frame_context(frame: &TurnFrame) -> Option<String> {
     if let Some(domain_id) = &frame.selected_domain_id {
         lines.push(format!("selected_domain_id: {domain_id}"));
     }
+    if let Some(task_id) = &frame.active_task_id {
+        lines.push(format!("active_task_id: {task_id}"));
+    }
+    if let Some(work_item_id) = &frame.active_work_item_id {
+        lines.push(format!("active_work_item_id: {work_item_id}"));
+    }
     Some(lines.join("\n"))
 }
 
@@ -4288,7 +4455,9 @@ fn render_optional_guidance(user_system: Option<&str>) -> String {
 }
 
 fn prompt_raw(editor: &mut DefaultEditor) -> Result<Option<String>> {
-    match editor.readline("you> ") {
+    wait_for_cli_output_quiet_window_if_needed();
+    println!("you>");
+    match editor.readline("") {
         Ok(input) => {
             let input = repair_console_mojibake(&input);
             if !input.trim().is_empty() {
@@ -4364,7 +4533,10 @@ fn print_help() {
     println!("hc-cli                         # start tool-aware chat");
     println!("global options: --tenant-id <id> --user-id <id> --session-id <id>");
     println!(
-        "hc-cli chat [--provider <id>] [--model <name>] [--system <text>] [--active-task-id <task>] ..."
+        "timed follow-ups in hc-cli chat: HC_CLI_CHAT_SCHEDULER_ENABLED (unset=on; false|0|no|off when using schedule watch), HC_CLI_CHAT_SCHEDULER_TICK_MS (default 500, min 50)"
+    );
+    println!(
+        "hc-cli chat [--provider <id>] [--model <name>] [--system <text>] [--active-task-id <task>] [--active-work-item-id <id>] ..."
     );
     println!(
         "hc-cli create <tool-id> <name> --description <text> --command <token> [--command <token>] [--kind <cli|builtin|script|workflow|service>] [--tag <tag>] [--json]"
@@ -4387,6 +4559,14 @@ fn print_help() {
     println!("hc-cli schedule dispatch-due [--now-unix <ts>] [--json]");
     println!("hc-cli schedule dispatch-queued [--now-unix <ts>] [--json]");
     println!("hc-cli schedule watch [--tick-seconds <n>] [--max-ticks <n>] [--json]");
+    println!(
+        "hc-cli schedule followups list [--due-only] [--status <pending|fired|cancelled|failed>] [--json]"
+    );
+    println!("hc-cli schedule followups cancel --id <followup-id> [--json]");
+    println!(
+        "hc-cli schedule followups replay-events [--since-created-unix <ts>] [--json] [--no-print]"
+    );
+    println!("hc-cli schedule stats [--now-unix <ts>] [--json]");
     println!("hc-cli human-inbox list [--json]");
     println!("hc-cli human-inbox complete --id <item-id> --body <text> [--json]");
     println!("hc-cli conversation inbox [--now-unix <ts>] [--json]");
@@ -4529,6 +4709,58 @@ pub(super) fn run() -> Result<()> {
         [cmd, rest @ ..] if cmd == "room" => room::handle_room(rest),
         [cmd, rest @ ..] if cmd == "pattern" => pattern::handle_pattern(rest),
         [other, ..] => bail!("unknown command: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod cli_repl_scheduler_tick_env_tests {
+    use super::cli_repl_scheduler_enabled_from_env;
+    use std::env;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static HC_CLI_SCHEDULER_ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    const KEY: &str = "HC_CLI_CHAT_SCHEDULER_ENABLED";
+
+    #[test]
+    fn repl_scheduler_tick_env_gate_truth_table() {
+        let _guard = HC_CLI_SCHEDULER_ENV_GUARD
+            .lock()
+            .expect("serialized env mutations");
+        let prev: Option<OsString> = env::var_os(KEY);
+
+        unsafe { env::remove_var(KEY) };
+        assert!(
+            cli_repl_scheduler_enabled_from_env(),
+            "unset should imply enabled"
+        );
+
+        for v in ["false", "FALSE", "0", "off", "NO", "  off  "] {
+            unsafe { env::set_var(KEY, v) };
+            assert!(
+                !cli_repl_scheduler_enabled_from_env(),
+                "expected disable for {:?}",
+                v
+            );
+        }
+
+        unsafe { env::set_var(KEY, "true") };
+        assert!(cli_repl_scheduler_enabled_from_env());
+
+        unsafe { env::set_var(KEY, "anything_else") };
+        assert!(cli_repl_scheduler_enabled_from_env());
+
+        unsafe { env::set_var(KEY, "") };
+        assert!(
+            cli_repl_scheduler_enabled_from_env(),
+            "empty string is not treated as disable"
+        );
+
+        match prev.as_ref() {
+            None => unsafe { env::remove_var(KEY) },
+            Some(previous) => unsafe { env::set_var(KEY, previous) },
+        }
     }
 }
 

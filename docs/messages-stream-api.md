@@ -2,9 +2,9 @@
 
 ## 概览
 
-`POST /v1/messages/stream` 是面向前端或业务调用方的轻量消息流式接口。调用方只需要提交用户可见的文本消息，服务端会根据运行时配置决定模型、记忆检索、Agent 路由和工具调用。
+轻量接口 **`POST /v1/messages/stream`**（SSE）与 **`POST /v1/messages`**（单次 JSON）共用请求体 schema **`UserMessageBody`**（OpenAPI 中为向后兼容仍保留已弃用别名 **`UserMessageStreamBody`** → `UserMessageBody`）。二者与完整 **`POST /v1/chat`**（`ChatRequest`）相比字段更少；**`/v1/messages`** 的响应体形状与 **`POST /v1/chat`** 相同（`ChatResponse`）。
 
-接口使用 Server-Sent Events（SSE）返回流式结果：
+**`/v1/messages/stream`** 使用 Server-Sent Events（SSE）时的约定如下：
 
 - 请求体：`application/json`
 - 响应体：`text/event-stream`
@@ -22,7 +22,17 @@ Content-Type: application/json
 Accept: text/event-stream
 ```
 
-### 请求字段
+### 同步 `POST /v1/messages`
+
+与上表相同的 JSON 请求体，路由为 **`POST /v1/messages`**，`Content-Type: application/json`，响应为 **`ChatResponse` JSON**（与 **`POST /v1/chat`** 一致），无需 `Accept: text/event-stream`。
+
+```bash
+curl -s -X POST "http://127.0.0.1:3000/v1/messages" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"一句话介绍你自己。"}'
+```
+
+### 请求字段（流式与同步共用）
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -30,8 +40,23 @@ Accept: text/event-stream
 | `tenant_id` | string | 否 | `local` | 租户 ID。空字符串会按默认租户处理。 |
 | `user_id` | string | 否 | `default` | 用户 ID。空字符串会按默认用户处理。 |
 | `session_id` | string | 否 | 命名空间默认会话 | 会话 ID。用于维持同一轮对话上下文。 |
-| `agent_id` | string | 否 | 自动路由 | 指定 Agent ID。传入后服务端优先使用该 Agent。 |
+| `room_id` | string | 否 | 无 | 记忆房间 id；与完整 `ChatRequest.room_id` 一致，用于房间能力、路由上下文与可选的首个 SSE `chat.room_capabilities`。 |
+| `behavior_pattern` | string | 否 | 无 | 行为模式名称，与 `ChatRequest.behavior_pattern` 一致；可选值见 **`GET /v1/behavior/patterns`**。 |
+| `thinking_depth` | integer (0–255) | 否 | 无 | 思维深度覆盖，与 `ChatRequest.thinking_depth` 一致；由行为引擎在合并配置时使用。 |
+| `agent_id` | string | 否 | 自动路由 | 指定 Agent ID（路由/本回合说话者）。与 `ChatRequest.agent_id` 一致。 |
 | `domain_id` | string | 否 | 无 | 领域路由提示。未指定 `agent_id` 时可辅助服务端选择 Agent。 |
+| `active_agent_id` | string | 否 | 无 | 当前任务/会话上下文中的 active agent，与 `ChatRequest.active_agent_id` 一致（与用于强制路由的 **`agent_id`** 不同）。 |
+| `active_task_id` | string | 否 | 无 | 显式绑定当前任务 id（与完整 `ChatRequest` 的 `active_task_id` 一致），用于任务域记忆与 swarm 观测。 |
+| `active_work_item_id` | string | 否 | 无 | 可选 `work-item.*` id；在 HTTP L2/L3 单轮退化协调下，当计划中存在多个未终态 planner 工项时，用于指明本轮应对哪一行做 claim/assign 及（在合法时）合成完工。 |
+| `provider` | string | 否 | 无 | LLM 提供商 id，与 `ChatRequest.provider` 一致。 |
+| `model` | string | 否 | 无 | 模型名，与 `ChatRequest.model` 一致。 |
+| `system_prompt` | string | 否 | 无 | 本轮系统提示覆盖，与 `ChatRequest.system_prompt` 一致（空串会按服务端归一规则忽略）。 |
+| `temperature` | number | 否 | 无 | 采样温度，与 `ChatRequest.temperature` 一致。 |
+| `max_output_tokens` | integer (≥1) | 否 | 无 | 最大输出 token 上限，与 `ChatRequest.max_output_tokens` 一致。 |
+| `messages` | `ApiChatMessage[]` | 否 | `[]` | 本轮之前的对话历史，与 `ChatRequest.messages` 一致；与 `text` 同时存在时由服务端按与完整 `ChatRequest` 相同规则合并。 |
+| `memory` | `ApiMemoryQuery` | 否 | 无 | 记忆检索参数。默认 `namespace` 由顶层 `tenant_id` / `user_id` 推导；若 body 中 `memory.namespace` 与默认 `local`/`default` 不同，则以其为准并参与归一化。可在此设置 `scope` / `kind` / `tag` / `text` / `limit` 等子字段。 |
+
+OpenAPI 中该请求体 schema 为 **`UserMessageBody`**（历史名称 **`UserMessageStreamBody`** 仍作为 **`deprecated`** 别名保留在 `openapi.json` 中）。若还需 **`ChatRequest`** 上尚未镜像的字段，请改用 **`POST /v1/chat`** 或 **`POST /v1/chat/stream`**。
 
 ### 最小请求示例
 
@@ -54,8 +79,26 @@ curl -N \
     "tenant_id": "local",
     "user_id": "alice",
     "session_id": "chat-2026-05-01",
+    "room_id": "room-kitchen",
     "domain_id": "life",
     "text": "根据我最近的偏好，帮我安排今天午饭。"
+  }'
+```
+
+### 带任务与工项作用域的示例
+
+```bash
+curl -N \
+  -X POST "http://127.0.0.1:3000/v1/messages/stream" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "tenant_id": "local",
+    "user_id": "alice",
+    "session_id": "chat-2026-05-01",
+    "active_task_id": "task.coord.example",
+    "active_work_item_id": "work-item.0002",
+    "text": "按当前工项完成说明，输出一句状态摘要。"
   }'
 ```
 
@@ -280,7 +323,9 @@ streamMessage(
 ## 调用建议
 
 - 建议业务方始终传入稳定的 `tenant_id`、`user_id`、`session_id`，这样记忆检索和会话归属更可控。
-- 只做普通用户消息发送时，优先使用 `/v1/messages/stream`；需要自定义模型、系统提示词、历史消息数组或生成参数时，使用 `/v1/turn/stream`。
-- 客户端应优先展示 `chat.delta`，并在 `chat.completed` 到达后用完整 `response.message.content` 校准最终文本。
-- 客户端应监听 `chat.error`，并在连接中断、JSON 解析失败或长时间无事件时做重试或降级。
-- 服务端每 15 秒发送一次 SSE keep-alive 注释，客户端解析时可以忽略非 `event/data` 行。
+- 在多工项并行、且走 HTTP L2/L3 退化协调时，若需对**指定** planner 工项打点持久化（而非仅落到「第一个开放式工项」），应随请求带上 `active_task_id` 与 `active_work_item_id`。
+- 当路由进入 HTTP `L2/L3` 且存在 task 锚时，服务端会按稳定顺序 `execution_result` → `plan_note` → `review_note` 将任务房摘要只读注入 system prompt，客户端无需重复拼接这三类历史摘要。
+- 需要 **`messages`**、**`memory`** 等轻量字段时优先使用 **`POST /v1/messages`**（单次 JSON）或 **`POST /v1/messages/stream`**（SSE）；仍需 **`ChatRequest`** 专有字段时再改用 **`POST /v1/chat`** 或 **`POST /v1/chat/stream`**。
+- 若走 **SSE**（`/v1/messages/stream` 或 `/v1/chat/stream`），客户端应优先展示 **`chat.delta`**，并在 **`chat.completed`** 到达后用完整 **`response.message.content`** 校准最终文本。
+- 走 SSE 时，客户端应监听 **`chat.error`**；走 **`POST /v1/messages`** / **`POST /v1/chat`** 时则应检查 HTTP 状态与非 2xx 的报错体。
+- 服务端在 **`/v1/messages/stream`**（及 **`/v1/chat/stream`**）上约每 **15** 秒发送 SSE keep-alive；客户端解析时可忽略非 **`event`/`data`** 行。

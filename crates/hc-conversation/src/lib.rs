@@ -65,7 +65,7 @@ pub struct ConversationEvent {
     pub relative_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FollowUpStatus {
     Pending,
@@ -341,6 +341,64 @@ impl ConversationRepository {
                 followup.status == FollowUpStatus::Pending && followup.due_at_unix <= now_unix
             })
             .collect())
+    }
+
+    /// Returns the first **`Pending`** follow-up whose payload `timed_run_idempotency_key_v1`
+    /// string matches `key` (Honeycomb timed / scheduler unified idempotency).
+    pub fn find_pending_followup_id_by_timed_idempotency_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>> {
+        for followup in self.list_followups()? {
+            if followup.status != FollowUpStatus::Pending {
+                continue;
+            }
+            let matches = match followup.payload.get("timed_run_idempotency_key_v1") {
+                Some(Value::String(s)) => s == key,
+                _ => false,
+            };
+            if matches {
+                return Ok(Some(followup.id));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn update_followup_status(
+        &self,
+        followup_id: &str,
+        next: FollowUpStatus,
+    ) -> Result<PendingFollowUp> {
+        if followup_id.trim().is_empty() {
+            bail!("follow-up id cannot be empty");
+        }
+        let relative = Self::followup_relative_path_for(followup_id);
+        let mut followup = self.read_followup(relative)?;
+        match (&followup.status, &next) {
+            (_, FollowUpStatus::Pending) => {
+                bail!(
+                    "cannot transition follow-up {:?} -> Pending",
+                    followup.status
+                )
+            }
+            (FollowUpStatus::Pending, FollowUpStatus::Cancelled)
+            | (FollowUpStatus::Pending, FollowUpStatus::Failed)
+            | (FollowUpStatus::Pending, FollowUpStatus::Fired) => {}
+            (FollowUpStatus::Failed, FollowUpStatus::Cancelled) => {}
+            (FollowUpStatus::Fired | FollowUpStatus::Cancelled, _) => {
+                bail!("follow-up {:?} is terminal", followup.status)
+            }
+            (left, right) => {
+                bail!(
+                    "unsupported follow-up status transition {:?} -> {:?}",
+                    left,
+                    right
+                )
+            }
+        }
+        followup.status = next;
+        self.write_followup(&followup)?;
+        Ok(followup)
     }
 
     pub fn write_proposal(&self, proposal: &AgentTurnProposal) -> Result<PathBuf> {
@@ -707,6 +765,22 @@ mod tests {
         let due = repo.due_followups(20).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].agent_id, "agent.demo");
+    }
+
+    #[test]
+    fn followup_update_status_cancel_then_reject_mutations() {
+        let repo = ConversationRepository::new(temp_root("followup-status-x"));
+        let mut followup = PendingFollowUp::new("agent.demo", "reminder.due", 99);
+        followup.id = "followup-cancel-1".to_owned();
+        repo.write_followup(&followup).unwrap();
+        let out = repo
+            .update_followup_status("followup-cancel-1", FollowUpStatus::Cancelled)
+            .unwrap();
+        assert_eq!(out.status, FollowUpStatus::Cancelled);
+        assert!(
+            repo.update_followup_status("followup-cancel-1", FollowUpStatus::Fired)
+                .is_err()
+        );
     }
 
     #[test]
