@@ -2,6 +2,9 @@
 
 pub mod runtime;
 
+mod chat_turn_persistence;
+pub use chat_turn_persistence::{ChatTurnPersistence, MemoryRoomChatTurnSink};
+
 use anyhow::Result;
 use hc_bootstrap::{tenant_id_from_env, user_id_from_env, wall_clock_ms};
 use hc_capability::CapabilityProfile;

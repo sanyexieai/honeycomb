@@ -1,12 +1,13 @@
 //! `hc-cli schedule` 子命令。
 use anyhow::{Context, Result, bail};
-use hc_conversation::FollowUpStatus;
 use hc_protocol::ApiNamespace;
-use hc_scheduler::{ScheduleSpec, ScheduleStatus, ScheduledTarget, ScheduledTask, now_unix};
 use hc_service::ServiceConfig;
 use hc_service::scheduler::{
     SchedulerDispatchReceipt, SchedulerDispatchReport, dispatch_due_scheduled_runs,
     dispatch_queued_scheduled_runs,
+};
+use hc_service::transport::{
+    FollowUpStatus, ScheduleSpec, ScheduleStatus, ScheduledTarget, ScheduledTask, now_unix,
 };
 use std::time::Duration;
 

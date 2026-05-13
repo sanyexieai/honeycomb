@@ -23,3 +23,6 @@ hc-protocol = { path = "../hc-protocol" }
 hc-responder = { path = "../hc-responder" }
 hc-store = { path = "../hc-store" }
 hc-trace = { path = "../hc-trace" }
+
+[dev-dependencies]
+tempfile = "3"

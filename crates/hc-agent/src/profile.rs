@@ -6,6 +6,19 @@ use hc_conversation::ConversationPolicy;
 use hc_store::store::{StoredMarkdown, WorkspaceNamespace, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 
+/// 能力定义所在层级：工作区共享能力（与用户无关）或用户命名空间下的运行时配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDefinitionLayer {
+    /// 用户目录 `tenants/.../users/.../agents/` 下的运行时 agent（记忆、脚本绑定等）。
+    #[default]
+    UserRuntime,
+    /// 工作区根目录 `agent-definitions/<id>/` 下的能力定义（从该目录加载提示词片段等）。
+    WorkspaceCapability,
+    /// 本会话目录 `agent-runtime/sessions/<slug>/agent/`（与单次运行/会话绑定，占位可用 `status: temporary`）。
+    SessionRuntime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
@@ -55,6 +68,16 @@ pub struct AgentProfile {
     #[serde(default)]
     pub conversation_policy: ConversationPolicy,
     #[serde(default)]
+    pub definition_layer: AgentDefinitionLayer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends_workspace_agent: Option<String>,
+    /// 生命周期标记，例如 `temporary` 表示占位/待细化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// 短描述（例如来自工作区 `description.md`），用于路由与系统提示拼装。
+    #[serde(default)]
+    pub capability_description: String,
+    #[serde(default)]
     pub instructions: String,
     #[serde(default)]
     pub relative_path: String,
@@ -76,6 +99,9 @@ impl AgentProfile {
             memory_scope_refs: self.memory_scope_refs.clone(),
             tags: self.tags.clone(),
             conversation_policy: self.conversation_policy.clone(),
+            definition_layer: definition_layer_label(&self.definition_layer).to_owned(),
+            extends_workspace_agent: self.extends_workspace_agent.clone(),
+            status: self.status.clone(),
         }
     }
 }
@@ -95,10 +121,14 @@ pub struct AgentProfileSummary {
     pub memory_scope_refs: Vec<String>,
     pub tags: Vec<String>,
     pub conversation_policy: ConversationPolicy,
+    pub definition_layer: String,
+    pub extends_workspace_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentProfileFrontmatter {
+pub(crate) struct AgentProfileFrontmatter {
     id: String,
     r#type: String,
     title: String,
@@ -130,6 +160,12 @@ struct AgentProfileFrontmatter {
     state_schema_ref: Option<String>,
     #[serde(default)]
     conversation_policy: ConversationPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extends_workspace_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(default)]
+    capability_description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +196,7 @@ impl AgentRepository {
             .store
             .read_markdown_in_namespace(&self.namespace, relative_path)?;
         let mut profile = AgentProfile::from_document(stored.frontmatter, stored.body)?;
+        profile.definition_layer = AgentDefinitionLayer::UserRuntime;
         profile.relative_path = relative_path.to_string_lossy().replace('\\', "/");
         Ok(profile)
     }
@@ -209,7 +246,7 @@ impl AgentRepository {
 }
 
 impl AgentProfile {
-    fn from_document(frontmatter: AgentProfileFrontmatter, body: String) -> Result<Self> {
+    pub(crate) fn from_document(frontmatter: AgentProfileFrontmatter, body: String) -> Result<Self> {
         if frontmatter.r#type != "agent_profile" {
             anyhow::bail!("unsupported agent profile type: {}", frontmatter.r#type);
         }
@@ -230,6 +267,10 @@ impl AgentProfile {
             responder_ref: frontmatter.responder_ref,
             state_schema_ref: frontmatter.state_schema_ref,
             conversation_policy: frontmatter.conversation_policy,
+            definition_layer: AgentDefinitionLayer::default(),
+            extends_workspace_agent: frontmatter.extends_workspace_agent,
+            status: frontmatter.status,
+            capability_description: frontmatter.capability_description,
             instructions: body.trim().to_owned(),
             relative_path: String::new(),
         })
@@ -256,6 +297,9 @@ impl AgentProfileFrontmatter {
             responder_ref: profile.responder_ref.clone(),
             state_schema_ref: profile.state_schema_ref.clone(),
             conversation_policy: profile.conversation_policy.clone(),
+            extends_workspace_agent: profile.extends_workspace_agent.clone(),
+            status: profile.status.clone(),
+            capability_description: profile.capability_description.clone(),
         }
     }
 }
@@ -271,6 +315,14 @@ fn collect_markdown_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn definition_layer_label(layer: &AgentDefinitionLayer) -> &'static str {
+    match layer {
+        AgentDefinitionLayer::UserRuntime => "user_runtime",
+        AgentDefinitionLayer::WorkspaceCapability => "workspace_capability",
+        AgentDefinitionLayer::SessionRuntime => "session_runtime",
+    }
 }
 
 fn agent_kind_label(kind: &AgentKind) -> &'static str {

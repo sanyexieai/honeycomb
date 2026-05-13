@@ -10,12 +10,12 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hc-agent = { path = "../hc-agent" }
-hc-bootstrap = { path = "../hc-bootstrap" }
-hc-core = { path = "../hc-core" }
 hc-context = { path = "../hc-context" }
+hc-core = { path = "../hc-core" }
 hc-llm = { path = "../hc-llm" }
 hc-protocol = { path = "../hc-protocol" }
 hc-responder = { path = "../hc-responder" }
-hc-store = { path = "../hc-store" }
+hc-service = { path = "../hc-service" }
+hc-trace = { path = "../hc-trace" }
 slint = "1.8"
 tracing = "0.1.44"

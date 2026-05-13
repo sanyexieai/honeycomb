@@ -1,15 +1,12 @@
 //! `hc-cli index` 子命令（工作区 Markdown / 向量索引）。
 use anyhow::{Context, Result, bail};
 use hc_agent::phrase_match_score;
-use hc_bootstrap::workspace_root;
-use hc_store::{
-    index::{
-        DEFAULT_LOCAL_EMBEDDING_DIMS, LocalJsonVectorIndex, RebuildableIndex, VectorIndex,
-        VectorQuery, indexed_documents_from_markdown_index, local_hash_embedding,
-        vector_documents_from_indexed_documents,
-    },
-    store::{WorkspaceNamespace, WorkspaceStore},
+use hc_service::transport::workspace_markdown_index::{
+    DEFAULT_LOCAL_EMBEDDING_DIMS, IndexHit, LocalJsonVectorIndex, MarkdownIndex, MarkdownQuery,
+    RebuildableIndex, VectorIndex, VectorQuery, WorkspaceStore, indexed_documents_from_markdown_index,
+    local_hash_embedding, vector_documents_from_indexed_documents,
 };
+use hc_service::transport::{workspace_root, WorkspaceNamespace};
 use std::collections::BTreeMap;
 
 pub(super) fn handle_index(args: &[String]) -> Result<()> {
@@ -206,7 +203,7 @@ fn handle_index_search(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let mut query = hc_store::store::MarkdownQuery::default()
+    let mut query = MarkdownQuery::default()
         .with_text(text)
         .with_limit(limit);
     if let Some(doc_type) = filters.get("doc_type") {
@@ -237,7 +234,7 @@ fn handle_index_search(args: &[String]) -> Result<()> {
 
 fn rebuild_local_vector_index(
     namespace: &WorkspaceNamespace,
-    markdown_index: &hc_store::store::MarkdownIndex,
+    markdown_index: &MarkdownIndex,
     dims: usize,
 ) -> Result<()> {
     let indexed_documents = indexed_documents_from_markdown_index(markdown_index);
@@ -257,11 +254,11 @@ fn rebuild_local_vector_index(
 }
 
 fn rerank_vector_hits_with_markdown_text(
-    mut hits: Vec<hc_store::index::IndexHit>,
-    markdown_index: &hc_store::store::MarkdownIndex,
+    mut hits: Vec<IndexHit>,
+    markdown_index: &MarkdownIndex,
     text: &str,
     limit: usize,
-) -> Vec<hc_store::index::IndexHit> {
+) -> Vec<IndexHit> {
     let by_path = markdown_index
         .documents
         .iter()

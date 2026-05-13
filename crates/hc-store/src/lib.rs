@@ -849,6 +849,11 @@ pub mod store {
                 if relative == ignored_dir {
                     continue;
                 }
+                // `agent-runtime/` holds hc-agent chat turns and other non-workspace markdown;
+                // indexing them would require full frontmatter (`id`, `type`, …).
+                if relative.starts_with(Path::new("agent-runtime")) {
+                    continue;
+                }
                 collect_markdown_files(root, &path, ignored_dir, files)?;
                 continue;
             }

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use hc_agent::{
-    AgentProfile, AgentRepository, DomainProfile, DomainRepository, best_phrase_match_score,
+    AgentCatalog, AgentProfile, DomainProfile, DomainRepository, best_phrase_match_score,
 };
 use hc_protocol::{
     AgentListResponse, AgentProfileSummary, AgentRouteCandidate, AgentRouteRequest,
@@ -11,12 +11,12 @@ use hc_store::store::WorkspaceNamespace;
 use crate::ServiceConfig;
 
 pub fn list_agents(config: &ServiceConfig, namespace: ApiNamespace) -> Result<AgentListResponse> {
-    let repository = AgentRepository::with_namespace(
+    let catalog = AgentCatalog::new(
         config.workspace_root.clone(),
-        WorkspaceNamespace::new(namespace.tenant_id, namespace.user_id),
+        WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone()),
     );
-    let agents = repository
-        .list_profiles()?
+    let agents = catalog
+        .list_effective_profiles()?
         .into_iter()
         .map(|profile| {
             let summary = profile.summary();
@@ -33,6 +33,9 @@ pub fn list_agents(config: &ServiceConfig, namespace: ApiNamespace) -> Result<Ag
                 tool_refs: summary.tool_refs,
                 memory_scope_refs: summary.memory_scope_refs,
                 tags: summary.tags,
+                definition_layer: Some(summary.definition_layer),
+                extends_workspace_agent: summary.extends_workspace_agent,
+                status: summary.status,
             }
         })
         .collect();
@@ -76,12 +79,17 @@ pub fn route_agent(
         request.namespace.tenant_id.clone(),
         request.namespace.user_id.clone(),
     );
-    let agent_repository =
-        AgentRepository::with_namespace(config.workspace_root.clone(), namespace.clone());
+    let catalog = AgentCatalog::new(config.workspace_root.clone(), namespace.clone());
+    let agents = catalog.list_effective_profiles_with_session(
+        request
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )?;
     let domain_repository =
         DomainRepository::with_namespace(config.workspace_root.clone(), namespace);
 
-    let agents = agent_repository.list_profiles()?;
     let domains = domain_repository.list_profiles()?;
     let input = request.input.to_lowercase();
     let limit = request.limit.unwrap_or(5).clamp(1, 20);

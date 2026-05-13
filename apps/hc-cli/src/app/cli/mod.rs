@@ -14,18 +14,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use encoding_rs::GB18030;
 use hc_agent::phrase_match_score;
-use hc_bootstrap::{
-    init_console_tracing, load_local_env_file, tenant_id_from_env, unix_timestamp_secs,
-    user_id_from_env, wall_clock_ms, workspace_root,
-};
 use hc_capability::ModelDependence;
 use hc_context::{
-    ChatCaptureOptions, ChatMemoryOptions, MemoryNamespace, MemoryRetriever, MemoryRoom,
-    RetrievedMemory, WorkspaceMemoryRetriever, load_tool_chat_prompt,
+    ChatCaptureOptions, ChatMemoryOptions, ChatTurnPersistence, MemoryNamespace, MemoryRetriever,
+    MemoryRoomChatTurnSink, RetrievedMemory, WorkspaceMemoryRetriever, load_tool_chat_prompt,
     load_tool_natural_language_builder_prompt, load_tool_router_prompt, memory_kind_label,
-    memory_scope_label, parse_memory_kind, parse_memory_scope, persist_chat_turn_assistant_reply,
-    persist_chat_turn_user_message, persist_global_preference_from_chat_input,
-    prepare_chat_capture_room, render_recalled_memory_context,
+    memory_scope_label, parse_memory_kind, parse_memory_scope,     persist_global_preference_from_chat_input,
+    render_recalled_memory_context,
     runtime::{RuntimeIdentity, RuntimeVariableRepository, RuntimeVariables},
     workspace_namespace_from_memory_namespace,
 };
@@ -36,7 +31,6 @@ use hc_llm::{
     sanitize_assistant_text,
 };
 use hc_protocol::{ApiChatMessage, ApiMemoryQuery, ApiMessageRole, ApiNamespace, ChatRequest};
-use hc_scheduler::{ScheduleRepository, ScheduledTargetKind};
 use hc_service::{
     ServiceConfig,
     chat::{emit_swarm_observability_for_chat_like_request, workspace_namespace_from_chat_request},
@@ -55,8 +49,12 @@ use hc_service::{
     },
     turn::{ServiceTurnOutcome, try_handle_service_turn},
 };
+use hc_service::transport::{
+    ScheduleKind, ScheduleRepository, ScheduledTargetKind, WorkspaceNamespace,
+    init_console_tracing, load_local_env_file, tenant_id_from_env, unix_timestamp_secs,
+    user_id_from_env, wall_clock_ms, workspace_root,
+};
 use hc_skill::{SkillProfile, SkillRepository};
-use hc_store::store::WorkspaceNamespace;
 use hc_tag_system::{TagSystemManager, TagVector};
 use hc_toolchain::{
     CommandToolExecutor, McpServerRepository, McpTransportKind, ToolCatalog, ToolComposition,
@@ -734,11 +732,12 @@ fn handle_chat(args: &[String]) -> Result<()> {
     let workspace_namespace = workspace_namespace_from_memory_namespace(&memory_options.namespace);
     let memory_retriever =
         WorkspaceMemoryRetriever::new(workspace_root(), workspace_namespace.clone());
-    let chat_room = prepare_chat_capture_room(
+    let chat_sink = MemoryRoomChatTurnSink::try_new(
         workspace_root(),
         workspace_namespace.clone(),
         &capture_options,
-    )?;
+    )
+    .context("failed to prepare chat memory room")?;
 
     let repl_scheduler_tick = cli_repl_scheduler_enabled_from_env();
 
@@ -873,15 +872,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 "intent resolution"
             );
         }
-        if let Some(room) = &chat_room
-            && let Err(error) = persist_chat_turn_user_message(
-                workspace_root(),
-                frame.workspace_namespace.clone(),
-                room,
-                frame.turn_index,
-                frame.user_turn.clone(),
-            )
-        {
+        if let Err(error) = chat_sink.persist_user_turn(frame.turn_index, trimmed) {
             println!("warning> chat memory write skipped: {error}");
         }
         let turn_chat_request = chat_request_from_turn_frame(&frame, &history);
@@ -900,7 +891,7 @@ fn handle_chat(args: &[String]) -> Result<()> {
                 &pending_confirmation,
             )?;
             print_turn_node_warning(&node_reply);
-            emit_turn_node_reply(&frame, &node_reply, &mut history, chat_room.as_ref())?;
+            emit_turn_node_reply(&frame, &node_reply, &mut history, &chat_sink)?;
             if node_reply.stop_pipeline {
                 continue;
             }
@@ -975,14 +966,14 @@ fn handle_chat(args: &[String]) -> Result<()> {
                     streamed,
                     output_options,
                     &mut history,
-                    chat_room.as_ref(),
+                    &chat_sink,
                 )?;
                 if memory_options.enabled {
                     match persist_global_preference_from_chat_input(
                         workspace_root(),
                         workspace_namespace.clone(),
                         memory_options.namespace.clone(),
-                        chat_room.as_ref().map(|room| room.id.clone()),
+                        chat_sink.as_memory_room().map(|room| room.id.clone()),
                         frame.user_turn.clone(),
                         &registry,
                         &ModelRef::new(provider.clone(), model.clone()),
@@ -2083,7 +2074,7 @@ fn emit_turn_node_reply(
     frame: &TurnFrame,
     node_reply: &TurnNodeReply,
     history: &mut Vec<ChatMessage>,
-    room: Option<&MemoryRoom>,
+    sink: &MemoryRoomChatTurnSink,
 ) -> Result<bool> {
     let Some(reply) = &node_reply.reply else {
         return Ok(false);
@@ -2094,7 +2085,7 @@ fn emit_turn_node_reply(
     }
     history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
     if !reply.trim().is_empty() {
-        persist_assistant_reply(frame, reply.clone(), history, room)?;
+        persist_assistant_reply(frame, reply.clone(), history, sink)?;
     }
     Ok(true)
 }
@@ -2106,7 +2097,7 @@ fn emit_normal_chat_assistant_reply(
     streamed: bool,
     output_options: ChatOutputOptions,
     history: &mut Vec<ChatMessage>,
-    room: Option<&MemoryRoom>,
+    sink: &MemoryRoomChatTurnSink,
 ) -> Result<()> {
     if content.trim().is_empty() {
         println!(
@@ -2124,7 +2115,7 @@ fn emit_normal_chat_assistant_reply(
         mark_cli_output_activity();
     }
     history.push(ChatMessage::new(MessageRole::User, frame.user_turn.clone()));
-    persist_assistant_reply(frame, content, history, room)
+    persist_assistant_reply(frame, content, history, sink)
 }
 
 fn print_assistant_reply_content(content: &str, output_options: ChatOutputOptions) -> Result<()> {
@@ -2178,18 +2169,10 @@ fn persist_assistant_reply(
     frame: &TurnFrame,
     reply: String,
     history: &mut Vec<ChatMessage>,
-    room: Option<&MemoryRoom>,
+    sink: &MemoryRoomChatTurnSink,
 ) -> Result<()> {
     history.push(ChatMessage::new(MessageRole::Assistant, reply.clone()));
-    if let Some(room) = room
-        && let Err(error) = persist_chat_turn_assistant_reply(
-            workspace_root(),
-            frame.workspace_namespace.clone(),
-            room,
-            frame.turn_index,
-            reply,
-        )
-    {
+    if let Err(error) = sink.persist_assistant_turn(frame.turn_index, &reply) {
         println!("warning> chat memory write skipped: {error}");
     }
     Ok(())
@@ -3879,10 +3862,10 @@ fn parse_u64_arg(value: &str, name: &str) -> Result<u64> {
         .with_context(|| format!("invalid value for {name}: {value}"))
 }
 
-fn parse_schedule_kind(value: &str) -> Result<hc_scheduler::ScheduleKind> {
+fn parse_schedule_kind(value: &str) -> Result<ScheduleKind> {
     match value {
-        "once" => Ok(hc_scheduler::ScheduleKind::Once),
-        "interval" => Ok(hc_scheduler::ScheduleKind::Interval),
+        "once" => Ok(ScheduleKind::Once),
+        "interval" => Ok(ScheduleKind::Interval),
         other => bail!("unsupported schedule kind: {other}"),
     }
 }

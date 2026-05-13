@@ -1,0 +1,21 @@
+[package]
+name = "hc-agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+hc-agent = { path = "../../crates/hc-agent" }
+hc-context = { path = "../../crates/hc-context" }
+hc-protocol = { path = "../../crates/hc-protocol" }
+hc-service = { path = "../../crates/hc-service" }
+rustyline.workspace = true
+serde_json.workspace = true
+tracing = "0.1.44"
+
+[[bin]]
+name = "hc-agent"
+path = "src/main.rs"

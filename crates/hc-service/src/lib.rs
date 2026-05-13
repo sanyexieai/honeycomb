@@ -14,6 +14,7 @@ pub mod tool_execution;
 pub mod tool_turn;
 pub mod turn;
 pub mod turn_router;
+pub mod transport;
 
 use std::path::PathBuf;
 

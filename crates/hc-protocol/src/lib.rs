@@ -191,6 +191,12 @@ pub struct AgentProfileSummary {
     pub tool_refs: Vec<String>,
     pub memory_scope_refs: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_layer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends_workspace_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,6 +263,9 @@ pub struct AgentRouteRequest {
     pub active_work_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// 与会话目录 `agent-runtime/sessions/<slug>/` 对齐；提供时路由/合并列表可包含本会话占位 agent。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use hc_agent::{
-    AgentKind, AgentProfile, AgentRepository, DomainKind, DomainProfile, DomainRepository,
+    AgentKind, AgentProfile, AgentCatalog, DomainKind, DomainProfile, DomainRepository,
     append_implicit_intent_dedupe_record, append_routing_binding_log_line,
     build_routing_binding_log_line_v1_headless_from_snapshot, ensure_http_implicit_task_plan_stub,
     format_execution_results_digest_for_http_l23, format_plan_notes_digest_for_http_l23,
@@ -185,6 +185,7 @@ pub fn resolve_chat_agent_selection(
             active_task_id: request.active_task_id.clone(),
             active_work_item_id: request.active_work_item_id.clone(),
             limit: Some(1),
+            session_id: request.session_id.clone(),
         },
     )?;
 
@@ -965,12 +966,13 @@ fn resolve_agent_context(
     let namespace = request.memory.namespace.clone();
     let workspace_namespace =
         WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone());
-    let agent_repository =
-        AgentRepository::with_namespace(config.workspace_root.clone(), workspace_namespace.clone());
+    let catalog =
+        AgentCatalog::new(config.workspace_root.clone(), workspace_namespace.clone());
     let domain_repository =
         DomainRepository::with_namespace(config.workspace_root.clone(), workspace_namespace);
 
-    let agents = agent_repository.list_profiles()?;
+    let session_key = request.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let agents = catalog.list_effective_profiles_with_session(session_key)?;
     if agents.is_empty() {
         return Ok(None);
     }
@@ -1030,6 +1032,10 @@ fn compose_agent_system_prompt(
         ),
     ];
 
+    if let Some(status) = context.agent.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        sections.push(format!("[Agent status]\n{status}"));
+    }
+
     if let Some(domain) = &context.domain {
         sections.push(format!(
             "[Selected Domain]\nid: {}\nname: {}\nkind: {}\npriority: {}\n{}",
@@ -1038,6 +1044,13 @@ fn compose_agent_system_prompt(
             domain_kind_label(&domain.kind),
             domain.priority,
             domain.description
+        ));
+    }
+
+    if !context.agent.capability_description.trim().is_empty() {
+        sections.push(format!(
+            "[Capability description]\n{}",
+            context.agent.capability_description.trim()
         ));
     }
 

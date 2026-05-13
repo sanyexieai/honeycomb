@@ -11,15 +11,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use hc_agent::{
-    ActivityItemView, AgentOrchestrator, AgentPlan, AgentSeed, AgentWorkbench, MaterializedAgent,
-    TaskArtifactSummary, TaskBudget, TaskNamespace, TaskPlan, TaskRequest, WorkspacePhase,
+    AgentOrchestrator, AgentPlan, AgentSeed, AgentWorkbench, MaterializedAgent, TaskArtifactSummary,
+    TaskBudget, TaskNamespace, TaskPlan, TaskRequest, WorkspacePhase,
     append_implicit_intent_dedupe_record, append_routing_binding_log_line,
     append_work_item_assignment_journal_line, append_work_item_claim_journal_line,
     bootstrap_task_workbench, build_routing_binding_log_line_v1, build_workspace_view,
     hydrate_task_plan_work_item_coordination_journals, load_implicit_intent_dedupe_keys,
     materialize_seed, persist_task_artifacts_with_in_memory_prune, query_task_artifacts,
 };
-use hc_bootstrap::{tenant_id_from_env, user_id_from_env};
 use hc_context::{
     load_agent_planner_input_prompt, load_agent_responder_system_prompt,
     load_agent_work_item_execution_prompt,
@@ -39,6 +38,10 @@ use hc_protocol::swarm::{
 use hc_responder::{
     HumanInboxRepository, HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse,
     ResponderBackend, ResponderBinding, require_human,
+};
+use hc_trace::{ActivityItemView, DecisionTraceView};
+use hc_service::transport::{
+    tenant_id_from_env, user_id_from_env, wall_clock_ms, workspace_root, WorkspaceNamespace,
 };
 use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
@@ -784,12 +787,12 @@ fn build_registry_for_task(
         .cloned()
         .context("expected at least one materialized agent window")?;
 
-    let store_namespace = hc_store::store::WorkspaceNamespace::new(
+    let store_namespace = WorkspaceNamespace::new(
         namespace.tenant_id.clone(),
         namespace.user_id.clone(),
     );
     let implicit_intent_seen = load_implicit_intent_dedupe_keys(
-        hc_bootstrap::workspace_root(),
+        workspace_root(),
         &store_namespace,
         &workbench.task.id,
     )
@@ -823,13 +826,13 @@ fn build_registry_for_task(
 
     {
         let mut registry_ref = registry.borrow_mut();
-        let namespace = hc_store::store::WorkspaceNamespace::new(
+        let namespace = WorkspaceNamespace::new(
             registry_ref.namespace.tenant_id.clone(),
             registry_ref.namespace.user_id.clone(),
         );
         let task_id = registry_ref.task_id.clone();
         hydrate_task_plan_work_item_coordination_journals(
-            hc_bootstrap::workspace_root(),
+            workspace_root(),
             &namespace,
             &task_id,
             &mut registry_ref.task_plan,
@@ -1424,8 +1427,8 @@ fn queue_human_reply(registry_ref: &mut UiRegistry, request: ReplyRequest) -> Re
         .clone()
         .unwrap_or_else(|| "default".to_owned());
     let repository = HumanInboxRepository::with_namespace(
-        hc_bootstrap::workspace_root(),
-        hc_store::store::WorkspaceNamespace::new(
+        workspace_root(),
+        WorkspaceNamespace::new(
             registry_ref.namespace.tenant_id.clone(),
             responder_user_ref.clone(),
         ),
@@ -1489,8 +1492,8 @@ fn post_human_reply(
         let request = registry_ref.windows[source_index].pending_replies.remove(0);
         let source_name = registry_ref.windows[source_index].instance_name.clone();
         let repository = HumanInboxRepository::with_namespace(
-            hc_bootstrap::workspace_root(),
-            hc_store::store::WorkspaceNamespace::new(
+            workspace_root(),
+            WorkspaceNamespace::new(
                 registry_ref.namespace.tenant_id.clone(),
                 registry_ref.namespace.user_id.clone(),
             ),
@@ -1718,7 +1721,7 @@ fn broadcast_window_message(
                 } else {
                     let record = ImplicitIntentDedupeRecord::from_key(&key, ts);
                     if let Err(error) = append_implicit_intent_dedupe_record(
-                        hc_bootstrap::workspace_root(),
+                        workspace_root(),
                         &workspace_namespace(&registry_ref.namespace),
                         task_scope_id.as_str(),
                         &record,
@@ -1733,7 +1736,7 @@ fn broadcast_window_message(
             let line =
                 build_routing_binding_log_line_v1(ts, &message, task_scope_id.as_str(), swarm);
             if let Err(error) = append_routing_binding_log_line(
-                hc_bootstrap::workspace_root(),
+                workspace_root(),
                 &workspace_namespace(&registry_ref.namespace),
                 task_scope_id.as_str(),
                 &line,
@@ -2127,7 +2130,7 @@ fn send_channel_message(
                 } else {
                     let record = ImplicitIntentDedupeRecord::from_key(&key, ts);
                     if let Err(error) = append_implicit_intent_dedupe_record(
-                        hc_bootstrap::workspace_root(),
+                        workspace_root(),
                         &workspace_namespace(&registry_ref.namespace),
                         task_scope_id.as_str(),
                         &record,
@@ -2142,7 +2145,7 @@ fn send_channel_message(
             let line =
                 build_routing_binding_log_line_v1(ts, &message, task_scope_id.as_str(), swarm);
             if let Err(error) = append_routing_binding_log_line(
-                hc_bootstrap::workspace_root(),
+                workspace_root(),
                 &workspace_namespace(&registry_ref.namespace),
                 task_scope_id.as_str(),
                 &line,
@@ -2562,8 +2565,8 @@ fn sync_external_human_replies(registry: &Rc<RefCell<UiRegistry>>) -> Result<boo
     let answered_items = {
         let registry_ref = registry.borrow();
         let repository = HumanInboxRepository::with_namespace(
-            hc_bootstrap::workspace_root(),
-            hc_store::store::WorkspaceNamespace::new(
+            workspace_root(),
+            WorkspaceNamespace::new(
                 registry_ref.namespace.tenant_id.clone(),
                 registry_ref.namespace.user_id.clone(),
             ),
@@ -2579,8 +2582,8 @@ fn sync_external_human_replies(registry: &Rc<RefCell<UiRegistry>>) -> Result<boo
     let repository = {
         let registry_ref = registry.borrow();
         HumanInboxRepository::with_namespace(
-            hc_bootstrap::workspace_root(),
-            hc_store::store::WorkspaceNamespace::new(
+            workspace_root(),
+            WorkspaceNamespace::new(
                 registry_ref.namespace.tenant_id.clone(),
                 registry_ref.namespace.user_id.clone(),
             ),
@@ -2812,25 +2815,25 @@ fn current_task_request(registry: &UiRegistry) -> TaskRequest {
 
 fn refresh_persisted_task_artifacts(registry: &mut UiRegistry) -> Result<()> {
     let task = current_task_request(registry);
-    let namespace = hc_store::store::WorkspaceNamespace::new(
+    let namespace = WorkspaceNamespace::new(
         registry.namespace.tenant_id.clone(),
         registry.namespace.user_id.clone(),
     );
     persist_task_artifacts_with_in_memory_prune(
-        hc_bootstrap::workspace_root(),
+        workspace_root(),
         &task,
         &mut registry.task_plan,
     )?;
     registry.task_artifacts = query_task_artifacts(
-        hc_bootstrap::workspace_root(),
+        workspace_root(),
         &namespace,
         &hc_agent::TaskArtifactQuery::default().for_task(registry.task_id.clone()),
     )?;
     Ok(())
 }
 
-fn ui_store_namespace(registry: &UiRegistry) -> hc_store::store::WorkspaceNamespace {
-    hc_store::store::WorkspaceNamespace::new(
+fn ui_store_namespace(registry: &UiRegistry) -> WorkspaceNamespace {
+    WorkspaceNamespace::new(
         registry.namespace.tenant_id.clone(),
         registry.namespace.user_id.clone(),
     )
@@ -2844,7 +2847,7 @@ fn append_work_item_claim_journal_for_id(registry: &UiRegistry, claim_id: &str) 
         .find(|row| row.id == claim_id)
         .ok_or_else(|| anyhow::anyhow!("missing work item claim row: {claim_id}"))?;
     append_work_item_claim_journal_line(
-        hc_bootstrap::workspace_root(),
+        workspace_root(),
         &ui_store_namespace(registry),
         &registry.task_id,
         claim,
@@ -2856,7 +2859,7 @@ fn append_work_item_claims_journal_for_work_item(
     registry: &UiRegistry,
     work_item_id: &str,
 ) -> Result<()> {
-    let root = hc_bootstrap::workspace_root();
+    let root = workspace_root();
     let namespace = ui_store_namespace(registry);
     for claim in registry
         .task_plan
@@ -2880,7 +2883,7 @@ fn append_work_item_assignment_journal_for_id(
         .find(|row| row.id == assignment_id)
         .ok_or_else(|| anyhow::anyhow!("missing work item assignment row: {assignment_id}"))?;
     append_work_item_assignment_journal_line(
-        hc_bootstrap::workspace_root(),
+        workspace_root(),
         &ui_store_namespace(registry),
         &registry.task_id,
         assignment,
@@ -2901,7 +2904,7 @@ fn append_journal_for_executing_assignment(
         return Ok(());
     };
     append_work_item_assignment_journal_line(
-        hc_bootstrap::workspace_root(),
+        workspace_root(),
         &ui_store_namespace(registry),
         &registry.task_id,
         assignment,
@@ -3022,7 +3025,7 @@ fn render_activity_line(activity: &ActivityItemView) -> String {
     )
 }
 
-fn render_decision_trace_line(trace: &hc_agent::DecisionTraceView) -> String {
+fn render_decision_trace_line(trace: &DecisionTraceView) -> String {
     format!(
         "- [{}:{}] {} => {} :: {}",
         trace.code, trace.stage, trace.subject, trace.outcome, trace.detail
@@ -4543,8 +4546,8 @@ fn runtime_namespace() -> RuntimeNamespace {
     RuntimeNamespace::new(tenant_id_from_env(), user_id_from_env())
 }
 
-fn workspace_namespace(namespace: &RuntimeNamespace) -> hc_store::store::WorkspaceNamespace {
-    hc_store::store::WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone())
+fn workspace_namespace(namespace: &RuntimeNamespace) -> WorkspaceNamespace {
+    WorkspaceNamespace::new(namespace.tenant_id.clone(), namespace.user_id.clone())
 }
 
 fn render_agent_responder_system_prompt(
@@ -4620,7 +4623,7 @@ fn summarize_task_title(task_goal: &str) -> String {
 }
 
 fn current_timestamp_ms() -> u64 {
-    hc_bootstrap::wall_clock_ms()
+    wall_clock_ms()
 }
 
 fn default_llm_registry() -> ProviderRegistry {

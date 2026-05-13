@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hc_agent::AgentRepository;
+use hc_agent::AgentCatalog;
 use hc_conversation::{
     AgentTurnProposal, AgentTurnProposalStatus, ConversationEvent, ConversationEventStatus,
     ConversationRepository, FollowUpStatus, PendingFollowUp, now_unix,
@@ -79,9 +79,8 @@ pub fn process_conversation_inbox(
         config.workspace_root.clone(),
         workspace_namespace.clone(),
     );
-    let agent_repository =
-        AgentRepository::with_namespace(config.workspace_root.clone(), workspace_namespace);
-    let agents = agent_repository.list_profiles()?;
+    let catalog = AgentCatalog::new(config.workspace_root.clone(), workspace_namespace);
+    let agents = catalog.list_effective_profiles()?;
 
     let mut proposals = Vec::new();
     let mut processed_events = 0usize;
@@ -269,7 +268,7 @@ fn trigger_allowed(triggers: &[String], kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hc_agent::{AgentKind, AgentProfile, AgentRepository};
+    use hc_agent::{AgentDefinitionLayer, AgentKind, AgentProfile, AgentRepository};
     use hc_conversation::ConversationPolicy;
     use std::path::PathBuf;
 
@@ -308,6 +307,10 @@ mod tests {
                 proactive_triggers: vec!["demo.event".to_owned()],
                 quiet_hours: None,
             },
+            definition_layer: AgentDefinitionLayer::UserRuntime,
+            extends_workspace_agent: None,
+            status: None,
+            capability_description: String::new(),
             instructions: String::new(),
             relative_path: String::new(),
         };

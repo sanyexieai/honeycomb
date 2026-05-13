@@ -2,6 +2,8 @@
 
 pub mod binding;
 pub mod bootstrap;
+pub mod catalog;
+pub mod agent_chat_turn_sink;
 pub mod conversation;
 pub mod domain;
 pub mod experience_lane;
@@ -11,18 +13,25 @@ pub mod orchestrator;
 pub mod persistence;
 pub mod planning;
 pub mod profile;
+pub mod runtime_layout;
 pub mod routing;
+pub mod session_bundle;
+pub mod session_hc_agent_bin;
 pub mod swarm_routing;
 mod swarm_routing_phrase_table;
 pub mod task;
 pub mod view;
 pub mod workbench;
 
+pub use agent_chat_turn_sink::AgentRuntimeChatTurnSink;
 pub use binding::{AgentRuntimeBinding, BindingNamespace};
 pub use bootstrap::{
     AgentPlan, AgentSeed, MaterializePlanLimits, MaterializePlanOutcome, MaterializedAgent,
     TaskBootstrapPreset, bootstrap_planning_task, bootstrap_task, bootstrap_task_preset_from_env,
     bootstrap_task_with_preset, materialize_plan, materialize_plan_with_limits, materialize_seed,
+};
+pub use catalog::{
+    AgentCatalog, WORKSPACE_AGENT_DEFINITIONS_DIR, load_workspace_capability_profiles,
 };
 pub use conversation::{
     ChannelConversation, ConversationParticipant, ConversationParticipantKind,
@@ -31,24 +40,6 @@ pub use conversation::{
 };
 pub use domain::{DomainKind, DomainProfile, DomainProfileSummary, DomainRepository};
 pub use experience_lane::{task_learning_effective, tenant_learning_allowed_from_env};
-pub use hc_capability::{
-    CapabilityInputType, CapabilityNamespace, CapabilityOutputType, CapabilityProfile,
-    CapabilityRepository, CapabilityTier, CapabilityVisibility, ModelDependence,
-    seed_capability_for_role,
-};
-pub use hc_memory::{MemoryRecord, MemoryScope, MemoryType};
-pub use hc_persona::{
-    CollaborationRules, PersonaKind, PersonaLifecycle, PersonaProfile, PersonaRepository,
-    seed_persona_for_role,
-};
-pub use hc_responder::{
-    HumanResponderConfig, LlmResponderConfig, ReplyRequest, ReplyResponse, ResponderBackend,
-    ResponderBinding, ResponderKind, RuleResponderConfig, ScriptResponderConfig,
-};
-pub use hc_trace::{
-    ActivityItemView, DecisionTraceView, agent_code_from, behavior_mode_code_from, code_from,
-    summarize_trace_body,
-};
 pub use http_l2l3_planner_steering::{
     http_l2l3_planner_steering_enabled_from_env, maybe_apply_http_l2l3_planner_steering,
 };
@@ -79,7 +70,21 @@ pub use planning::{
     AgentProposal, AgentRuntimeBudget, EvolutionIssue, HTTP_IMPLICIT_WORK_ITEM_HOLDER_ID, TaskPlan,
     TaskPlanStatus, WorkItem,
 };
-pub use profile::{AgentKind, AgentProfile, AgentProfileSummary, AgentRepository};
+pub use profile::{
+    AgentDefinitionLayer, AgentKind, AgentProfile, AgentProfileSummary, AgentRepository,
+};
+pub use runtime_layout::{
+    USER_AGENT_RUNTIME_REL, agent_conversation_slug, ensure_user_agent_runtime_layout,
+    user_agent_runtime_dir,
+};
+pub use session_bundle::{
+    SESSIONS_SUBDIR, ensure_session_agent_bundle, load_session_agent_profile, session_agent_md_rel,
+    session_runtime_rel,
+};
+pub use session_hc_agent_bin::{
+    HcAgentSessionBinMode, SessionHcAgentBinOptions, maybe_install_session_hc_agent_bin,
+    session_hc_agent_dest_file_name,
+};
 pub use routing::{
     best_phrase_match_score, phrase_match_score, phrase_match_score_with_stop_terms,
     route_match_terms, route_match_terms_with_stop_terms,

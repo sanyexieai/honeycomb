@@ -1,11 +1,10 @@
 //! `hc-cli room` 子命令（memory room 管理）。
 use anyhow::{Context, Result, bail};
-use hc_bootstrap::workspace_root;
 use hc_context::MemoryNamespace;
-use hc_memory::{
-    CapabilityRef, InheritanceType, MemoryNamespace as MemoryNamespaceStorage,
+use hc_service::transport::{
+    CapabilityRef, InheritanceType, MemoryLayer, MemoryNamespace as MemoryNamespaceStorage,
     MemoryRoom as MemoryRoomStorage, MemoryRoomRepository, RoomCapabilityResolver, ScheduleRef,
-    SkillRef, ToolRef,
+    SkillRef, ToolRef, WorkspaceNamespace, workspace_root,
 };
 use serde_json;
 
@@ -97,11 +96,11 @@ pub(super) fn handle_room_create(args: &[String]) -> Result<()> {
     let summary = summary.unwrap_or_else(|| format!("Memory room for {}", title));
 
     let memory_layer = match layer.as_str() {
-        "chat" => hc_memory::MemoryLayer::Chat,
-        "topic" => hc_memory::MemoryLayer::Topic,
-        "task" => hc_memory::MemoryLayer::Task,
-        "project" => hc_memory::MemoryLayer::Project,
-        "global" => hc_memory::MemoryLayer::Global,
+        "chat" => MemoryLayer::Chat,
+        "topic" => MemoryLayer::Topic,
+        "task" => MemoryLayer::Task,
+        "project" => MemoryLayer::Project,
+        "global" => MemoryLayer::Global,
         _ => bail!(
             "invalid layer: {} (must be chat, topic, task, project, or global)",
             layer
@@ -113,7 +112,7 @@ pub(super) fn handle_room_create(args: &[String]) -> Result<()> {
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
-    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+    let workspace_namespace = WorkspaceNamespace::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
@@ -140,7 +139,7 @@ pub(super) fn handle_room_create(args: &[String]) -> Result<()> {
 pub(super) fn handle_room_list(args: &[String]) -> Result<()> {
     let options = parse_common_options(args)?;
     let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
-    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+    let workspace_namespace = WorkspaceNamespace::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
@@ -241,7 +240,7 @@ pub(super) fn handle_room_show(args: &[String]) -> Result<()> {
     let room_id = room_id.context("missing room ID")?;
 
     let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
-    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+    let workspace_namespace = WorkspaceNamespace::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );
@@ -399,7 +398,7 @@ pub(super) fn handle_room_capabilities(args: &[String]) -> Result<()> {
     let room_id = room_id.context("missing room ID")?;
 
     let runtime_context = CLI_RUNTIME_CONTEXT.get().unwrap();
-    let workspace_namespace = hc_store::store::WorkspaceNamespace::new(
+    let workspace_namespace = WorkspaceNamespace::new(
         runtime_context.tenant_id.as_deref().unwrap_or("local"),
         runtime_context.user_id.as_deref().unwrap_or("default"),
     );

@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 hc-bootstrap = { path = "../hc-bootstrap" }
 hc-agent = { path = "../hc-agent" }
+hc-behavior = { path = "../hc-behavior" }
 hc-capability = { path = "../hc-capability" }
 hc-conversation = { path = "../hc-conversation" }
 hc-context = { path = "../hc-context" }

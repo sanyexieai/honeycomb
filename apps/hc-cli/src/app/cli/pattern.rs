@@ -1,6 +1,6 @@
 //! `hc-cli pattern` 子命令（行为模式）。
 use anyhow::{Context, Result, bail};
-use hc_behavior::{
+use hc_service::transport::{
     BehaviorConfig, BehaviorContext, BehaviorEngine, BehaviorPattern, DecisionOption, DecisionType,
 };
 use serde_json;

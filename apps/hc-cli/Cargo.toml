@@ -15,18 +15,12 @@ encoding_rs = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 hc-capability = { path = "../../crates/hc-capability" }
 hc-agent = { path = "../../crates/hc-agent" }
-hc-conversation = { path = "../../crates/hc-conversation" }
 hc-context = { path = "../../crates/hc-context" }
 hc-llm = { path = "../../crates/hc-llm" }
-hc-memory = { path = "../../crates/hc-memory" }
-hc-scheduler = { path = "../../crates/hc-scheduler" }
 hc-service = { path = "../../crates/hc-service" }
 hc-skill = { path = "../../crates/hc-skill" }
-hc-store = { path = "../../crates/hc-store" }
 hc-toolchain = { path = "../../crates/hc-toolchain" }
-hc-bootstrap = { path = "../../crates/hc-bootstrap" }
 hc-intent = { path = "../../crates/hc-intent" }
 hc-protocol = { path = "../../crates/hc-protocol" }
-hc-behavior = { path = "../../crates/hc-behavior" }
 hc-tag-system = { path = "../../crates/hc-tag-system" }
 tracing = "0.1.44"
