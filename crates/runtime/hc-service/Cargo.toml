@@ -7,20 +7,20 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-hc-bootstrap = { path = "../hc-bootstrap" }
-hc-agent = { path = "../hc-agent" }
-hc-behavior = { path = "../hc-behavior" }
-hc-capability = { path = "../hc-capability" }
-hc-conversation = { path = "../hc-conversation" }
-hc-context = { path = "../hc-context" }
-hc-intent = { path = "../hc-intent" }
-hc-llm = { path = "../hc-llm" }
-hc-memory = { path = "../hc-memory" }
-hc-protocol = { path = "../hc-protocol" }
-hc-responder = { path = "../hc-responder" }
-hc-scheduler = { path = "../hc-scheduler" }
-hc-store = { path = "../hc-store" }
-hc-toolchain = { path = "../hc-toolchain" }
+hc-bootstrap = { path = "../../storage/hc-bootstrap" }
+hc-agent = { path = "../../agent/hc-agent" }
+hc-behavior = { path = "../../foundation/hc-behavior" }
+hc-capability = { path = "../../agent/hc-capability" }
+hc-conversation = { path = "../../agent/hc-conversation" }
+hc-context = { path = "../../agent/hc-context" }
+hc-intent = { path = "../../foundation/hc-intent" }
+hc-llm = { path = "../../integrations/hc-llm" }
+hc-memory = { path = "../../agent/hc-memory" }
+hc-protocol = { path = "../../foundation/hc-protocol" }
+hc-responder = { path = "../../agent/hc-responder" }
+hc-scheduler = { path = "../../agent/hc-scheduler" }
+hc-store = { path = "../../storage/hc-store" }
+hc-toolchain = { path = "../../agent/hc-toolchain" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

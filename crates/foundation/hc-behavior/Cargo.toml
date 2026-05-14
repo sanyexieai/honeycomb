@@ -10,5 +10,5 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-hc-store = { path = "../hc-store" }
+hc-store = { path = "../../storage/hc-store" }
 hc-protocol = { path = "../hc-protocol" }

@@ -6,5 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-hc-store = { path = "../hc-store" }
-hc-trace = { path = "../hc-trace" }
+hc-store = { path = "../../storage/hc-store" }
+hc-trace = { path = "../../integrations/hc-trace" }

@@ -13,14 +13,14 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 encoding_rs = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
-hc-capability = { path = "../../crates/hc-capability" }
-hc-agent = { path = "../../crates/hc-agent" }
-hc-context = { path = "../../crates/hc-context" }
-hc-llm = { path = "../../crates/hc-llm" }
-hc-service = { path = "../../crates/hc-service" }
-hc-skill = { path = "../../crates/hc-skill" }
-hc-toolchain = { path = "../../crates/hc-toolchain" }
-hc-intent = { path = "../../crates/hc-intent" }
-hc-protocol = { path = "../../crates/hc-protocol" }
-hc-tag-system = { path = "../../crates/hc-tag-system" }
+hc-capability = { path = "../../crates/agent/hc-capability" }
+hc-agent = { path = "../../crates/agent/hc-agent" }
+hc-context = { path = "../../crates/agent/hc-context" }
+hc-llm = { path = "../../crates/integrations/hc-llm" }
+hc-service = { path = "../../crates/runtime/hc-service" }
+hc-skill = { path = "../../crates/agent/hc-skill" }
+hc-toolchain = { path = "../../crates/agent/hc-toolchain" }
+hc-intent = { path = "../../crates/foundation/hc-intent" }
+hc-protocol = { path = "../../crates/foundation/hc-protocol" }
+hc-tag-system = { path = "../../crates/foundation/hc-tag-system" }
 tracing = "0.1.44"

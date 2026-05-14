@@ -8,6 +8,6 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-hc-bootstrap = { path = "../hc-bootstrap" }
-hc-responder = { path = "../hc-responder" }
-hc-store = { path = "../hc-store" }
+hc-bootstrap = { path = "../../storage/hc-bootstrap" }
+hc-responder = { path = "../../agent/hc-responder" }
+hc-store = { path = "../../storage/hc-store" }

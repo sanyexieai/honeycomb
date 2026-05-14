@@ -8,4 +8,4 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-hc-store = { path = "../hc-store" }
+hc-store = { path = "../../storage/hc-store" }

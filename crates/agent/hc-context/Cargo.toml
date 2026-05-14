@@ -9,12 +9,12 @@ rust-version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-hc-bootstrap = { path = "../hc-bootstrap" }
-hc-llm = { path = "../hc-llm" }
-hc-protocol = { path = "../hc-protocol" }
+hc-bootstrap = { path = "../../storage/hc-bootstrap" }
+hc-llm = { path = "../../integrations/hc-llm" }
+hc-protocol = { path = "../../foundation/hc-protocol" }
 hc-capability = { path = "../hc-capability" }
 hc-memory = { path = "../hc-memory" }
 hc-persona = { path = "../hc-persona" }
-hc-store = { path = "../hc-store" }
+hc-store = { path = "../../storage/hc-store" }
 hc-toolchain = { path = "../hc-toolchain" }
-hc-trace = { path = "../hc-trace" }
+hc-trace = { path = "../../integrations/hc-trace" }

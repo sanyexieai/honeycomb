@@ -7,8 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-hc-bootstrap = { path = "../hc-bootstrap" }
-hc-core = { path = "../hc-core" }
-hc-store = { path = "../hc-store" }
+hc-bootstrap = { path = "../../storage/hc-bootstrap" }
+hc-core = { path = "../../foundation/hc-core" }
+hc-store = { path = "../../storage/hc-store" }
 serde.workspace = true
 serde_json.workspace = true

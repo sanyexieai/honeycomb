@@ -7,9 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-hc-bootstrap = { path = "../hc-bootstrap" }
+hc-bootstrap = { path = "../../storage/hc-bootstrap" }
 serde.workspace = true
 serde_json.workspace = true
 hc-capability = { path = "../hc-capability" }
-hc-store = { path = "../hc-store" }
+hc-store = { path = "../../storage/hc-store" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

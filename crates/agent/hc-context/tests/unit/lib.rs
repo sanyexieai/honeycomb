@@ -1140,7 +1140,7 @@ fn infer_tool_execution_signals_marks_success_and_validation() {
         success: true,
         summary: "Found 3 rg match lines.".to_owned(),
         observations: vec![
-            "crates/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
+            "crates/agent/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
             "apps/hc-cli/src/main.rs:10:AssetView".to_owned(),
         ],
     };
@@ -1188,8 +1188,8 @@ fn evaluate_tool_execution_returns_promotable_assets() {
         success: true,
         summary: "Found rg matches.".to_owned(),
         observations: vec![
-            "crates/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
-            "crates/hc-context/src/lib.rs:60:pub enum AssetTarget".to_owned(),
+            "crates/agent/hc-context/src/lib.rs:42:pub struct AssetView".to_owned(),
+            "crates/agent/hc-context/src/lib.rs:60:pub enum AssetTarget".to_owned(),
         ],
     };
     let evaluation = evaluate_tool_execution(
